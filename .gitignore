@@ -14,3 +14,5 @@ __pycache__/
 # Logs
 logs/
 *.log
+agent/latest_assessment.json
+agent/assessment_result.json
