@@ -27,15 +27,28 @@ from livekit.plugins import (
     openai,
     silero,
 )
-from config import (
-    ASSESSMENT_DURATION_SECONDS,
-    WARNING_SECONDS,
-    CLOSING_MESSAGE_PAUSE_SECONDS,
-    OPENAI_MODEL,
-    BEHAVIORAL_AREAS,
-    SYSTEM_PROMPT,
-    FINAL_ANALYSIS_PROMPT,
-)
+try:
+    from config import (
+        ASSESSMENT_DURATION_SECONDS,
+        WARNING_SECONDS,
+        WARNING_DELAY_SECONDS,
+        CLOSING_MESSAGE_PAUSE_SECONDS,
+        OPENAI_MODEL,
+        BEHAVIORAL_AREAS,
+        SYSTEM_PROMPT,
+        FINAL_ANALYSIS_PROMPT,
+    )
+except ImportError:
+    from agent.config import (
+        ASSESSMENT_DURATION_SECONDS,
+        WARNING_SECONDS,
+        WARNING_DELAY_SECONDS,
+        CLOSING_MESSAGE_PAUSE_SECONDS,
+        OPENAI_MODEL,
+        BEHAVIORAL_AREAS,
+        SYSTEM_PROMPT,
+        FINAL_ANALYSIS_PROMPT,
+    )
 
 # ============================================================
 # ENVIRONMENT
@@ -477,7 +490,7 @@ Rules:
     try:
 
         response = await openai_client.responses.create(
-            model="gpt-4.1",
+            model=OPENAI_MODEL,
             input=prompt,
         )
 
@@ -612,7 +625,7 @@ Return ONLY the question text.
     try:
 
         response = await openai_client.responses.create(
-            model="gpt-4.1",
+            model=OPENAI_MODEL,
             input=prompt,
         )
 
@@ -741,7 +754,7 @@ Rules:
     try:
 
         response = await openai_client.responses.create(
-            model="gpt-4.1",
+            model=OPENAI_MODEL,
             input=prompt,
         )
 
@@ -1007,7 +1020,7 @@ async def entrypoint(
         ),
 
         llm=openai.LLM(
-            model="gpt-4.1",
+            model=OPENAI_MODEL,
         ),
 
         vad=silero.VAD.load(),
@@ -1407,7 +1420,13 @@ async def entrypoint(
 
                 except Exception:
 
-                    continue
+                    answer = None
+
+                finally:
+
+                    answer_task = asyncio.create_task(
+                        user_answer_queue.get()
+                    )
 
                 if not answer:
                     continue

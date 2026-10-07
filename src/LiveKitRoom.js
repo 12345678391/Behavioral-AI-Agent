@@ -37,43 +37,45 @@ export async function joinRoom(
       console.log("AI audio track received.");
 
       const audioElement = track.attach();
-
       audioElement.autoplay = true;
       audioElement.muted = false;
       audioElement.volume = 1;
-
       audioElement.style.display = "none";
+      audioElement.setAttribute("data-livekit-track-sid", track.sid);
 
       document.body.appendChild(audioElement);
 
       try {
         await audioElement.play();
-
-        console.log(
-          "AI audio playback started."
-        );
+        console.log("AI audio playback started.");
       } catch (error) {
-        console.error(
-          "AI audio playback failed:",
-          error
-        );
-
+        console.error("AI audio playback failed:", error);
         try {
           await room.startAudio();
           await audioElement.play();
-
-          console.log(
-            "AI audio started after startAudio()."
-          );
+          console.log("AI audio started after startAudio().");
         } catch (audioError) {
-          console.error(
-            "Could not start AI audio:",
-            audioError
-          );
+          console.error("Could not start AI audio:", audioError);
         }
       }
     }
   );
+
+  // ==========================================================
+  // TRACK UNSUBSCRIBED (CLEANUP AUDIO ELEMENTS)
+  // ==========================================================
+
+  room.on(RoomEvent.TrackUnsubscribed, (track) => {
+    if (track.kind === Track.Kind.Audio) {
+      console.log("Detaching audio track:", track.sid);
+      const detached = track.detach();
+      detached.forEach((element) => {
+        if (element && element.parentNode) {
+          element.parentNode.removeChild(element);
+        }
+      });
+    }
+  });
 
   // ==========================================================
   // DATA FROM PYTHON AGENT
@@ -168,8 +170,18 @@ export async function joinRoom(
         reason
       );
 
+      // Clean up any remaining attached audio elements
+      const elements = document.querySelectorAll(
+        "[data-livekit-track-sid]"
+      );
+      elements.forEach((el) => {
+        if (el.parentNode) {
+          el.parentNode.removeChild(el);
+        }
+      });
+
       if (onDisconnected) {
-        onDisconnected();
+        onDisconnected(reason);
       }
     }
   );

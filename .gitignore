@@ -16,6 +16,12 @@ __pycache__/
 logs/
 *.log
 
+# Build outputs
+build/
+dist/
+
 # Project generated files
 agent/latest_assessment.json
 agent/assessment_result.json
+agent/assessments/
+*.json.bak

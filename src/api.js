@@ -1,11 +1,23 @@
-const API_BASE_URL = process.env.REACT_APP_API_BASE_URL;
+const API_BASE_URL =
+  process.env.REACT_APP_API_BASE_URL || "http://localhost:5000/api";
 
-if (!API_BASE_URL) {
-  throw new Error("REACT_APP_API_BASE_URL is not configured.");
-}
+export async function getToken(identity = "candidate", room) {
+  if (!API_BASE_URL) {
+    throw new Error("REACT_APP_API_BASE_URL is not configured.");
+  }
 
-export async function getToken() {
-  const response = await fetch(`${API_BASE_URL}/token`);
+  const params = new URLSearchParams();
+  if (identity) {
+    params.append("identity", identity);
+  }
+  if (room) {
+    params.append("room", room);
+  }
+
+  const queryString = params.toString();
+  const url = `${API_BASE_URL}/token${queryString ? `?${queryString}` : ""}`;
+
+  const response = await fetch(url);
 
   if (!response.ok) {
     let message = "Failed to get LiveKit token.";

@@ -20,10 +20,13 @@ app.use(
 
 app.get("/token", async (req, res) => {
   try {
-    const room = "behavior-room";
+    const rawRoom = req.query.room;
+    const room =
+      rawRoom ||
+      `behavior-room-${Date.now()}-${Math.random().toString(36).substring(2, 8)}`;
 
     // Create a unique participant identity for each request.
-    const identity = `web-user-${Date.now()}`;
+    const identity = req.query.identity || `web-user-${Date.now()}`;
 
     const token = new AccessToken(
       process.env.LIVEKIT_API_KEY,
@@ -42,6 +45,7 @@ app.get("/token", async (req, res) => {
 
     res.json({
       token: await token.toJwt(),
+      room,
       serverUrl: process.env.LIVEKIT_URL,
     });
 
@@ -61,12 +65,26 @@ app.get("/token", async (req, res) => {
 
 app.get("/assessment-result", (req, res) => {
   try {
-    const resultPath = path.join(
-      __dirname,
-      "..",
-      "agent",
-      "assessment_result.json"
-    );
+    const assessmentId = req.query.assessmentId;
+    let resultPath;
+
+    if (assessmentId) {
+      const safeId = assessmentId.replace(/[^a-zA-Z0-9_-]/g, "_");
+      resultPath = path.join(
+        __dirname,
+        "..",
+        "agent",
+        "assessments",
+        `${safeId}.json`
+      );
+    } else {
+      resultPath = path.join(
+        __dirname,
+        "..",
+        "agent",
+        "assessment_result.json"
+      );
+    }
 
     if (!fs.existsSync(resultPath)) {
       return res.status(404).json({

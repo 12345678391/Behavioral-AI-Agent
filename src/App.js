@@ -7,7 +7,23 @@ import {
   BEHAVIORAL_AREAS,
 } from "./config";
 
-
+function safeRandomUUID() {
+  if (
+    typeof window !== "undefined" &&
+    window.crypto &&
+    typeof window.crypto.randomUUID === "function"
+  ) {
+    try {
+      return window.crypto.randomUUID();
+    } catch {}
+  }
+  return (
+    "id-" +
+    Date.now().toString(36) +
+    "-" +
+    Math.random().toString(36).substring(2, 9)
+  );
+}
 
 function App() {
   const [room, setRoom] = useState(null);
@@ -61,6 +77,22 @@ function App() {
   }
 
   // ==========================================================
+  // CLEANUP ON UNMOUNT
+  // ==========================================================
+
+  useEffect(() => {
+    return () => {
+      if (room) {
+        try {
+          room.disconnect();
+        } catch (e) {
+          console.warn("Error disconnecting room on unmount:", e);
+        }
+      }
+    };
+  }, [room]);
+
+  // ==========================================================
   // LIVEKIT EVENTS
   // ==========================================================
 
@@ -92,6 +124,27 @@ function App() {
     }
 
     // --------------------------------------------------------
+    // CANDIDATE ANSWER TRANSCRIPT
+    // --------------------------------------------------------
+
+    if (type === "candidate_answer") {
+      const answer = eventData.answer || "";
+
+      if (answer) {
+        setConversation((previous) => [
+          ...previous,
+          {
+            id: safeRandomUUID(),
+            role: "candidate",
+            text: answer,
+          },
+        ]);
+      }
+
+      return;
+    }
+
+    // --------------------------------------------------------
     // NEW INTERVIEW QUESTION / SCENARIO
     // --------------------------------------------------------
 
@@ -108,7 +161,7 @@ function App() {
           (previous) => [
             ...previous,
             {
-              id: crypto.randomUUID(),
+              id: safeRandomUUID(),
               role: "ai",
               text: question,
             },
@@ -136,12 +189,10 @@ function App() {
         (previous) => [
           ...previous,
           {
-           
-            id: crypto.randomUUID(),
+            id: safeRandomUUID(),
             role: "ai",
             text:
                "Thank you for sharing your responses. We have about 40 seconds remaining in the assessment. Please finish your current response. I won't start another question. Once you're finished, we'll conclude the interview. Thank you for your time.",
-
           },
         ]
       );
@@ -160,7 +211,7 @@ function App() {
         (previous) => [
           ...previous,
           {
-            id: crypto.randomUUID(),
+            id: safeRandomUUID(),
             role: "ai",
             text:
               "Thank you for completing the behavioral assessment. I appreciate your time and your responses. The interview is now complete. Thank you.",
@@ -192,6 +243,14 @@ function App() {
       setConnected(false);
       setAssessmentStarted(false);
 
+      if (room) {
+        try {
+          room.disconnect();
+        } catch (e) {
+          console.warn("Error disconnecting room on error:", e);
+        }
+      }
+
       return;
     }
 
@@ -214,6 +273,14 @@ function App() {
       setAssessmentFinished(true);
       setConnected(false);
       setEnding(false);
+
+      if (room) {
+        try {
+          room.disconnect();
+        } catch (e) {
+          console.warn("Error disconnecting room on final result:", e);
+        }
+      }
 
       return;
     }
@@ -257,10 +324,24 @@ function App() {
 
             setConnected(true);
           },
-          () => {
+          (reason) => {
             console.log(
-              "Assessment room disconnected."
+              "Assessment room disconnected:",
+              reason
             );
+
+            setConnected(false);
+            setRoom(null);
+            setEnding(false);
+
+            setAssessmentFinished((finished) => {
+              if (!finished) {
+                setErrorMessage(
+                  "Connection to the assessment was closed."
+                );
+              }
+              return finished;
+            });
           }
         );
 
@@ -388,6 +469,7 @@ function App() {
     if (timeLeft === 0) {
       endAssessment();
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [
     timeLeft,
     connected,
