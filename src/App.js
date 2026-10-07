@@ -1,18 +1,13 @@
 import { useEffect, useState } from "react";
 import { getToken } from "./api";
 import { joinRoom } from "./LiveKitRoom";
+import {
+  INTERVIEW_DURATION_SECONDS,
+  WARNING_SECONDS,
+  BEHAVIORAL_AREAS,
+} from "./config";
 
-const INTERVIEW_DURATION_SECONDS = 10 * 60;
 
-const BEHAVIORAL_AREAS = [
-  "Communication",
-  "Teamwork",
-  "Adaptability",
-  "Accountability",
-  "Decision Making",
-  "Leadership",
-  "Problem Solving",
-];
 
 function App() {
   const [room, setRoom] = useState(null);
@@ -113,6 +108,7 @@ function App() {
           (previous) => [
             ...previous,
             {
+              id: crypto.randomUUID(),
               role: "ai",
               text: question,
             },
@@ -140,9 +136,12 @@ function App() {
         (previous) => [
           ...previous,
           {
+           
+            id: crypto.randomUUID(),
             role: "ai",
             text:
-              "Thank you for sharing your responses. We have about 40 seconds remaining in the assessment. Please finish your current response. I won't start another question. Once you're finished, we'll conclude the interview. Thank you for your time.",
+               "Thank you for sharing your responses. We have about 40 seconds remaining in the assessment. Please finish your current response. I won't start another question. Once you're finished, we'll conclude the interview. Thank you for your time.",
+
           },
         ]
       );
@@ -161,12 +160,37 @@ function App() {
         (previous) => [
           ...previous,
           {
+            id: crypto.randomUUID(),
             role: "ai",
             text:
               "Thank you for completing the behavioral assessment. I appreciate your time and your responses. The interview is now complete. Thank you.",
           },
         ]
       );
+
+      return;
+    }
+
+    // --------------------------------------------------------
+    // ASSESSMENT ERROR
+    // --------------------------------------------------------
+
+    if (
+      type === "assessment_error"
+    ) {
+      console.error(
+        "ASSESSMENT ERROR:",
+        eventData
+      );
+
+      setErrorMessage(
+        eventData.message ||
+          "The assessment finished, but the final behavioral analysis could not be generated."
+      );
+
+      setEnding(false);
+      setConnected(false);
+      setAssessmentStarted(false);
 
       return;
     }
@@ -263,6 +287,7 @@ function App() {
   // ==========================================================
 
   async function endAssessment() {
+    console.log("END CLICKED — room:", room);
     if (!room || ending) {
       return;
     }
@@ -840,7 +865,8 @@ function App() {
 
                     <p
                       className={`text-3xl font-bold ${
-                        timeLeft <= 40
+                        timeLeft <= WARNING_SECONDS
+                        
                           ? "text-red-400"
                           : "text-white"
                       }`}
@@ -886,7 +912,7 @@ function App() {
                       (item, index) => (
 
                         <div
-                          key={index}
+                          key={item.id}
                           className={`rounded-2xl p-4 ${
                             item.role === "ai"
                               ? "bg-slate-800"

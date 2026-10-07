@@ -2,11 +2,16 @@ import asyncio
 import json
 import os
 import time
-from pathlib import Path
 from dataclasses import dataclass, field
 from typing import Dict, List
 
 from dotenv import load_dotenv
+from config import (
+    ASSESSMENT_DURATION_SECONDS,
+    WARNING_SECONDS,
+    OPENAI_MODEL,
+    BEHAVIORAL_AREAS,
+)
 from openai import AsyncOpenAI
 
 from livekit.agents import (
@@ -27,79 +32,24 @@ from livekit.plugins import (
     openai,
     silero,
 )
-from config import (
-    ASSESSMENT_DURATION_SECONDS,
-    WARNING_SECONDS,
-    CLOSING_MESSAGE_PAUSE_SECONDS,
-    OPENAI_MODEL,
-    BEHAVIORAL_AREAS,
-    SYSTEM_PROMPT,
-    FINAL_ANALYSIS_PROMPT,
-)
+
 
 # ============================================================
 # ENVIRONMENT
 # ============================================================
 
-# Load environment variables from the most likely locations.
-# The project can keep .env in:
-#   C:\\Behavioral-AI-Agent\\.env
-# or .env/.env.local inside the agent folder.
-#
-# We intentionally do NOT print any secret values.
-
-BASE_DIR = Path(__file__).resolve().parent
-
-ENV_FILES = [
-    BASE_DIR / ".env.local",
-    BASE_DIR / ".env",
-    BASE_DIR.parent / ".env",
-]
-
-_loaded_env_file = None
-
-for _env_file in ENV_FILES:
-    if _env_file.exists():
-        load_dotenv(_env_file, override=False)
-        _loaded_env_file = _env_file
-        break
-
-print(
-    "Environment file:",
-    str(_loaded_env_file) if _loaded_env_file else "NOT FOUND",
-)
-
-# Deepgram is required because this agent uses Deepgram for both
-# speech-to-text and text-to-speech.
-if not os.getenv("DEEPGRAM_API_KEY"):
-    raise RuntimeError(
-        "DEEPGRAM_API_KEY was not found. "
-        "Create C:\\Behavioral-AI-Agent\\.env (or .env in the "
-        "agent folder) and add: DEEPGRAM_API_KEY=your_key"
-    )
-
-if not os.getenv("OPENAI_API_KEY"):
-    raise RuntimeError(
-        "OPENAI_API_KEY was not found in the environment."
-    )
-
-print("Deepgram API key loaded: True")
-print("OpenAI API key loaded: True")
+load_dotenv(".env.local")
 
 
 # ============================================================
 # ASSESSMENT SETTINGS
 # ============================================================
 
+WARNING_DELAY_SECONDS = (
+    ASSESSMENT_DURATION_SECONDS - WARNING_SECONDS
+)
 
-CLOSING_MESSAGE_PAUSE_SECONDS = 3
-
-RESULTS_DIR = Path(__file__).resolve().parent / "assessments"
-
-
-# ============================================================
-# BEHAVIORAL AREAS
-# ============================================================
+RESULT_FILE = "latest_assessment.json"
 
 
 # ============================================================
@@ -214,16 +164,11 @@ openai_client = AsyncOpenAI(
 
 def save_assessment(
     state: AssessmentState,
-    assessment_id: str,
 ):
-    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-
-    safe_id = "".join(
-        char if char.isalnum() or char in "-_" else "_"
-        for char in assessment_id
+    path = os.path.join(
+        os.path.dirname(__file__),
+        RESULT_FILE,
     )
-
-    path = RESULTS_DIR / f"{safe_id}.json"
 
     with open(
         path,
@@ -274,113 +219,8 @@ def extract_json(
 # ============================================================
 # FORMAT EVIDENCE FOR LLM
 # ============================================================
-def format_transcript(
-    state: AssessmentState,
-    max_turns: int = 6,
-) -> str:
-
-    if not state.transcript:
-        return "No recent conversation available."
-
-    recent_items = state.transcript[-max_turns:]
-
-    lines = []
-
-    for item in recent_items:
-
-        role = item.get(
-            "role",
-            "unknown",
-        )
-
-        text = item.get(
-            "text",
-            "",
-        )
-
-        lines.append(
-            f"{role.upper()}: {text}"
-        )
-
-    return "\n".join(lines)
-
 
 def format_evidence(
-    state: AssessmentState,
-    max_items_per_area: int = 2,
-) -> str:
-
-    lines = []
-
-    for area in BEHAVIORAL_AREAS:
-
-        items = state.evidence.get(
-            area,
-            [],
-        )
-
-        lines.append(
-            f"\n{area.upper()}:"
-        )
-
-        if not items:
-            lines.append(
-                "No evidence collected."
-            )
-            continue
-
-        recent_items = items[
-            -max_items_per_area:
-        ]
-
-        for item in recent_items:
-
-            lines.append(
-                f"- Evidence: {item.evidence}"
-            )
-
-            lines.append(
-                f"  Strength: {item.strength}"
-            )
-
-            lines.append(
-                f"  Confidence: {item.confidence}"
-            )
-
-    return "\n".join(lines)
-
-# ============================================================
-# FULL HISTORY FOR FINAL ANALYSIS
-# ============================================================
-def format_full_transcript(
-    state: AssessmentState,
-) -> str:
-
-    if not state.transcript:
-        return "No conversation available."
-
-    lines = []
-
-    for item in state.transcript:
-
-        role = item.get(
-            "role",
-            "unknown",
-        )
-
-        text = item.get(
-            "text",
-            "",
-        )
-
-        lines.append(
-            f"{role.upper()}: {text}"
-        )
-
-    return "\n".join(lines)
-
-
-def format_full_evidence(
     state: AssessmentState,
 ) -> str:
 
@@ -416,6 +256,38 @@ def format_full_evidence(
             lines.append(
                 f"  Confidence: {item.confidence}"
             )
+
+    return "\n".join(lines)
+
+
+# ============================================================
+# FORMAT TRANSCRIPT
+# ============================================================
+
+def format_transcript(
+    state: AssessmentState,
+) -> str:
+
+    if not state.transcript:
+        return "No transcript available."
+
+    lines = []
+
+    for item in state.transcript:
+
+        role = item.get(
+            "role",
+            "unknown",
+        )
+
+        text = item.get(
+            "text",
+            "",
+        )
+
+        lines.append(
+            f"{role.upper()}: {text}"
+        )
 
     return "\n".join(lines)
 
@@ -477,7 +349,7 @@ Rules:
     try:
 
         response = await openai_client.responses.create(
-            model="gpt-4.1",
+            model=OPENAI_MODEL,
             input=prompt,
         )
 
@@ -538,20 +410,15 @@ Rules:
 async def generate_adaptive_question(
     state: AssessmentState,
     remaining_seconds: int,
-    current_answer: str = "",
-    transcript: str | None = None,
-    evidence: str | None = None,
 ) -> str:
 
-    # Capture the adaptive-question context before the analysis task
-    # mutates state.evidence. The current answer is passed explicitly
-    # so the question generator can use the latest response even while
-    # evidence analysis runs in parallel.
-    if transcript is None:
-        transcript = format_transcript(state)
+    transcript = format_transcript(
+        state
+    )
 
-    if evidence is None:
-        evidence = format_evidence(state)
+    evidence = format_evidence(
+        state
+    )
 
     prompt = f"""
 You are an adaptive behavioral interviewer.
@@ -575,10 +442,6 @@ The candidate's previous conversation:
 Current behavioral evidence:
 
 {evidence}
-
-Candidate's latest answer:
-
-{current_answer}
 
 Time remaining:
 
@@ -612,7 +475,7 @@ Return ONLY the question text.
     try:
 
         response = await openai_client.responses.create(
-            model="gpt-4.1",
+            model=OPENAI_MODEL,
             input=prompt,
         )
 
@@ -646,11 +509,11 @@ async def generate_final_analysis(
     state: AssessmentState,
 ):
 
-    transcript = format_full_transcript(
+    transcript = format_transcript(
         state
     )
 
-    evidence = format_full_evidence(
+    evidence = format_evidence(
         state
     )
 
@@ -741,7 +604,7 @@ Rules:
     try:
 
         response = await openai_client.responses.create(
-            model="gpt-4.1",
+            model=OPENAI_MODEL,
             input=prompt,
         )
 
@@ -749,13 +612,11 @@ Rules:
             response.output_text
         )
 
-        if not result:
-            raise RuntimeError(
-                "OpenAI returned an empty or invalid final analysis response."
-            )
+        if result:
 
-        state.final_analysis = result
-        return result
+            state.final_analysis = result
+
+            return result
 
     except Exception as error:
 
@@ -764,9 +625,32 @@ Rules:
             repr(error),
         )
 
-        raise RuntimeError(
-            "Final behavioral analysis could not be generated."
-        ) from error
+    state.final_analysis = {
+        "scores": {
+            area: 0
+            for area in BEHAVIORAL_AREAS
+        },
+        "overall_score": 0,
+        "overall_communication":
+            "Insufficient assessment data was available.",
+        "strengths": [],
+        "areas_for_improvement": [],
+        "behavioral_summary":
+            "The assessment did not collect enough evidence to generate a complete behavioral summary.",
+        "team_working_style": {
+            "collaboration": 0,
+            "independence": 0,
+            "adaptability": 0,
+            "leadership": 0,
+            "structure": 0,
+            "autonomy": 0,
+            "summary":
+                "Insufficient evidence.",
+            "environment_alignment": [],
+        },
+    }
+
+    return state.final_analysis
 
 
 # ============================================================
@@ -885,9 +769,6 @@ async def entrypoint(
     # --------------------------------------------------------
 
     await ctx.connect()
-    assessment_id = ctx.room.name
-    print("AGENT ROOM:", ctx.room.name)
-    print("ASSESSMENT ID:", assessment_id)
 
     print(
         "Connected to LiveKit."
@@ -933,6 +814,29 @@ async def entrypoint(
     processed_transcripts = set()
 
     # --------------------------------------------------------
+    # AGENT SESSION
+    # --------------------------------------------------------
+
+    session = AgentSession(
+        stt=deepgram.STT(
+            model="nova-3"
+        ),
+        tts=deepgram.TTS(
+            model="aura-2-asteria-en"
+        ),
+        llm=openai.LLM(
+            model=OPENAI_MODEL
+        ),
+        vad=silero.VAD.load(),
+        turn_handling={
+            "interruption": {
+                "mode": "vad"
+            }
+        }
+    )
+
+
+    # --------------------------------------------------------
     # PARTICIPANT DISCONNECTED
     # --------------------------------------------------------
 
@@ -957,68 +861,54 @@ async def entrypoint(
     # --------------------------------------------------------
     # FRONTEND DATA
     # --------------------------------------------------------
-
-    @ctx.room.on(
-        "data_received"
-    )
-    def on_data_received(packet):
-
-        try:
-
-            decoded = packet.data.decode(
-                "utf-8"
-            )
-
-            payload = json.loads(
-                decoded
-            )
-
-            print(
-                "Browser data:",
-                payload,
-            )
-
-            if (
-                payload.get("type")
-                == "end_assessment"
-            ):
-
-                manual_end_requested.set()
-
-        except Exception as error:
-
-            print(
-                "Data receive error:",
-                repr(error),
-            )
-
-    # --------------------------------------------------------
-    # SESSION
-    # --------------------------------------------------------
-
-    session = AgentSession(
-
-        stt=deepgram.STT(
-            model="nova-3",
-        ),
-
-        tts=deepgram.TTS(
-            model="aura-2-asteria-en",
-        ),
-
-        llm=openai.LLM(
-            model="gpt-4.1",
-        ),
-
-        vad=silero.VAD.load(),
-
-        turn_handling={
-            "interruption": {
-                "mode": "vad"
-            }
-        },
+    @ctx.room.on("data_received")
+    def on_data_received(data: rtc.DataPacket):
+      print(
+        "DATA RECEIVED CALLBACK FIRED:",
+        type(data),
     )
 
+    try:
+        raw_data = getattr(data, "data", None)
+
+        print(
+            "RAW DATA:",
+            raw_data,
+        )
+
+        if raw_data is None:
+            print(
+                "Data packet has no data field."
+            )
+            return
+
+        decoded = raw_data.decode("utf-8")
+
+        print(
+            "DECODED DATA:",
+            decoded,
+        )
+
+        payload = json.loads(decoded)
+
+        print(
+            "Browser data:",
+            payload,
+        )
+
+        if payload.get("type") == "end_assessment":
+            print(
+                "Manual end request received from browser."
+            )
+
+            manual_end_requested.set()
+
+    except Exception as error:
+        print(
+            "Data receive error:",
+            repr(error),
+        )
+    
     # --------------------------------------------------------
     # USER TRANSCRIPT EVENT
     # --------------------------------------------------------
@@ -1257,7 +1147,6 @@ async def entrypoint(
         print(
             f"{WARNING_SECONDS} seconds remaining."
         )
-        
 
         await send_ui_event(
             ctx,
@@ -1269,12 +1158,12 @@ async def entrypoint(
         )
 
         warning_message = (
-           "Thank you for sharing your responses. "
-           f"We have about {WARNING_SECONDS} seconds remaining in the assessment. "
-           "Please finish your current response. "
-           "I won't start another question. "
-           "Once you're finished, we'll conclude the interview. "
-           "Thank you for your time."
+            "Thank you for sharing your responses. "
+            "We have about 40 seconds remaining in the assessment. "
+            "Please finish your current response. "
+            "I won't start another question. "
+            "Once you're finished, we'll conclude the interview. "
+            "Thank you for your time."
         )
 
         await session.say(
@@ -1306,10 +1195,6 @@ async def entrypoint(
     # INTERVIEW LOOP
     # --------------------------------------------------------
 
-    answer_task = asyncio.create_task(
-    user_answer_queue.get()
-    )
-
     try:
 
         while True:
@@ -1333,7 +1218,9 @@ async def entrypoint(
             # WAIT FOR CANDIDATE ANSWER
             # ----------------------------------------------
 
-            
+            answer_task = asyncio.create_task(
+                user_answer_queue.get()
+            )
 
             disconnect_task = asyncio.create_task(
                 candidate_disconnected.wait()
@@ -1347,28 +1234,24 @@ async def entrypoint(
                 timer_finished.wait()
             )
 
+            tasks = {
+                answer_task,
+                disconnect_task,
+                manual_task,
+                timer_task,
+            }
+
             done, pending = await asyncio.wait(
-                {
-                    answer_task,
-                    disconnect_task,
-                    manual_task,
-                    timer_task,
-                },
+                tasks,
                 return_when=asyncio.FIRST_COMPLETED,
             )
 
-            pending_event_tasks = {
-               task
-               for task in pending
-               if task is not answer_task
-            }
-
-            for task in pending_event_tasks:
+            for task in pending:
                 task.cancel()
 
-            if pending_event_tasks:
+            if pending:
                 await asyncio.gather(
-                   *pending_event_tasks,
+                    *pending,
                     return_exceptions=True,
                 )
 
@@ -1384,6 +1267,9 @@ async def entrypoint(
             # ----------------------------------------------
 
             if manual_end_requested.is_set():
+                print(
+                    "Manual end requested."
+                )
                 break
 
             # ----------------------------------------------
@@ -1479,53 +1365,12 @@ async def entrypoint(
                     break
 
                 # ------------------------------------------
-                # ANALYZE ANSWER + GENERATE QUESTION
-                # IN PARALLEL
+                # ANALYZE ANSWER
                 # ------------------------------------------
 
-                # Snapshot the context before analysis mutates
-                # state.evidence. The latest answer is passed
-                # explicitly to the question generator.
-                question_transcript = format_transcript(
-                    state
-                )
-
-                question_evidence = format_evidence(
-                    state
-                )
-
-                print(
-                    "DEBUG: starting analysis + question generation"
-                )
-
-                start_time = time.perf_counter()
-
-                analysis_task = asyncio.create_task(
-                    analyze_candidate_answer(
-                        state,
-                        answer,
-                    )
-                )
-
-                question_task = asyncio.create_task(
-                    generate_adaptive_question(
-                        state,
-                        remaining_seconds,
-                        current_answer=answer,
-                        transcript=question_transcript,
-                        evidence=question_evidence,
-                    )
-                )
-
-                analysis_result, question = await asyncio.gather(
-                    analysis_task,
-                    question_task,
-                )
-
-                elapsed = time.perf_counter() - start_time
-
-                print(
-                    f"DEBUG: analysis + question generation took {elapsed:.2f} seconds"
+                await analyze_candidate_answer(
+                    state,
+                    answer,
                 )
 
                 print(
@@ -1533,8 +1378,15 @@ async def entrypoint(
                 )
 
                 # ------------------------------------------
-                # NEXT ADAPTIVE QUESTION
+                # GENERATE NEXT ADAPTIVE QUESTION
                 # ------------------------------------------
+
+                question = (
+                    await generate_adaptive_question(
+                        state,
+                        remaining_seconds,
+                    )
+                )
 
                 if not question:
                     break
@@ -1598,18 +1450,6 @@ async def entrypoint(
     finally:
 
         # ----------------------------------------------------
-        # STOP ANSWER TASK
-        # ----------------------------------------------------
-
-        if not answer_task.done():
-            answer_task.cancel()
-
-        try:
-            await answer_task
-        except asyncio.CancelledError:
-            pass
-
-        # ----------------------------------------------------
         # STOP CLOCK
         # ----------------------------------------------------
 
@@ -1634,13 +1474,33 @@ async def entrypoint(
 
     elif manual_end_requested.is_set():
 
-        # IMPORTANT:
-        # Do not send assessment_closing or wait for a spoken
-        # closing message here. The frontend may treat the
-        # closing event as a signal to disconnect the LiveKit
-        # room. We must generate and publish final_result first.
         print(
-            "Manual end requested. Proceeding directly to final analysis."
+            "Starting manual assessment closing."
+        )
+
+        closing_message = (
+            "Thank you for taking the time to complete "
+            "the behavioral assessment. "
+            "I appreciate your responses. "
+            "The interview is now complete. "
+            "Thank you, and have a great day."
+        )
+
+        await send_ui_event(
+            ctx,
+            "assessment_closing",
+            {
+                "reason":
+                    "manual_end",
+            },
+        )
+
+        await session.say(
+            closing_message
+        )
+
+        await asyncio.sleep(
+            3
         )
 
     else:
@@ -1666,9 +1526,8 @@ async def entrypoint(
         )
 
         await asyncio.sleep(
-            CLOSING_MESSAGE_PAUSE_SECONDS
+            3
         )
-        
 
     # ========================================================
     # FINAL ANALYSIS
@@ -1678,43 +1537,16 @@ async def entrypoint(
         "Generating final behavioral analysis..."
     )
 
-    try:
-        final_analysis = await generate_final_analysis(
+    final_analysis = (
+        await generate_final_analysis(
             state
         )
+    )
 
-    except Exception as error:
+    state.final_analysis = (
+        final_analysis
+    )
 
-        print(
-            "Final assessment generation failed:",
-            repr(error),
-        )
-
-        state.completed = False
-
-        # Save the interview/transcript even when the final LLM
-        # analysis fails. Never replace a failed analysis with
-        # a misleading all-zero report.
-        save_assessment(
-            state,
-            assessment_id,
-        )
-
-        await send_ui_event(
-            ctx,
-            "assessment_error",
-            {
-                "stage": "final_analysis",
-                "message": (
-                    "The interview was completed, but the final behavioral analysis could not be generated. "
-                    "Your interview data has been saved."
-                ),
-            },
-        )
-
-        return
-
-    state.final_analysis = final_analysis
     state.completed = True
 
     # ========================================================
@@ -1722,30 +1554,26 @@ async def entrypoint(
     # ========================================================
 
     save_assessment(
-        state,
-        assessment_id,
+        state
     )
 
     # ========================================================
     # SEND FINAL RESULT TO FRONTEND
     # ========================================================
 
-    try:
-        await send_ui_event(
-            ctx,
-            "final_result",
-            state.to_dict(),
-        )
-        print(
-            "FINAL RESULT SENT TO FRONTEND."
-        )
-    except Exception as error:
-        print(
-            "Final result send failed:",
-            repr(error),
-        )
-    
-    
+    print(
+        "Sending final_result to frontend..."
+    )
+
+    await send_ui_event(
+        ctx,
+        "final_result",
+        state.to_dict(),
+    )
+
+    print(
+        "final_result sent."
+    )
 
     print()
     print(
@@ -1759,8 +1587,9 @@ async def entrypoint(
     )
     print()
 
-    return
-
+    await asyncio.sleep(
+        3
+    )
 
 
 # ============================================================

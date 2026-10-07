@@ -1,0 +1,66 @@
+{
+  "candidate_introduction": "My name is Antita Singh.",
+  "transcript": [
+    {
+      "role": "interviewer",
+      "text": "To begin, please introduce yourself and briefly tell me about your background."
+    },
+    {
+      "role": "candidate",
+      "text": "My name is Antita Singh."
+    }
+  ],
+  "behavioral_evidence": {
+    "communication": [
+      {
+        "area": "communication",
+        "evidence": "Introduced self clearly by stating name.",
+        "strength": "weak",
+        "confidence": 0.6
+      }
+    ],
+    "teamwork": [],
+    "adaptability": [],
+    "accountability": [],
+    "decision_making": [],
+    "leadership": [],
+    "problem_solving": []
+  },
+  "questions_asked": 1,
+  "completed": true,
+  "final_analysis": {
+    "scores": {
+      "communication": 10,
+      "teamwork": 0,
+      "adaptability": 0,
+      "accountability": 0,
+      "decision_making": 0,
+      "leadership": 0,
+      "problem_solving": 0
+    },
+    "overall_score": 1,
+    "overall_communication": "Candidate clearly introduced themselves by name, demonstrating a basic level of communication. No further evidence of communication skills provided.",
+    "strengths": [
+      "Clearly stated name when prompted"
+    ],
+    "areas_for_improvement": [
+      "Provide more comprehensive responses to showcase additional behavioral competencies",
+      "Offer specific examples to illustrate strengths in teamwork, adaptability, and problem solving"
+    ],
+    "behavioral_summary": "At this stage, observable evidence is limited to the candidate introducing themselves. No substantial behavioral information is available on other relevant dimensions.",
+    "team_working_style": {
+      "collaboration": 0,
+      "independence": 0,
+      "adaptability": 0,
+      "leadership": 0,
+      "structure": 0,
+      "autonomy": 0,
+      "summary": "No evidence collected on team working style or preferred behaviors in collaborative or independent settings.",
+      "environment_alignment": [
+        "Insufficient information for alignment assessment",
+        "",
+        ""
+      ]
+    }
+  }
+}

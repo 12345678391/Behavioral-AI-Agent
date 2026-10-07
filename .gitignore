@@ -1,4 +1,4 @@
-# Environment / credentials
+# Environment variables
 .env
 .env.*
 !.env.example
@@ -8,11 +8,14 @@ node_modules/
 
 # Python
 .venv/
+.venv-*/
 __pycache__/
 *.pyc
 
 # Logs
 logs/
 *.log
+
+# Project generated files
 agent/latest_assessment.json
 agent/assessment_result.json

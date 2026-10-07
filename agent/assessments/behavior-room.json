@@ -1,0 +1,68 @@
+{
+  "candidate_introduction": "My name is.",
+  "transcript": [
+    {
+      "role": "candidate",
+      "text": "My name is."
+    },
+    {
+      "role": "interviewer",
+      "text": "To begin, please introduce yourself and briefly tell me about your"
+    }
+  ],
+  "behavioral_evidence": {
+    "communication": [
+      {
+        "area": "communication",
+        "evidence": "Candidate introduced themselves briefly.",
+        "strength": "weak",
+        "confidence": 0.9
+      }
+    ],
+    "teamwork": [],
+    "adaptability": [],
+    "accountability": [],
+    "decision_making": [],
+    "leadership": [],
+    "problem_solving": []
+  },
+  "questions_asked": 1,
+  "completed": true,
+  "final_analysis": {
+    "scores": {
+      "communication": 15,
+      "teamwork": 0,
+      "adaptability": 0,
+      "accountability": 0,
+      "decision_making": 0,
+      "leadership": 0,
+      "problem_solving": 0
+    },
+    "overall_score": 2,
+    "overall_communication": "The candidate gave a brief introduction. Verbal communication was minimally demonstrated based on the transcript.",
+    "strengths": [
+      "Demonstrated willingness to respond to prompt",
+      "",
+      ""
+    ],
+    "areas_for_improvement": [
+      "Provide more comprehensive responses",
+      "Demonstrate additional behavioral competencies"
+    ],
+    "behavioral_summary": "The available transcript provides extremely limited behavioral evidence, with only a brief self-introduction by the candidate. No information is available to assess other key behavioral dimensions.",
+    "team_working_style": {
+      "collaboration": 0,
+      "independence": 0,
+      "adaptability": 0,
+      "leadership": 0,
+      "structure": 0,
+      "autonomy": 0,
+      "summary": "No evidence collected to assess team working style.",
+      "environment_alignment": [
+        "",
+        "",
+        ""
+      ]
+    }
+  }
+}

@@ -3,12 +3,15 @@ const { AccessToken } = require("livekit-server-sdk");
 const cors = require("cors");
 const fs = require("fs");
 const path = require("path");
-require("dotenv").config();
+require("dotenv").config({ path: path.join(__dirname, ".env") });
 
 const app = express();
 
-app.use(cors());
-app.use(express.json());
+app.use(
+  cors({
+     origin: process.env.FRONTEND_ORIGIN,
+  })
+);
 
 
 // ---------------------------------------------------------
