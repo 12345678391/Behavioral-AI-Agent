@@ -358,7 +358,9 @@ function App() {
       );
 
       setErrorMessage(
-        "Could not start the assessment. Make sure the Node.js server and Python AI agent are running."
+        error?.message
+          ? `Could not start the assessment: ${error.message}`
+          : "Could not start the assessment. Make sure the Node.js server and Python AI agent are running."
       );
     }
   }

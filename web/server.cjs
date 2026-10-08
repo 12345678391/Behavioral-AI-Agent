@@ -4,21 +4,47 @@ const cors = require("cors");
 const fs = require("fs");
 const path = require("path");
 require("dotenv").config({ path: path.join(__dirname, ".env") });
+require("dotenv").config({ path: path.join(__dirname, "..", ".env") });
 
 const app = express();
 
+const allowedOrigin = process.env.FRONTEND_ORIGIN || "http://localhost:3000";
+
 app.use(
   cors({
-     origin: process.env.FRONTEND_ORIGIN,
+    origin: (origin, callback) => {
+      if (!origin) return callback(null, true);
+
+      const isLocalhost =
+        /^http:\/\/localhost(:\d+)?$/.test(origin) ||
+        /^http:\/\/127\.0\.0\.1(:\d+)?$/.test(origin);
+
+      if (origin === allowedOrigin || isLocalhost) {
+        return callback(null, true);
+      }
+
+      callback(new Error("CORS request blocked by policy."));
+    },
+    credentials: true,
   })
 );
 
+app.use(express.json());
+
+// ---------------------------------------------------------
+// HEALTH CHECK
+// ---------------------------------------------------------
+app.get(["/health", "/api/health"], (req, res) => {
+  res.json({
+    status: "ok",
+    message: "Token + Assessment API running on http://localhost:3001",
+  });
+});
 
 // ---------------------------------------------------------
 // LIVEKIT TOKEN
 // ---------------------------------------------------------
-
-app.get("/token", async (req, res) => {
+app.get(["/token", "/api/token"], async (req, res) => {
   try {
     const rawRoom = req.query.room;
     const room =
@@ -63,7 +89,7 @@ app.get("/token", async (req, res) => {
 // ASSESSMENT RESULT
 // ---------------------------------------------------------
 
-app.get("/assessment-result", (req, res) => {
+app.get(["/assessment-result", "/api/assessment-result"], (req, res) => {
   try {
     const assessmentId = req.query.assessmentId;
     let resultPath;

@@ -1,5 +1,23 @@
-const API_BASE_URL =
-  process.env.REACT_APP_API_BASE_URL || "http://localhost:5000/api";
+let rawBaseUrl =
+  process.env.REACT_APP_API_BASE_URL || "http://localhost:3001";
+
+// Auto-correct legacy port 5000 (from previous configurations) to port 3001
+if (rawBaseUrl.includes("localhost:5000") || rawBaseUrl.includes("127.0.0.1:5000")) {
+  console.warn(
+    "Detected legacy backend port 5000 in REACT_APP_API_BASE_URL. Redirecting API requests to port 3001."
+  );
+  rawBaseUrl = rawBaseUrl.replace(":5000", ":3001");
+}
+
+// Strip trailing slash
+rawBaseUrl = rawBaseUrl.replace(/\/+$/, "");
+
+// Normalize port 3001 base URL so it maps cleanly to /token and /assessment-result
+if (rawBaseUrl.includes("localhost:3001") || rawBaseUrl.includes("127.0.0.1:3001")) {
+  rawBaseUrl = rawBaseUrl.replace(/\/api$/, "");
+}
+
+const API_BASE_URL = rawBaseUrl;
 
 export async function getToken(identity = "candidate", room) {
   if (!API_BASE_URL) {
@@ -17,10 +35,17 @@ export async function getToken(identity = "candidate", room) {
   const queryString = params.toString();
   const url = `${API_BASE_URL}/token${queryString ? `?${queryString}` : ""}`;
 
-  const response = await fetch(url);
+  let response;
+  try {
+    response = await fetch(url);
+  } catch (networkError) {
+    throw new Error(
+      `Failed to connect to backend at ${url}. ${networkError.message || ""}`
+    );
+  }
 
   if (!response.ok) {
-    let message = "Failed to get LiveKit token.";
+    let message = `Failed to get LiveKit token (HTTP ${response.status}).`;
 
     try {
       const data = await response.json();
@@ -41,14 +66,21 @@ export async function getAssessmentResult(assessmentId) {
     throw new Error("Assessment ID is required.");
   }
 
-  const response = await fetch(
-    `${API_BASE_URL}/assessment-result?assessmentId=${encodeURIComponent(
-      assessmentId
-    )}`
-  );
+  const url = `${API_BASE_URL}/assessment-result?assessmentId=${encodeURIComponent(
+    assessmentId
+  )}`;
+
+  let response;
+  try {
+    response = await fetch(url);
+  } catch (networkError) {
+    throw new Error(
+      `Failed to connect to backend at ${url}. ${networkError.message || ""}`
+    );
+  }
 
   if (!response.ok) {
-    let message = "Assessment result is not ready yet.";
+    let message = `Assessment result is not ready yet (HTTP ${response.status}).`;
 
     try {
       const data = await response.json();
