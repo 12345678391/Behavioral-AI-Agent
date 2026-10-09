@@ -82,13 +82,9 @@ print(
     str(_loaded_env_file) if _loaded_env_file else "NOT FOUND",
 )
 
-# Deepgram is required because this agent uses Deepgram for both
-# speech-to-text and text-to-speech.
 if not os.getenv("DEEPGRAM_API_KEY"):
     raise RuntimeError(
-        "DEEPGRAM_API_KEY was not found. "
-        "Create C:\\Behavioral-AI-Agent\\.env (or .env in the "
-        "agent folder) and add: DEEPGRAM_API_KEY=your_key"
+        "DEEPGRAM_API_KEY was not found in the environment."
     )
 
 if not os.getenv("OPENAI_API_KEY"):
@@ -96,8 +92,39 @@ if not os.getenv("OPENAI_API_KEY"):
         "OPENAI_API_KEY was not found in the environment."
     )
 
+if not os.getenv("LIVEKIT_URL"):
+    raise RuntimeError(
+        "LIVEKIT_URL was not found in the environment."
+    )
+
+if not os.getenv("LIVEKIT_API_KEY"):
+    raise RuntimeError(
+        "LIVEKIT_API_KEY was not found in the environment."
+    )
+
+if not os.getenv("LIVEKIT_API_SECRET"):
+    raise RuntimeError(
+        "LIVEKIT_API_SECRET was not found in the environment."
+    )
+
+print("LiveKit URL loaded:", bool(os.getenv("LIVEKIT_URL")))
+print("LiveKit API key loaded:", bool(os.getenv("LIVEKIT_API_KEY")))
+print("LiveKit API secret loaded:", bool(os.getenv("LIVEKIT_API_SECRET")))
 print("Deepgram API key loaded: True")
 print("OpenAI API key loaded: True")
+
+# Ensure Render health checks succeed whether hitting / or /health
+from aiohttp import web
+_orig_add_routes = web.Application.add_routes
+
+def _patched_add_routes(self, routes):
+    extra = []
+    for route in routes:
+        if getattr(route, "path", None) == "/":
+            extra.append(web.get("/health", route.handler))
+    return _orig_add_routes(self, list(routes) + extra)
+
+web.Application.add_routes = _patched_add_routes
 
 
 # ============================================================
@@ -1787,6 +1814,15 @@ async def entrypoint(
 # ============================================================
 
 if __name__ == "__main__":
+    import sys
+
+    # Ensure unbuffered stdout so logs stream immediately to Render / console
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(line_buffering=True)
+
+    # If no CLI subcommand is provided, default to 'start' for production deployment
+    if len(sys.argv) <= 1:
+        sys.argv.append("start")
 
     cli.run_app(
         WorkerOptions(
