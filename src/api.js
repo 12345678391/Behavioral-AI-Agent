@@ -12,10 +12,8 @@ if (rawBaseUrl.includes("localhost:5000") || rawBaseUrl.includes("127.0.0.1:5000
 // Strip trailing slash
 rawBaseUrl = rawBaseUrl.replace(/\/+$/, "");
 
-// Normalize port 3001 base URL so it maps cleanly to /token and /assessment-result
-if (rawBaseUrl.includes("localhost:3001") || rawBaseUrl.includes("127.0.0.1:3001")) {
-  rawBaseUrl = rawBaseUrl.replace(/\/api$/, "");
-}
+// Normalize base URL so it maps cleanly to /token and /assessment-result
+rawBaseUrl = rawBaseUrl.replace(/\/api$/, "");
 
 const API_BASE_URL = rawBaseUrl;
 
