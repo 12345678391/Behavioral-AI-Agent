@@ -9,7 +9,8 @@ export async function joinRoom(
   serverUrl,
   onData,
   onConnected,
-  onDisconnected
+  onDisconnected,
+  onMicrophoneError
 ) {
   const room = new Room({
     adaptiveStream: true,
@@ -120,9 +121,11 @@ export async function joinRoom(
     RoomEvent.Connected,
     async () => {
       console.log(
-        "Connected to LiveKit room:",
+        "[LiveKit] Connected to room:",
         room.name
       );
+
+      console.log("[LiveKit] Microphone publication started.");
 
       try {
         await room.localParticipant.setMicrophoneEnabled(
@@ -130,24 +133,38 @@ export async function joinRoom(
         );
 
         console.log(
-          "Microphone enabled."
+          "[LiveKit] Microphone publication completed successfully."
         );
       } catch (error) {
-        console.error(
-          "Microphone error:",
-          error
-        );
+        const isCancelled =
+          error?.message?.includes("Cancelled publication") ||
+          room.state === "disconnected";
+
+        if (isCancelled) {
+          console.log(
+            "[LiveKit] Microphone publication was cancelled (room disconnected or track unpublished)."
+          );
+        } else {
+          console.error(
+            "[LiveKit] Microphone setup error:",
+            error?.message || error
+          );
+
+          if (onMicrophoneError) {
+            onMicrophoneError(error);
+          }
+        }
       }
 
       try {
         await room.startAudio();
 
         console.log(
-          "LiveKit audio started."
+          "[LiveKit] LiveKit audio playback started."
         );
       } catch (error) {
         console.warn(
-          "startAudio warning:",
+          "[LiveKit] startAudio warning:",
           error
         );
       }
@@ -166,7 +183,7 @@ export async function joinRoom(
     RoomEvent.Disconnected,
     (reason) => {
       console.log(
-        "Disconnected from LiveKit:",
+        "[LiveKit] Room disconnected event received. Reason:",
         reason
       );
 
@@ -191,20 +208,29 @@ export async function joinRoom(
   // ==========================================================
 
   console.log(
-    "Connecting to LiveKit..."
+    "[LiveKit] Room connection started..."
   );
 
-  await room.connect(
-    serverUrl,
-    token,
-    {
-      autoSubscribe: true,
-    }
-  );
+  try {
+    await room.connect(
+      serverUrl,
+      token,
+      {
+        autoSubscribe: true,
+      }
+    );
 
-  console.log(
-    "Successfully connected to LiveKit."
-  );
+    console.log(
+      "[LiveKit] Room connection completed. Room name:",
+      room.name
+    );
+  } catch (error) {
+    console.error(
+      "[LiveKit] Failed to connect to room:",
+      error?.message || error
+    );
+    throw error;
+  }
 
   return room;
 }
