@@ -254,6 +254,37 @@ const server = app.listen(0, async () => {
       process.env.LIVEKIT_API_SECRET = origSecret;
     }
 
+    // Test 19: POST /assessment-result and cached retrieval via GET /assessment-result
+    const testAssessmentPayload = {
+      assessment_id: "test-assessment-sync-room",
+      completed: true,
+      final_analysis: {
+        overall_score: 85,
+        scores: { communication: 90, teamwork: 85 },
+      },
+    };
+    const postRes = await fetch(`http://localhost:${port}/assessment-result?assessmentId=test-assessment-sync-room`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(testAssessmentPayload),
+    });
+    const postJson = await postRes.json();
+
+    const getRes = await fetch(`http://localhost:${port}/assessment-result?assessmentId=test-assessment-sync-room`);
+    const getJson = await getRes.json();
+
+    if (
+      postRes.status === 200 &&
+      postJson.success &&
+      getRes.status === 200 &&
+      getJson.final_analysis?.overall_score === 85
+    ) {
+      console.log("PASS: POST and cached GET /assessment-result cross-container sync works");
+    } else {
+      console.error("FAIL: POST /assessment-result sync test failed", postRes.status, getRes.status);
+      failures++;
+    }
+
   } catch (err) {
     console.error("Test execution error:", err);
     failures++;

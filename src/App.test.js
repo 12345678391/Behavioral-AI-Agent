@@ -451,5 +451,113 @@ describe('Behavioral AI Agent App', () => {
     // Verify "Connection to the assessment was closed" is NOT shown
     expect(screen.queryByText(/Connection to the assessment was closed/i)).not.toBeInTheDocument();
   });
+
+  test('end assessment delivery: final_result renders complete behavioral assessment report in UI', async () => {
+    let capturedOnData = null;
+    const mockRoom = {
+      name: 'test-room-report',
+      disconnect: jest.fn(),
+      localParticipant: {
+        publishData: jest.fn().mockResolvedValue(true),
+      },
+    };
+
+    api.getToken.mockResolvedValueOnce({
+      token: 'fake-jwt',
+      serverUrl: 'wss://test.livekit.cloud',
+      room: 'test-room-report',
+    });
+
+    livekitRoom.joinRoom.mockImplementation((
+      token,
+      url,
+      onData,
+      onConnected,
+      onDisconnected
+    ) => {
+      capturedOnData = onData;
+      if (onConnected) onConnected();
+      return Promise.resolve(mockRoom);
+    });
+
+    render(<App />);
+    const startButton = screen.getByRole('button', { name: /Start Assessment/i });
+    await act(async () => {
+      fireEvent.click(startButton);
+    });
+
+    // Deliver final_result
+    await act(async () => {
+      capturedOnData({
+        type: 'final_result',
+        data: {
+          completed: true,
+          final_analysis: {
+            overall_score: 92,
+            scores: {
+              communication: 95,
+              teamwork: 90,
+              adaptability: 88,
+              accountability: 91,
+              decision_making: 94,
+              leadership: 89,
+              problem_solving: 92,
+            },
+            strengths: ['Clear and articulate communicator under pressure.'],
+            areas_for_improvement: ['Delegate earlier in project milestones.'],
+            behavioral_summary: 'Demonstrated outstanding collaborative problem-solving capabilities.',
+            team_working_style: {
+              summary: 'Proactive and supportive collaborator.',
+            },
+          },
+        },
+      });
+    });
+
+    // The full report must be rendered
+    expect(screen.getByText(/Behavioral Assessment Report/i)).toBeInTheDocument();
+    expect(screen.getByText(/Assessment Complete/i)).toBeInTheDocument();
+    expect(screen.getAllByText(/92/).length).toBeGreaterThan(0);
+    expect(screen.getByText(/Clear and articulate communicator under pressure/i)).toBeInTheDocument();
+  });
+
+  test('end assessment idempotency: repeated clicks do not send duplicate publishData calls', async () => {
+    const mockRoom = {
+      name: 'test-room-clicks',
+      disconnect: jest.fn(),
+      localParticipant: {
+        publishData: jest.fn().mockResolvedValue(true),
+      },
+    };
+
+    api.getToken.mockResolvedValueOnce({
+      token: 'fake-jwt',
+      serverUrl: 'wss://test.livekit.cloud',
+      room: 'test-room-clicks',
+    });
+
+    livekitRoom.joinRoom.mockImplementation((token, url, onData, onConnected) => {
+      if (onConnected) onConnected();
+      return Promise.resolve(mockRoom);
+    });
+
+    render(<App />);
+    const startButton = screen.getByRole('button', { name: /Start Assessment/i });
+    await act(async () => {
+      fireEvent.click(startButton);
+    });
+
+    const endButton = screen.getByRole('button', { name: /End Assessment/i });
+
+    // Click multiple times rapidly
+    await act(async () => {
+      fireEvent.click(endButton);
+      fireEvent.click(endButton);
+      fireEvent.click(endButton);
+    });
+
+    // publishData must only be called once
+    expect(mockRoom.localParticipant.publishData).toHaveBeenCalledTimes(1);
+  });
 });
 

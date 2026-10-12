@@ -535,7 +535,7 @@ function App() {
   async function endAssessment() {
     const activeRoom = roomRef.current || room;
     console.log("[App] Assessment completion requested. Active room present:", !!activeRoom);
-    if (!activeRoom || ending) {
+    if (!activeRoom || ending || endingRef.current || assessmentFinished || assessmentFinishedRef.current) {
       return;
     }
 
