@@ -838,8 +838,7 @@ Rules:
             raw_text = chat_resp.choices[0].message.content or ""
         except Exception as chat_err:
             print(f"[Agent] chat.completions fallback also failed ({chat_err!r})")
-            if last_error is None:
-                last_error = chat_err
+            last_error = chat_err
             raise RuntimeError(f"OpenAI final analysis generation failed: {last_error}") from last_error
 
     try:
@@ -859,6 +858,9 @@ Rules:
 
         if "overall_score" not in result or not isinstance(result["overall_score"], (int, float)):
             result["overall_score"] = int(sum(result["scores"].values()) / max(len(result["scores"]), 1))
+
+        if "overall_communication" not in result or not result["overall_communication"]:
+            result["overall_communication"] = "Communicated clearly and responded to interview scenarios."
 
         if "strengths" not in result or not isinstance(result["strengths"], list):
             result["strengths"] = ["Demonstrated engaged participation throughout the interview."]
