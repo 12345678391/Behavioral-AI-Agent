@@ -234,19 +234,44 @@ function App() {
     if (
       type === "assessment_error"
     ) {
+      const stage = eventData?.stage || "final_analysis";
+      const code = eventData?.code || eventData?.error_type || "ASSESSMENT_ERROR";
+      const httpStatus = eventData?.http_status || "";
+      const message =
+        eventData?.message ||
+        "The interview was completed, but the final behavioral analysis could not be generated.";
+      const details = eventData?.error_details || "";
+
       console.error(
-        "ASSESSMENT ERROR:",
-        eventData
+        `[App] ASSESSMENT ERROR in stage '${stage}' [code: ${code}${httpStatus ? `, status: ${httpStatus}` : ""}]: ${message}` +
+          (details ? ` (details: ${details})` : ""),
+        { stage, code, httpStatus, message, details }
       );
 
+      // Preserve recoverable conversation transcript if provided
+      if (
+        eventData?.recoverable_data?.transcript &&
+        Array.isArray(eventData.recoverable_data.transcript) &&
+        eventData.recoverable_data.transcript.length > 0
+      ) {
+        setConversation(
+          eventData.recoverable_data.transcript.map((item) => ({
+            id: safeRandomUUID(),
+            role: item.role === "candidate" ? "user" : item.role,
+            text: item.text,
+          }))
+        );
+      }
+
       setErrorMessage(
-        eventData.message ||
-          "The assessment finished, but the final behavioral analysis could not be generated."
+        `${message}${details ? ` (Details: ${details})` : ""}`
       );
 
       setEnding(false);
       setConnected(false);
-      setAssessmentStarted(false);
+      // Mark as finished so results/completion review is displayed with recoverable data
+      // and onDisconnected does not overwrite the message
+      setAssessmentFinished(true);
 
       const activeRoom = roomRef.current || room;
       if (activeRoom) {
@@ -270,13 +295,16 @@ function App() {
     if (
       type === "final_result"
     ) {
+      const finalData = data.data || data;
       console.log(
-        "FINAL ASSESSMENT RESULT:",
-        data
+        "[App] Final assessment result received:",
+        finalData
       );
 
+      setErrorMessage("");
+
       setAssessmentResult(
-        data.data || data
+        finalData
       );
 
       setAssessmentFinished(true);
@@ -360,7 +388,7 @@ function App() {
             setAssessmentFinished((finished) => {
               if (!finished) {
                 setErrorMessage(
-                  "Connection to the assessment was closed."
+                  (prev) => prev || "Connection to the assessment was closed."
                 );
               }
               return finished;
@@ -556,6 +584,98 @@ function App() {
 
   function startNewAssessment() {
     window.location.reload();
+  }
+
+  // ==========================================================
+  // ASSESSMENT COMPLETED WITH NOTICE (PRESERVE RECOVERABLE DATA)
+  // ==========================================================
+
+  if (
+    assessmentFinished &&
+    !assessmentResult
+  ) {
+    return (
+      <div className="min-h-screen bg-slate-950 text-white">
+        <header className="border-b border-slate-800">
+          <div className="mx-auto flex max-w-7xl items-center justify-between px-6 py-5">
+            <div>
+              <h1 className="text-2xl font-bold">
+                Behavioral AI
+              </h1>
+              <p className="mt-1 text-sm text-slate-400">
+                Assessment Status
+              </p>
+            </div>
+
+            <div className="rounded-full bg-amber-500/10 px-4 py-2 text-sm text-amber-400">
+              Completed with Notice
+            </div>
+          </div>
+        </header>
+
+        <main className="mx-auto max-w-5xl px-6 py-10">
+          {errorMessage && (
+            <div className="mb-8 rounded-2xl border border-amber-500/30 bg-amber-500/10 p-6 text-amber-200">
+              <h3 className="text-lg font-semibold text-amber-300">
+                Assessment Data Saved
+              </h3>
+              <p className="mt-2 text-sm leading-relaxed">
+                {errorMessage}
+              </p>
+              <p className="mt-2 text-xs text-amber-300/80">
+                Your interview responses were recorded and preserved on the server. You can review your completed conversation below.
+              </p>
+            </div>
+          )}
+
+          <section className="rounded-3xl border border-slate-800 bg-slate-900 p-8">
+            <h2 className="text-xl font-bold">
+              Interview Transcript
+            </h2>
+            <p className="mt-1 text-sm text-slate-400">
+              Recorded responses from your assessment session:
+            </p>
+
+            <div className="mt-6 max-h-[500px] space-y-4 overflow-y-auto pr-2">
+              {conversation.length === 0 ? (
+                <p className="text-sm text-slate-500">
+                  No conversation turns recorded.
+                </p>
+              ) : (
+                conversation.map((item) => (
+                  <div
+                    key={item.id}
+                    className={`rounded-2xl p-4 ${
+                      item.role === "ai"
+                        ? "bg-slate-800"
+                        : "bg-indigo-500/10"
+                    }`}
+                  >
+                    <p className="text-xs uppercase tracking-wider text-slate-500">
+                      {item.role === "ai"
+                        ? "AI Interviewer"
+                        : "Candidate"}
+                    </p>
+                    <p className="mt-2 text-sm leading-relaxed text-slate-300">
+                      {item.text}
+                    </p>
+                  </div>
+                ))
+              )}
+            </div>
+
+            <div className="mt-8 flex justify-end">
+              <button
+                onClick={startNewAssessment}
+                className="rounded-xl bg-indigo-500 px-6 py-3 font-semibold text-white hover:bg-indigo-600 transition"
+              >
+                Start New Assessment
+              </button>
+            </div>
+          </section>
+        </main>
+      </div>
+    );
   }
 
   // ==========================================================
