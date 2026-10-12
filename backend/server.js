@@ -12,15 +12,21 @@ const PORT = process.env.PORT || 5000;
 // ============================================================
 // CORS CONFIGURATION
 // ============================================================
-const PRODUCTION_ORIGIN = "https://behavioral-ai-agent-src.vercel.app";
+const DEFAULT_ALLOWED_ORIGINS = [
+  "https://behavioral-ai-agent-src.vercel.app",
+  "https://behavioral-ai-agent-i7so64hrb-behaviour-ai.vercel.app",
+  "https://behavioral-ai-agent.vercel.app",
+];
 
-const configuredOrigins = (process.env.FRONTEND_ORIGIN || "")
-  .split(",")
-  .map((origin) => origin.trim().replace(/\/+$/, ""))
-  .filter(Boolean);
+function getConfiguredOrigins() {
+  return (process.env.FRONTEND_ORIGIN || "")
+    .split(",")
+    .map((origin) => origin.trim().replace(/\/+$/, ""))
+    .filter(Boolean);
+}
 
 const allowedOrigins = Array.from(
-  new Set([PRODUCTION_ORIGIN, ...configuredOrigins])
+  new Set([...DEFAULT_ALLOWED_ORIGINS, ...getConfiguredOrigins()])
 );
 
 function isOriginAllowed(origin) {
@@ -29,12 +35,18 @@ function isOriginAllowed(origin) {
 
   const normalized = origin.trim().replace(/\/+$/, "");
 
-  // 1. Exact match against production or configured origins
+  // 1. Exact match against default or statically configured origins
   if (allowedOrigins.includes(normalized)) {
     return true;
   }
 
-  // 2. Local development origins (localhost or 127.0.0.1 on any port)
+  // 2. Exact match against dynamic/runtime FRONTEND_ORIGIN configuration
+  const runtimeConfigured = getConfiguredOrigins();
+  if (runtimeConfigured.includes(normalized)) {
+    return true;
+  }
+
+  // 3. Local development origins (localhost or 127.0.0.1 on any port)
   const isLocalhost =
     /^http:\/\/localhost(:\d+)?$/i.test(normalized) ||
     /^http:\/\/127\.0\.0\.1(:\d+)?$/i.test(normalized);
@@ -42,9 +54,9 @@ function isOriginAllowed(origin) {
     return true;
   }
 
-  // 3. Safe, explicit Vercel preview deployments for this project
+  // 4. Safe, explicit Vercel preview and branch deployments for this project
   const isVercelPreview =
-    /^https:\/\/behavioral-ai-agent-src(-[a-zA-Z0-9_-]+)?\.vercel\.app$/i.test(
+    /^https:\/\/(behavioral-ai-agent|behavioral-ai-agent-src)(-[a-zA-Z0-9_-]+)?\.vercel\.app$/i.test(
       normalized
     );
   if (isVercelPreview) {
