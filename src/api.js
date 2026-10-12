@@ -22,9 +22,11 @@ async function requestJson(url, fallbackMessage) {
 
   if (!response.ok) {
     let message = `${fallbackMessage} (HTTP ${response.status}).`;
+    let responseBody = null;
 
     try {
       const data = await response.json();
+      responseBody = data;
       if (data?.error) {
         message = data.error;
       }
@@ -32,7 +34,10 @@ async function requestJson(url, fallbackMessage) {
       // Keep the fallback message if the response is not JSON.
     }
 
-    throw new Error(message);
+    const error = new Error(message);
+    error.status = response.status;
+    error.responseBody = responseBody;
+    throw error;
   }
 
   return response.json();
