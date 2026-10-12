@@ -73,11 +73,29 @@ ENV_FILES = [
     Path("C:/Behavioral-AI-Agent/.env"),
 ]
 
+def sanitize_environment():
+    """Sanitize environment variables by stripping whitespace, newlines, and surrounding quotes."""
+    target_keys = (
+        "OPENAI_API_KEY",
+        "DEEPGRAM_API_KEY",
+        "LIVEKIT_API_KEY",
+        "LIVEKIT_API_SECRET",
+        "LIVEKIT_URL",
+        "OPENAI_MODEL",
+    )
+    for key in target_keys:
+        val = os.environ.get(key)
+        if val is not None:
+            cleaned = val.strip().replace("\r", "").replace("\n", "").strip()
+            if (cleaned.startswith('"') and cleaned.endswith('"')) or (cleaned.startswith("'") and cleaned.endswith("'")):
+                cleaned = cleaned[1:-1].strip()
+            os.environ[key] = cleaned
+
 def get_clean_env(key: str) -> str | None:
     val = os.getenv(key)
     if not val:
         return None
-    val = val.strip()
+    val = val.strip().replace("\r", "").replace("\n", "").strip()
     if (val.startswith('"') and val.endswith('"')) or (val.startswith("'") and val.endswith("'")):
         val = val[1:-1].strip()
     return val or None
@@ -89,6 +107,8 @@ for _env_file in ENV_FILES:
         load_dotenv(_env_file, override=False)
         _loaded_env_file = _env_file
         break
+
+sanitize_environment()
 
 print(
     "Environment file:",
@@ -552,66 +572,85 @@ Rules:
 - Keep evidence concise.
 """
 
+    raw_text = None
     try:
-
         response = await openai_client.responses.create(
             model=OPENAI_MODEL,
             input=prompt,
         )
+        raw_text = getattr(response, "output_text", None)
+    except Exception as resp_err:
+        print(f"[Agent] analyze_candidate_answer responses.create failed ({resp_err!r}). Falling back to chat.completions.create...")
 
-        result = extract_json(
-            response.output_text
-        )
-
-        for item in result.get(
-            "evidence",
-            [],
-        ):
-
-            area = item.get(
-                "area"
+    if not raw_text:
+        try:
+            chat_resp = await openai_client.chat.completions.create(
+                model=OPENAI_MODEL,
+                messages=[{"role": "user", "content": prompt}],
+                response_format={"type": "json_object"},
             )
+            raw_text = chat_resp.choices[0].message.content or ""
+        except Exception as chat_err:
+            print(f"[Agent] analyze_candidate_answer chat.completions fallback failed ({chat_err!r})")
 
-            evidence = item.get(
+    if raw_text:
+        try:
+            result = extract_json(raw_text)
+
+            for item in result.get(
                 "evidence",
-                "",
-            )
-
-            strength = item.get(
-                "strength",
-                "unknown",
-            )
-
-            confidence = float(
-                item.get(
-                    "confidence",
-                    0.0,
-                )
-            )
-
-            if (
-                area in BEHAVIORAL_AREAS
-                and evidence
+                [],
             ):
 
-                state.add_evidence(
-                    area=area,
-                    evidence=evidence,
-                    strength=strength,
-                    confidence=confidence,
+                area = item.get(
+                    "area"
                 )
 
-    except Exception as error:
+                evidence = item.get(
+                    "evidence",
+                    "",
+                )
 
-        print(
-            "Answer analysis error:",
-            repr(error),
-        )
+                strength = item.get(
+                    "strength",
+                    "unknown",
+                )
+
+                confidence = float(
+                    item.get(
+                        "confidence",
+                        0.0,
+                    )
+                )
+
+                if (
+                    area in BEHAVIORAL_AREAS
+                    and evidence
+                ):
+
+                    state.add_evidence(
+                        area=area,
+                        evidence=evidence,
+                        strength=strength,
+                        confidence=confidence,
+                    )
+        except Exception as parse_err:
+            print(f"[Agent] analyze_candidate_answer parsing error: {parse_err!r}")
 
 
 # ============================================================
 # GENERATE ADAPTIVE QUESTION
 # ============================================================
+
+FALLBACK_BEHAVIORAL_QUESTIONS = [
+    "Can you tell me about a challenging technical or operational problem you encountered and the specific steps you took to resolve it?",
+    "Could you share a situation where you had to collaborate closely with a team member who had a different perspective or approach?",
+    "Tell me about a time when project priorities or requirements changed unexpectedly. How did you adapt your approach?",
+    "Describe a complex or high-stakes decision you had to make with limited or ambiguous information. What was your reasoning?",
+    "Can you share an experience where you had to take ownership of a mistake or setback, and what steps you took afterward?",
+    "Tell me about a situation where you stepped up to lead an initiative or guide colleagues through a difficult milestone?",
+    "Can you describe how you communicated complex concepts or persuaded cross-functional stakeholders to align on a direction?",
+]
 
 async def generate_adaptive_question(
     state: AssessmentState,
@@ -687,33 +726,55 @@ The question should feel like a natural continuation of the candidate's previous
 Return ONLY the question text.
 """
 
+    raw_question = None
     try:
-
         response = await openai_client.responses.create(
             model=OPENAI_MODEL,
             input=prompt,
         )
+        raw_question = getattr(response, "output_text", None)
+        if raw_question:
+            raw_question = raw_question.strip()
+    except Exception as resp_err:
+        print(f"[Agent] generate_adaptive_question responses.create failed ({resp_err!r}). Falling back to chat.completions.create...")
 
-        question = (
-            response.output_text
-            .strip()
-        )
+    if not raw_question:
+        try:
+            chat_resp = await openai_client.chat.completions.create(
+                model=OPENAI_MODEL,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            raw_question = (chat_resp.choices[0].message.content or "").strip()
+        except Exception as chat_err:
+            print(f"[Agent] generate_adaptive_question chat.completions fallback also failed ({chat_err!r})")
 
-        if question:
-            return question
+    if raw_question:
+        # Strip code fences or surrounding quotes if returned by the model
+        if raw_question.startswith("```"):
+            nl = raw_question.find("\n")
+            if nl != -1:
+                raw_question = raw_question[nl + 1:]
+            if raw_question.endswith("```"):
+                raw_question = raw_question[:-3]
+            raw_question = raw_question.strip()
+        if (raw_question.startswith('"') and raw_question.endswith('"')) or (raw_question.startswith("'") and raw_question.endswith("'")):
+            raw_question = raw_question[1:-1].strip()
 
-    except Exception as error:
+        if len(raw_question) > 10:
+            return raw_question
 
-        print(
-            "Question generation error:",
-            repr(error),
-        )
+    # Diverse fallback selection ensuring no question is duplicated
+    asked_questions = {
+        item.get("text", "").lower().strip()
+        for item in state.transcript
+        if item.get("role") in ("interviewer", "assistant", "agent")
+    }
 
-    return (
-        "Can you tell me about a situation "
-        "where you had to solve a difficult problem "
-        "and what you personally did?"
-    )
+    for fallback in FALLBACK_BEHAVIORAL_QUESTIONS:
+        if fallback.lower().strip() not in asked_questions:
+            return fallback
+
+    return FALLBACK_BEHAVIORAL_QUESTIONS[0]
 
 
 # ============================================================
@@ -1168,14 +1229,17 @@ async def entrypoint(
 
         stt=deepgram.STT(
             model="nova-3",
+            api_key=os.getenv("DEEPGRAM_API_KEY"),
         ),
 
         tts=deepgram.TTS(
             model="aura-2-asteria-en",
+            api_key=os.getenv("DEEPGRAM_API_KEY"),
         ),
 
         llm=openai.LLM(
             model=OPENAI_MODEL,
+            api_key=os.getenv("OPENAI_API_KEY"),
         ),
 
         vad=vad,

@@ -392,4 +392,64 @@ describe('Behavioral AI Agent App', () => {
     // Audio status returns to active
     expect(screen.getByText(/🔊 Audio Active/i)).toBeInTheDocument();
   });
+
+  test('intentional disconnection: clicking End Assessment does not display connection closed error', async () => {
+    let capturedOnDisconnected = null;
+    const mockRoom = {
+      name: 'test-room-end',
+      disconnect: jest.fn(),
+      localParticipant: {
+        publishData: jest.fn().mockResolvedValue(true),
+      },
+    };
+
+    api.getToken.mockResolvedValueOnce({
+      token: 'fake-jwt',
+      serverUrl: 'wss://test.livekit.cloud',
+      room: 'test-room-end',
+    });
+    api.getAssessmentResult.mockResolvedValueOnce(null);
+
+    livekitRoom.joinRoom.mockImplementation((
+      token,
+      url,
+      onData,
+      onConnected,
+      onDisconnected,
+      onMicError,
+      onAudioStatus
+    ) => {
+      capturedOnDisconnected = onDisconnected;
+      if (onConnected) onConnected();
+      return Promise.resolve(mockRoom);
+    });
+
+    render(<App />);
+    const startButton = screen.getByRole('button', { name: /Start Assessment/i });
+
+    await act(async () => {
+      fireEvent.click(startButton);
+    });
+
+    expect(screen.getByText(/Assessment Active/i)).toBeInTheDocument();
+
+    const endButton = screen.getByRole('button', { name: /End Assessment/i });
+    expect(endButton).toBeInTheDocument();
+
+    // Candidate clicks End Assessment
+    await act(async () => {
+      fireEvent.click(endButton);
+    });
+
+    // Room disconnects as part of completion
+    await act(async () => {
+      if (capturedOnDisconnected) {
+        capturedOnDisconnected('client_initiated');
+      }
+    });
+
+    // Verify "Connection to the assessment was closed" is NOT shown
+    expect(screen.queryByText(/Connection to the assessment was closed/i)).not.toBeInTheDocument();
+  });
 });
+
