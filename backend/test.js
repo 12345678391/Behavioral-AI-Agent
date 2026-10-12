@@ -235,6 +235,25 @@ const server = app.listen(0, async () => {
       failures++;
     }
 
+    // Test 18: LiveKit token generation with surrounding whitespace/newlines in credentials
+    const createToken = require("./livekit");
+    const origKey = process.env.LIVEKIT_API_KEY;
+    const origSecret = process.env.LIVEKIT_API_SECRET;
+    try {
+      process.env.LIVEKIT_API_KEY = "  mock_key_with_spaces\n  ";
+      process.env.LIVEKIT_API_SECRET = '"mock_secret_with_quotes_1234567890123456"';
+      const tokenRes = await createToken("candidate-trim-test");
+      if (tokenRes && tokenRes.token && tokenRes.room) {
+        console.log("PASS: LiveKit token generation succeeds with dirty/whitespace credentials");
+      } else {
+        console.error("FAIL: LiveKit token credential trimming test failed");
+        failures++;
+      }
+    } finally {
+      process.env.LIVEKIT_API_KEY = origKey;
+      process.env.LIVEKIT_API_SECRET = origSecret;
+    }
+
   } catch (err) {
     console.error("Test execution error:", err);
     failures++;

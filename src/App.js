@@ -1,5 +1,5 @@
 import { useEffect, useState, useRef } from "react";
-import { getToken } from "./api";
+import { getToken, getAssessmentResult } from "./api";
 import { joinRoom } from "./LiveKitRoom";
 import {
   INTERVIEW_DURATION_SECONDS,
@@ -29,6 +29,10 @@ function App() {
   const [room, setRoom] = useState(null);
   const roomRef = useRef(null);
   const isConnectingRef = useRef(false);
+  const endingRef = useRef(false);
+  const assessmentFinishedRef = useRef(false);
+  const assessmentResultRef = useRef(null);
+  const currentRoomNameRef = useRef("");
   const [isConnecting, setIsConnecting] = useState(false);
 
   const [connected, setConnected] =
@@ -311,6 +315,8 @@ function App() {
       setConnected(false);
       // Mark as finished so results/completion review is displayed with recoverable data
       // and onDisconnected does not overwrite the message
+      assessmentFinishedRef.current = true;
+      endingRef.current = false;
       setAssessmentFinished(true);
 
       const activeRoom = roomRef.current || room;
@@ -342,6 +348,10 @@ function App() {
       );
 
       setErrorMessage("");
+
+      assessmentResultRef.current = finalData;
+      assessmentFinishedRef.current = true;
+      endingRef.current = false;
 
       setAssessmentResult(
         finalData
@@ -388,6 +398,11 @@ function App() {
       setErrorMessage("");
       setAudioBlocked(false);
 
+      endingRef.current = false;
+      assessmentFinishedRef.current = false;
+      assessmentResultRef.current = null;
+      currentRoomNameRef.current = "";
+
       setAssessmentFinished(false);
       setAssessmentResult(null);
 
@@ -405,6 +420,8 @@ function App() {
         await getToken(
           "candidate"
         );
+
+      currentRoomNameRef.current = data?.room || "";
 
       const newRoom =
         await joinRoom(
@@ -427,9 +444,39 @@ function App() {
             roomRef.current = null;
             setConnected(false);
             setRoom(null);
-            setEnding(false);
             setAudioBlocked(false);
 
+            // If the assessment was completed or intentional ending is in progress, do not treat disconnection as failure
+            if (assessmentResultRef.current || assessmentFinishedRef.current) {
+              setEnding(false);
+              setAssessmentFinished(true);
+              return;
+            }
+
+            if (endingRef.current) {
+              console.log("[App] Room disconnected during intentional assessment conclusion.");
+              setEnding(false);
+              setAssessmentFinished(true);
+              // If final result wasn't received via data channel, attempt fallback retrieval
+              if (currentRoomNameRef.current) {
+                Promise.resolve()
+                  .then(() => getAssessmentResult(currentRoomNameRef.current))
+                  .then((res) => {
+                    const fallbackData = res?.data || res;
+                    if (fallbackData) {
+                      console.log("[App] Retrieved assessment result via backend fallback:", fallbackData);
+                      assessmentResultRef.current = fallbackData;
+                      setAssessmentResult(fallbackData);
+                    }
+                  })
+                  .catch((err) => {
+                    console.log("[App] Backend result fallback notice:", err?.message || err);
+                  });
+              }
+              return;
+            }
+
+            setEnding(false);
             setAssessmentFinished((finished) => {
               if (!finished) {
                 setErrorMessage(
@@ -493,6 +540,7 @@ function App() {
     }
 
     try {
+      endingRef.current = true;
       setEnding(true);
 
       console.log(

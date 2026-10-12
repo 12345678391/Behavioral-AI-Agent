@@ -183,5 +183,79 @@ class TestAgentStartup(unittest.TestCase):
         res = _resolve_interruption({"enabled": False})
         self.assertFalse(res["enabled"])
 
+    def test_sanitize_environment_strips_whitespace_and_newlines(self):
+        """Verify sanitize_environment cleans dirty strings in os.environ."""
+        import os
+        from agent.agent import sanitize_environment
+
+        os.environ["OPENAI_API_KEY"] = "  sk-test-secret-with-newline\n\r  "
+        os.environ["DEEPGRAM_API_KEY"] = '"quoted-deepgram-key"'
+        sanitize_environment()
+
+        self.assertEqual(os.environ["OPENAI_API_KEY"], "sk-test-secret-with-newline")
+        self.assertEqual(os.environ["DEEPGRAM_API_KEY"], "quoted-deepgram-key")
+
+    def test_analyze_candidate_answer_chat_completions_fallback(self):
+        """Verify analyze_candidate_answer falls back to chat.completions when responses.create fails."""
+        import asyncio
+        from unittest.mock import AsyncMock, patch, MagicMock
+        from agent.agent import AssessmentState, analyze_candidate_answer
+
+        state = AssessmentState()
+        mock_choice = MagicMock()
+        mock_choice.message.content = '{"evidence": [{"area": "teamwork", "evidence": "Worked with peer", "strength": "strong", "confidence": 0.9}]}'
+        mock_chat_resp = MagicMock()
+        mock_chat_resp.choices = [mock_choice]
+
+        with patch("agent.agent.openai_client.responses.create", new_callable=AsyncMock) as mock_resp, \
+             patch("agent.agent.openai_client.chat.completions.create", new_callable=AsyncMock) as mock_chat:
+            mock_resp.side_effect = RuntimeError("Responses 500 endpoint error")
+            mock_chat.return_value = mock_chat_resp
+
+            asyncio.run(analyze_candidate_answer(state, "I worked closely with my teammate to resolve the issue."))
+
+            self.assertEqual(len(state.evidence["teamwork"]), 1)
+            self.assertEqual(state.evidence["teamwork"][0].evidence, "Worked with peer")
+
+    def test_generate_adaptive_question_chat_fallback(self):
+        """Verify generate_adaptive_question falls back to chat.completions when responses.create fails."""
+        import asyncio
+        from unittest.mock import AsyncMock, patch, MagicMock
+        from agent.agent import AssessmentState, generate_adaptive_question
+
+        state = AssessmentState()
+        mock_choice = MagicMock()
+        mock_choice.message.content = "How did you resolve the conflict with your team?"
+        mock_chat_resp = MagicMock()
+        mock_chat_resp.choices = [mock_choice]
+
+        with patch("agent.agent.openai_client.responses.create", new_callable=AsyncMock) as mock_resp, \
+             patch("agent.agent.openai_client.chat.completions.create", new_callable=AsyncMock) as mock_chat:
+            mock_resp.side_effect = RuntimeError("Responses 500 endpoint error")
+            mock_chat.return_value = mock_chat_resp
+
+            q = asyncio.run(generate_adaptive_question(state, 300, current_answer="We had a conflict."))
+            self.assertEqual(q, "How did you resolve the conflict with your team?")
+
+    def test_generate_adaptive_question_no_duplicate_when_both_fail(self):
+        """Verify generate_adaptive_question selects unasked fallback questions without duplicates."""
+        import asyncio
+        from unittest.mock import AsyncMock, patch
+        from agent.agent import AssessmentState, generate_adaptive_question, FALLBACK_BEHAVIORAL_QUESTIONS
+
+        state = AssessmentState()
+        # Mark first question as already asked
+        state.add_transcript("interviewer", FALLBACK_BEHAVIORAL_QUESTIONS[0])
+
+        with patch("agent.agent.openai_client.responses.create", new_callable=AsyncMock) as mock_resp, \
+             patch("agent.agent.openai_client.chat.completions.create", new_callable=AsyncMock) as mock_chat:
+            mock_resp.side_effect = RuntimeError("500")
+            mock_chat.side_effect = RuntimeError("500")
+
+            q = asyncio.run(generate_adaptive_question(state, 300, current_answer="Some answer"))
+            # Must not return the first question because it was already asked
+            self.assertNotEqual(q, FALLBACK_BEHAVIORAL_QUESTIONS[0])
+            self.assertEqual(q, FALLBACK_BEHAVIORAL_QUESTIONS[1])
+
 if __name__ == "__main__":
     unittest.main()

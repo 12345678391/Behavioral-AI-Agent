@@ -1,8 +1,14 @@
 const { AccessToken } = require("livekit-server-sdk");
 
 async function createToken(identity = "candidate", requestedRoom) {
-  const apiKey = process.env.LIVEKIT_API_KEY;
-  const apiSecret = process.env.LIVEKIT_API_SECRET;
+  const apiKey = (process.env.LIVEKIT_API_KEY || "")
+    .trim()
+    .replace(/\r?\n/g, "")
+    .replace(/^["']|["']$/g, "");
+  const apiSecret = (process.env.LIVEKIT_API_SECRET || "")
+    .trim()
+    .replace(/\r?\n/g, "")
+    .replace(/^["']|["']$/g, "");
 
   if (!apiKey || !apiSecret) {
     throw new Error(
