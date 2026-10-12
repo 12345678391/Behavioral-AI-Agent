@@ -44,6 +44,12 @@ router.get("/token", async (req, res) => {
     const identity = rawIdentity || `candidate-${Date.now()}`;
     const { token, room } = await createToken(identity, rawRoom);
 
+    // Wake up the Python agent service on Render in the background if asleep on free tier
+    const agentUrl = process.env.AGENT_URL || "https://behavioral-agent.onrender.com";
+    if (agentUrl && typeof fetch === "function") {
+      fetch(`${agentUrl.replace(/\/+$/, "")}/health`).catch(() => {});
+    }
+
     res.json({
       token,
       room,

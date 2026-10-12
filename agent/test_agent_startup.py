@@ -32,7 +32,19 @@ class TestAgentStartup(unittest.TestCase):
         root = Path(__file__).resolve().parent.parent
         self.assertTrue((root / "requirements.txt").exists(), "root requirements.txt missing")
         self.assertTrue((root / "agent" / "requirements.txt").exists(), "agent requirements.txt missing")
-        self.assertTrue((root / "agent" / "requirement.txt").exists(), "agent requirement.txt missing")
+    def test_worker_options_thread_executor(self):
+        """Verify that WorkerOptions supports JobExecutorType.THREAD with num_idle_processes=0."""
+        from livekit.agents import WorkerOptions, JobExecutorType
+        opts = WorkerOptions(
+            entrypoint_fnc=lambda ctx: None,
+            port=8081,
+            num_idle_processes=0,
+            initialize_process_timeout=60.0,
+            job_executor_type=JobExecutorType.THREAD,
+        )
+        self.assertEqual(opts.num_idle_processes, 0)
+        self.assertEqual(opts.initialize_process_timeout, 60.0)
+        self.assertEqual(opts.job_executor_type, JobExecutorType.THREAD)
 
 if __name__ == "__main__":
     unittest.main()
