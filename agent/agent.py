@@ -1036,6 +1036,9 @@ async def entrypoint(
     # SESSION
     # --------------------------------------------------------
 
+    # Load VAD in a worker thread so the main asyncio event loop is not blocked during ONNX initialization
+    vad = await asyncio.to_thread(silero.VAD.load)
+
     session = AgentSession(
 
         stt=deepgram.STT(
@@ -1050,7 +1053,7 @@ async def entrypoint(
             model=OPENAI_MODEL,
         ),
 
-        vad=silero.VAD.load(),
+        vad=vad,
 
         turn_handling={
             "interruption": {
@@ -1250,13 +1253,33 @@ async def entrypoint(
         },
     )
 
-    await session.say(
+    print(
+        "[Agent] Requesting opening speech delivery via TTS..."
+    )
+
+    speech_handle = session.say(
         opening_question
     )
 
     print(
-        "Opening question delivered."
+        f"[Agent] Opening speech queued (speech_id: {speech_handle.id}). Awaiting speech playout..."
     )
+
+    await speech_handle
+
+    speech_error = speech_handle.exception()
+    if speech_error:
+        print(
+            f"[Agent] ERROR: Opening speech TTS/playout FAILED (speech_id: {speech_handle.id}): {speech_error!r}"
+        )
+    elif speech_handle.interrupted:
+        print(
+            f"[Agent] Opening speech was interrupted before completion (speech_id: {speech_handle.id})."
+        )
+    else:
+        print(
+            f"[Agent] Opening speech playout completed without errors (speech_id: {speech_handle.id})."
+        )
 
     # --------------------------------------------------------
     # ASSESSMENT CLOCK
@@ -1828,5 +1851,7 @@ if __name__ == "__main__":
         WorkerOptions(
             entrypoint_fnc=entrypoint,
             port=int(os.environ.get("PORT", "8081")),
+            num_idle_processes=0,
+            initialize_process_timeout=60.0,
         )
     )
