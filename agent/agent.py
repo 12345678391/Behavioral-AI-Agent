@@ -924,23 +924,32 @@ async def entrypoint(
     # CONNECT
     # --------------------------------------------------------
 
+    print(
+        "[Agent] [Stage 1/5] Connecting to LiveKit room..."
+    )
+
     await ctx.connect()
     assessment_id = ctx.room.name
     print("AGENT ROOM:", ctx.room.name)
     print("ASSESSMENT ID:", assessment_id)
 
     print(
-        "Connected to LiveKit."
+        "[Agent] [Stage 1/5] Successfully connected to LiveKit room:",
+        ctx.room.name,
     )
 
     # --------------------------------------------------------
     # WAIT FOR CANDIDATE
     # --------------------------------------------------------
 
+    print(
+        "[Agent] [Stage 2/5] Waiting for candidate participant..."
+    )
+
     participant = await ctx.wait_for_participant()
 
     print(
-        "Candidate connected:",
+        "[Agent] [Stage 2/5] Candidate connected:",
         participant.identity,
     )
 
@@ -1036,8 +1045,16 @@ async def entrypoint(
     # SESSION
     # --------------------------------------------------------
 
+    print(
+        "[Agent] [Stage 3/5] Loading VAD model in background worker thread..."
+    )
+
     # Load VAD in a worker thread so the main asyncio event loop is not blocked during ONNX initialization
     vad = await asyncio.to_thread(silero.VAD.load)
+
+    print(
+        "[Agent] [Stage 3/5] VAD model loaded successfully. Creating AgentSession..."
+    )
 
     session = AgentSession(
 
@@ -1213,13 +1230,21 @@ async def entrypoint(
     # START SESSION
     # --------------------------------------------------------
 
+    print(
+        "[Agent] [Stage 4/5] Starting AgentSession with room..."
+    )
+
     await session.start(
         room=ctx.room,
         agent=BehavioralInterviewAgent(),
     )
 
     print(
-        "Agent session started."
+        "[Agent] [Stage 4/5] Agent session started. Audio track publication initiated."
+    )
+
+    print(
+        "[Agent] [Stage 5/5] Sending assessment_started event to UI..."
     )
 
     await send_ui_event(
@@ -1242,6 +1267,10 @@ async def entrypoint(
 
     state.questions_asked += 1
 
+    print(
+        "[Agent] [Stage 5/5] Sending interview_question event to UI..."
+    )
+
     await send_ui_event(
         ctx,
         "interview_question",
@@ -1254,7 +1283,7 @@ async def entrypoint(
     )
 
     print(
-        "[Agent] Requesting opening speech delivery via TTS..."
+        "[Agent] [Stage 5/5] Requesting opening speech delivery via TTS..."
     )
 
     speech_handle = session.say(
@@ -1262,7 +1291,7 @@ async def entrypoint(
     )
 
     print(
-        f"[Agent] Opening speech queued (speech_id: {speech_handle.id}). Awaiting speech playout..."
+        f"[Agent] [Stage 5/5] Opening speech queued (speech_id: {speech_handle.id}). Awaiting speech playout..."
     )
 
     await speech_handle
@@ -1270,15 +1299,15 @@ async def entrypoint(
     speech_error = speech_handle.exception()
     if speech_error:
         print(
-            f"[Agent] ERROR: Opening speech TTS/playout FAILED (speech_id: {speech_handle.id}): {speech_error!r}"
+            f"[Agent] [Stage 5/5] ERROR: Opening speech TTS/playout FAILED (speech_id: {speech_handle.id}): {speech_error!r}"
         )
     elif speech_handle.interrupted:
         print(
-            f"[Agent] Opening speech was interrupted before completion (speech_id: {speech_handle.id})."
+            f"[Agent] [Stage 5/5] Opening speech was interrupted by candidate before completion (speech_id: {speech_handle.id})."
         )
     else:
         print(
-            f"[Agent] Opening speech playout completed without errors (speech_id: {speech_handle.id})."
+            f"[Agent] [Stage 5/5] Opening speech playout completed without errors (speech_id: {speech_handle.id})."
         )
 
     # --------------------------------------------------------
@@ -1653,9 +1682,33 @@ async def entrypoint(
                     },
                 )
 
-                await session.say(
+                print(
+                    f"[Agent] Requesting adaptive question speech delivery via TTS (question #{state.questions_asked})..."
+                )
+
+                adaptive_handle = session.say(
                     question
                 )
+
+                print(
+                    f"[Agent] Adaptive question queued (speech_id: {adaptive_handle.id}). Awaiting speech playout..."
+                )
+
+                await adaptive_handle
+
+                adaptive_error = adaptive_handle.exception()
+                if adaptive_error:
+                    print(
+                        f"[Agent] ERROR: Adaptive question speech FAILED (speech_id: {adaptive_handle.id}): {adaptive_error!r}"
+                    )
+                elif adaptive_handle.interrupted:
+                    print(
+                        f"[Agent] Adaptive question speech was interrupted by candidate (speech_id: {adaptive_handle.id})."
+                    )
+                else:
+                    print(
+                        f"[Agent] Adaptive question speech playout completed without errors (speech_id: {adaptive_handle.id})."
+                    )
 
     except Exception as error:
 
