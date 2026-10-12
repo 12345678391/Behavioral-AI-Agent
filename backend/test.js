@@ -85,71 +85,156 @@ const server = app.listen(0, async () => {
       failures++;
     }
 
-    // Test 8: Safe Vercel preview deployment origin allowed
-    const previewOrigin = "https://behavioral-ai-agent-src-git-main-test.vercel.app";
+    // Test 8: Current production deployment origin allowed with credentials
+    const currentProdOrigin = "https://behavioral-ai-agent-i7so64hrb-behaviour-ai.vercel.app";
     const res8 = await fetch(`http://localhost:${port}/health`, {
-      headers: { Origin: previewOrigin },
+      headers: { Origin: currentProdOrigin },
     });
     const allowOrigin8 = res8.headers.get("access-control-allow-origin");
-    if (res8.status === 200 && allowOrigin8 === previewOrigin) {
-      console.log("PASS: Vercel preview deployment origin allowed");
+    const allowCreds8 = res8.headers.get("access-control-allow-credentials");
+    if (res8.status === 200 && allowOrigin8 === currentProdOrigin && allowCreds8 === "true") {
+      console.log("PASS: Current production deployment origin allowed with credentials");
     } else {
-      console.error("FAIL: Vercel preview deployment CORS test", res8.status, allowOrigin8);
+      console.error("FAIL: Current production deployment CORS test", res8.status, allowOrigin8, allowCreds8);
       failures++;
     }
 
-    // Test 9: Localhost development origin allowed
-    const localOrigin = "http://localhost:3000";
+    // Test 9: Current production deployment origin with trailing slash accepted
     const res9 = await fetch(`http://localhost:${port}/health`, {
-      headers: { Origin: localOrigin },
+      headers: { Origin: `${currentProdOrigin}/` },
     });
     const allowOrigin9 = res9.headers.get("access-control-allow-origin");
-    if (res9.status === 200 && allowOrigin9 === localOrigin) {
-      console.log("PASS: Localhost dev origin allowed");
+    if (res9.status === 200 && (allowOrigin9 === currentProdOrigin || allowOrigin9 === `${currentProdOrigin}/`)) {
+      console.log("PASS: Current production deployment with trailing slash accepted");
     } else {
-      console.error("FAIL: Localhost CORS test", res9.status, allowOrigin9);
+      console.error("FAIL: Current production deployment trailing slash CORS test", res9.status, allowOrigin9);
       failures++;
     }
 
-    // Test 10: OPTIONS preflight response with methods and headers
-    const res10 = await fetch(`http://localhost:${port}/token`, {
+    // Test 10: Bare behavioral-ai-agent.vercel.app origin allowed
+    const bareVercelOrigin = "https://behavioral-ai-agent.vercel.app";
+    const res10 = await fetch(`http://localhost:${port}/health`, {
+      headers: { Origin: bareVercelOrigin },
+    });
+    const allowOrigin10 = res10.headers.get("access-control-allow-origin");
+    if (res10.status === 200 && allowOrigin10 === bareVercelOrigin) {
+      console.log("PASS: Bare behavioral-ai-agent.vercel.app origin allowed");
+    } else {
+      console.error("FAIL: Bare Vercel origin CORS test", res10.status, allowOrigin10);
+      failures++;
+    }
+
+    // Test 11: Safe Vercel preview deployment origins allowed (both project patterns)
+    const previewOrigins = [
+      "https://behavioral-ai-agent-src-git-main-test.vercel.app",
+      "https://behavioral-ai-agent-bmpbzda28-behaviour-ai.vercel.app",
+      "https://behavioral-ai-agent-git-master-behaviour-ai.vercel.app",
+      "https://behavioral-ai-agent-17oagipbu-behaviour-ai.vercel.app",
+    ];
+    for (const preview of previewOrigins) {
+      const resPrev = await fetch(`http://localhost:${port}/health`, {
+        headers: { Origin: preview },
+      });
+      const allowPrev = resPrev.headers.get("access-control-allow-origin");
+      if (resPrev.status === 200 && allowPrev === preview) {
+        console.log(`PASS: Vercel preview deployment allowed: ${preview}`);
+      } else {
+        console.error(`FAIL: Vercel preview CORS test for ${preview}`, resPrev.status, allowPrev);
+        failures++;
+      }
+    }
+
+    // Test 12: Localhost development origin allowed
+    const localOrigin = "http://localhost:3000";
+    const res12 = await fetch(`http://localhost:${port}/health`, {
+      headers: { Origin: localOrigin },
+    });
+    const allowOrigin12 = res12.headers.get("access-control-allow-origin");
+    if (res12.status === 200 && allowOrigin12 === localOrigin) {
+      console.log("PASS: Localhost dev origin allowed");
+    } else {
+      console.error("FAIL: Localhost CORS test", res12.status, allowOrigin12);
+      failures++;
+    }
+
+    // Test 13: OPTIONS preflight response with methods and headers for current production origin
+    const res13 = await fetch(`http://localhost:${port}/token`, {
       method: "OPTIONS",
       headers: {
-        Origin: prodOrigin,
+        Origin: currentProdOrigin,
         "Access-Control-Request-Method": "GET",
         "Access-Control-Request-Headers": "Content-Type",
       },
     });
-    const allowOrigin10 = res10.headers.get("access-control-allow-origin");
-    const allowMethods10 = res10.headers.get("access-control-allow-methods");
-    if (res10.status === 204 && allowOrigin10 === prodOrigin && allowMethods10) {
-      console.log("PASS: Preflight OPTIONS request handled properly (HTTP 204)");
+    const allowOrigin13 = res13.headers.get("access-control-allow-origin");
+    const allowMethods13 = res13.headers.get("access-control-allow-methods");
+    const allowCreds13 = res13.headers.get("access-control-allow-credentials");
+    if (res13.status === 204 && allowOrigin13 === currentProdOrigin && allowMethods13 && allowCreds13 === "true") {
+      console.log("PASS: Preflight OPTIONS request handled properly (HTTP 204) with credentials");
     } else {
-      console.error("FAIL: OPTIONS preflight test", res10.status, allowOrigin10, allowMethods10);
+      console.error("FAIL: OPTIONS preflight test", res13.status, allowOrigin13, allowMethods13, allowCreds13);
       failures++;
     }
 
-    // Test 11: Unauthorized origin rejected by CORS policy
-    const res11 = await fetch(`http://localhost:${port}/token?identity=candidate-test`, {
+    // Test 14: Preflight OPTIONS request for rejected origin rejected with HTTP 403
+    const res14 = await fetch(`http://localhost:${port}/token`, {
+      method: "OPTIONS",
+      headers: {
+        Origin: "https://unauthorized-evil-site.com",
+        "Access-Control-Request-Method": "GET",
+      },
+    });
+    if (res14.status === 403) {
+      console.log("PASS: Preflight OPTIONS for unauthorized origin rejected with HTTP 403");
+    } else {
+      console.error("FAIL: Preflight OPTIONS rejected test", res14.status);
+      failures++;
+    }
+
+    // Test 15: Unauthorized origin rejected by CORS policy on GET
+    const res15 = await fetch(`http://localhost:${port}/token?identity=candidate-test`, {
       headers: { Origin: "https://unauthorized-evil-site.com" },
     });
-    if (res11.status === 403) {
+    if (res15.status === 403) {
       console.log("PASS: Unauthorized origin rejected with HTTP 403");
     } else {
-      console.error("FAIL: Unauthorized origin rejection test", res11.status);
+      console.error("FAIL: Unauthorized origin rejection test", res15.status);
       failures++;
     }
 
-    // Test 12: Lookalike attacker domain rejected by CORS policy
-    const res12 = await fetch(`http://localhost:${port}/token?identity=candidate-test`, {
-      headers: { Origin: "https://evil-behavioral-ai-agent-src.vercel.app" },
+    // Test 16: Lookalike attacker domains rejected by CORS policy
+    const lookalikes = [
+      "https://evil-behavioral-ai-agent-src.vercel.app",
+      "https://evil-behavioral-ai-agent.vercel.app",
+      "https://behavioral-ai-agent.attacker.com",
+      "https://behavioral-ai-agent.vercel.app.attacker.com",
+      "https://unrelated-project.vercel.app",
+    ];
+    for (const lookalike of lookalikes) {
+      const resLookalike = await fetch(`http://localhost:${port}/token?identity=candidate-test`, {
+        headers: { Origin: lookalike },
+      });
+      if (resLookalike.status === 403) {
+        console.log(`PASS: Lookalike/unrelated domain rejected with HTTP 403: ${lookalike}`);
+      } else {
+        console.error(`FAIL: Domain rejection test for ${lookalike}`, resLookalike.status);
+        failures++;
+      }
+    }
+
+    // Test 17: Explicit FRONTEND_ORIGIN dynamic environment variable support
+    process.env.FRONTEND_ORIGIN = "https://custom-portal.example.com,https://another-client.org";
+    const res17 = await fetch(`http://localhost:${port}/health`, {
+      headers: { Origin: "https://custom-portal.example.com" },
     });
-    if (res12.status === 403) {
-      console.log("PASS: Lookalike domain rejected with HTTP 403");
+    const allowOrigin17 = res17.headers.get("access-control-allow-origin");
+    if (res17.status === 200 && allowOrigin17 === "https://custom-portal.example.com") {
+      console.log("PASS: Explicit FRONTEND_ORIGIN origin allowed dynamically");
     } else {
-      console.error("FAIL: Lookalike domain rejection test", res12.status);
+      console.error("FAIL: FRONTEND_ORIGIN CORS test", res17.status, allowOrigin17);
       failures++;
     }
+
   } catch (err) {
     console.error("Test execution error:", err);
     failures++;
