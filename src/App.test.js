@@ -325,4 +325,71 @@ describe('Behavioral AI Agent App', () => {
 
     consoleErrorSpy.mockRestore();
   });
+
+  test('audio autoplay policy: displays enable audio prompt when blocked and unblocks on user click', async () => {
+    let capturedOnAudioPlaybackChanged = null;
+    const mockRoom = {
+      name: 'test-room',
+      startAudio: jest.fn().mockResolvedValue(true),
+      disconnect: jest.fn(),
+      localParticipant: {
+        publishData: jest.fn(),
+      },
+    };
+
+    api.getToken.mockResolvedValueOnce({
+      token: 'fake-jwt',
+      serverUrl: 'wss://test.livekit.cloud',
+      room: 'test-room',
+    });
+
+    livekitRoom.joinRoom.mockImplementation((
+      token,
+      url,
+      onData,
+      onConnected,
+      onDisconnected,
+      onMicError,
+      onAudioStatus
+    ) => {
+      capturedOnAudioPlaybackChanged = onAudioStatus;
+      if (onConnected) onConnected();
+      return Promise.resolve(mockRoom);
+    });
+
+    render(<App />);
+    const startButton = screen.getByRole('button', { name: /Start Assessment/i });
+
+    await act(async () => {
+      fireEvent.click(startButton);
+    });
+
+    // Connected state: Initially audio active
+    expect(screen.getByText(/🔊 Audio Active/i)).toBeInTheDocument();
+
+    // Simulate browser autoplay blocking audio (canPlay = false)
+    await act(async () => {
+      if (capturedOnAudioPlaybackChanged) {
+        capturedOnAudioPlaybackChanged(false);
+      }
+    });
+
+    // Check that audio blocked indicator and prompt are visible
+    expect(screen.getByText(/🔇 Audio Blocked/i)).toBeInTheDocument();
+    expect(screen.getByText(/AI Interviewer audio is paused by your browser/i)).toBeInTheDocument();
+
+    const enableAudioBtn = screen.getByRole('button', { name: /Enable AI Audio/i });
+    expect(enableAudioBtn).toBeInTheDocument();
+
+    // User clicks Enable AI Audio
+    await act(async () => {
+      fireEvent.click(enableAudioBtn);
+    });
+
+    // Verify room.startAudio was invoked
+    expect(mockRoom.startAudio).toHaveBeenCalledTimes(1);
+
+    // Audio status returns to active
+    expect(screen.getByText(/🔊 Audio Active/i)).toBeInTheDocument();
+  });
 });
