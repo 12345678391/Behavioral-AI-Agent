@@ -17,7 +17,10 @@ class TestAgentStartup(unittest.TestCase):
 
     def test_health_route_patching(self):
         """Verify that when a '/' route is added to web.Application, '/health' is also registered."""
-        # Import agent to trigger the route patch
+        import os
+        for k in ["DEEPGRAM_API_KEY", "OPENAI_API_KEY", "LIVEKIT_URL", "LIVEKIT_API_KEY", "LIVEKIT_API_SECRET"]:
+            if not os.environ.get(k):
+                os.environ[k] = "test-dummy-key"
         import agent.agent
         app = web.Application()
         async def dummy_handler(request):
@@ -27,11 +30,38 @@ class TestAgentStartup(unittest.TestCase):
         self.assertIn("/", routes)
         self.assertIn("/health", routes)
 
+    def test_extract_json_markdown_blocks(self):
+        """Verify extract_json strips markdown code blocks and handles json correctly."""
+        from agent.agent import extract_json
+        raw = "```json\n{\"overall_score\": 85, \"scores\": {\"communication\": 90}}\n```"
+        parsed = extract_json(raw)
+        self.assertEqual(parsed.get("overall_score"), 85)
+        self.assertEqual(parsed.get("scores", {}).get("communication"), 90)
+
+        # Non-fenced json
+        self.assertEqual(extract_json('{"key": "value"}'), {"key": "value"})
+
+        # Empty or invalid string
+        self.assertEqual(extract_json(""), {})
+        self.assertEqual(extract_json("invalid"), {})
+
+    def test_assessment_state_recoverable_data(self):
+        """Verify AssessmentState retains transcript and evidence for recoverable data."""
+        from agent.agent import AssessmentState
+        state = AssessmentState()
+        state.add_transcript("candidate", "I led the migration project successfully.")
+        state.add_evidence("leadership", "Led migration project", "strong", 0.9)
+        d = state.to_dict()
+        self.assertEqual(len(d["transcript"]), 1)
+        self.assertEqual(d["transcript"][0]["role"], "candidate")
+        self.assertEqual(len(d["evidence"]["leadership"]), 1)
+
     def test_requirements_file_exists(self):
         """Verify requirements.txt exists at root and agent folder."""
         root = Path(__file__).resolve().parent.parent
         self.assertTrue((root / "requirements.txt").exists(), "root requirements.txt missing")
         self.assertTrue((root / "agent" / "requirements.txt").exists(), "agent requirements.txt missing")
+
     def test_worker_options_thread_executor(self):
         """Verify that WorkerOptions supports JobExecutorType.THREAD with num_idle_processes=0."""
         from livekit.agents import WorkerOptions, JobExecutorType

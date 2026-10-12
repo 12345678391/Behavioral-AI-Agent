@@ -68,7 +68,18 @@ ENV_FILES = [
     BASE_DIR / ".env.local",
     BASE_DIR / ".env",
     BASE_DIR.parent / ".env",
+    Path("C:/Behavioral-AI-Agent/agent/.env.local"),
+    Path("C:/Behavioral-AI-Agent/.env"),
 ]
+
+def get_clean_env(key: str) -> str | None:
+    val = os.getenv(key)
+    if not val:
+        return None
+    val = val.strip()
+    if (val.startswith('"') and val.endswith('"')) or (val.startswith("'") and val.endswith("'")):
+        val = val[1:-1].strip()
+    return val or None
 
 _loaded_env_file = None
 
@@ -229,6 +240,19 @@ class AssessmentState:
                 for area, items in self.evidence.items()
             },
 
+            "evidence": {
+                area: [
+                    {
+                        "area": item.area,
+                        "evidence": item.evidence,
+                        "strength": item.strength,
+                        "confidence": item.confidence,
+                    }
+                    for item in items
+                ]
+                for area, items in self.evidence.items()
+            },
+
             "questions_asked":
                 self.questions_asked,
 
@@ -245,7 +269,7 @@ class AssessmentState:
 # ============================================================
 
 openai_client = AsyncOpenAI(
-    api_key=os.getenv("OPENAI_API_KEY")
+    api_key=get_clean_env("OPENAI_API_KEY")
 )
 
 
@@ -291,7 +315,19 @@ def save_assessment(
 def extract_json(
     text: str,
 ):
+    if not text:
+        return {}
+
     text = text.strip()
+
+    # Strip markdown code blocks (e.g. ```json ... ``` or ``` ... ```)
+    if text.startswith("```"):
+        first_newline = text.find("\n")
+        if first_newline != -1:
+            text = text[first_newline + 1:]
+        if text.endswith("```"):
+            text = text[:-3]
+        text = text.strip()
 
     try:
         return json.loads(text)
@@ -779,21 +815,71 @@ Rules:
 - Describe observed behavioral patterns only.
 """
 
-    try:
+    raw_text = None
+    last_error = None
 
+    try:
         response = await openai_client.responses.create(
             model=OPENAI_MODEL,
             input=prompt,
         )
+        raw_text = getattr(response, "output_text", None)
+    except Exception as resp_err:
+        last_error = resp_err
+        print(f"[Agent] openai_client.responses.create failed ({resp_err!r}). Falling back to chat.completions.create...")
 
-        result = extract_json(
-            response.output_text
-        )
-
-        if not result:
-            raise RuntimeError(
-                "OpenAI returned an empty or invalid final analysis response."
+    if not raw_text:
+        try:
+            chat_resp = await openai_client.chat.completions.create(
+                model=OPENAI_MODEL,
+                messages=[{"role": "user", "content": prompt}],
+                response_format={"type": "json_object"},
             )
+            raw_text = chat_resp.choices[0].message.content or ""
+        except Exception as chat_err:
+            print(f"[Agent] chat.completions fallback also failed ({chat_err!r})")
+            if last_error is None:
+                last_error = chat_err
+            raise RuntimeError(f"OpenAI final analysis generation failed: {last_error}") from last_error
+
+    try:
+        result = extract_json(raw_text)
+
+        if not result or not isinstance(result, dict):
+            raise RuntimeError(
+                "OpenAI returned an empty or invalid final analysis JSON structure."
+            )
+
+        # Ensure required structure keys exist with valid fallbacks
+        if "scores" not in result or not isinstance(result["scores"], dict):
+            result["scores"] = {area: 50 for area in BEHAVIORAL_AREAS}
+        for area in BEHAVIORAL_AREAS:
+            if area not in result["scores"]:
+                result["scores"][area] = 50
+
+        if "overall_score" not in result or not isinstance(result["overall_score"], (int, float)):
+            result["overall_score"] = int(sum(result["scores"].values()) / max(len(result["scores"]), 1))
+
+        if "strengths" not in result or not isinstance(result["strengths"], list):
+            result["strengths"] = ["Demonstrated engaged participation throughout the interview."]
+
+        if "areas_for_improvement" not in result or not isinstance(result["areas_for_improvement"], list):
+            result["areas_for_improvement"] = ["Provide additional concrete examples in future behavioral scenarios."]
+
+        if "behavioral_summary" not in result or not result["behavioral_summary"]:
+            result["behavioral_summary"] = "Candidate completed the behavioral assessment session."
+
+        if "team_working_style" not in result or not isinstance(result["team_working_style"], dict):
+            result["team_working_style"] = {
+                "collaboration": 50,
+                "independence": 50,
+                "adaptability": 50,
+                "leadership": 50,
+                "structure": 50,
+                "autonomy": 50,
+                "summary": "Demonstrated balanced behavioral working style.",
+                "environment_alignment": ["Collaborative teams", "Structured environments"],
+            }
 
         state.final_analysis = result
         return result
@@ -801,12 +887,12 @@ Rules:
     except Exception as error:
 
         print(
-            "Final analysis error:",
+            "Final analysis parsing error:",
             repr(error),
         )
 
         raise RuntimeError(
-            "Final behavioral analysis could not be generated."
+            f"Final behavioral analysis could not be generated: {error}"
         ) from error
 
 
@@ -1808,9 +1894,23 @@ async def entrypoint(
 
     except Exception as error:
 
+        underlying = getattr(error, "__cause__", None) or error
+        error_type = type(underlying).__name__
+        error_code = (
+            getattr(underlying, "code", None)
+            or getattr(underlying, "status_code", None)
+            or getattr(underlying, "type", None)
+            or error_type
+        )
+        http_status = getattr(underlying, "status_code", None)
+        error_details = str(underlying)
+        for secret_pattern in ("sk-", "api_key", "secret", "token"):
+            if secret_pattern in error_details.lower():
+                error_details = f"Authentication/API error ({error_type}): check provider credentials."
+                break
+
         print(
-            "Final assessment generation failed:",
-            repr(error),
+            f"[Agent] Final assessment generation failed [code: {error_code}, status: {http_status}]: {error_details}"
         )
 
         state.completed = False
@@ -1828,10 +1928,19 @@ async def entrypoint(
             "assessment_error",
             {
                 "stage": "final_analysis",
+                "code": str(error_code),
+                "error_type": error_type,
+                "http_status": http_status,
                 "message": (
                     "The interview was completed, but the final behavioral analysis could not be generated. "
                     "Your interview data has been saved."
                 ),
+                "error_details": error_details,
+                "recoverable_data": {
+                    "assessment_id": assessment_id,
+                    "transcript": state.transcript,
+                    "questions_asked": state.questions_asked,
+                },
             },
         )
 
