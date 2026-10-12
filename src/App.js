@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useState, useRef } from "react";
 import { getToken } from "./api";
 import { joinRoom } from "./LiveKitRoom";
 import {
@@ -27,6 +27,9 @@ function safeRandomUUID() {
 
 function App() {
   const [room, setRoom] = useState(null);
+  const roomRef = useRef(null);
+  const isConnectingRef = useRef(false);
+  const [isConnecting, setIsConnecting] = useState(false);
 
   const [connected, setConnected] =
     useState(false);
@@ -82,15 +85,17 @@ function App() {
 
   useEffect(() => {
     return () => {
-      if (room) {
+      if (roomRef.current) {
+        console.log("[App] Room disconnection requested due to component unmount.");
         try {
-          room.disconnect();
+          roomRef.current.disconnect();
         } catch (e) {
-          console.warn("Error disconnecting room on unmount:", e);
+          console.warn("[App] Error disconnecting room on unmount:", e);
         }
+        roomRef.current = null;
       }
     };
-  }, [room]);
+  }, []);
 
   // ==========================================================
   // LIVEKIT EVENTS
@@ -243,12 +248,16 @@ function App() {
       setConnected(false);
       setAssessmentStarted(false);
 
-      if (room) {
+      const activeRoom = roomRef.current || room;
+      if (activeRoom) {
+        console.log("[App] Room disconnection requested due to assessment_error.");
         try {
-          room.disconnect();
+          activeRoom.disconnect();
         } catch (e) {
-          console.warn("Error disconnecting room on error:", e);
+          console.warn("[App] Error disconnecting room on error:", e);
         }
+        roomRef.current = null;
+        setRoom(null);
       }
 
       return;
@@ -274,12 +283,16 @@ function App() {
       setConnected(false);
       setEnding(false);
 
-      if (room) {
+      const activeRoom = roomRef.current || room;
+      if (activeRoom) {
+        console.log("[App] Room disconnection requested due to final_result.");
         try {
-          room.disconnect();
+          activeRoom.disconnect();
         } catch (e) {
-          console.warn("Error disconnecting room on final result:", e);
+          console.warn("[App] Error disconnecting room on final result:", e);
         }
+        roomRef.current = null;
+        setRoom(null);
       }
 
       return;
@@ -291,6 +304,15 @@ function App() {
   // ==========================================================
 
   async function startAssessment() {
+    if (isConnectingRef.current || roomRef.current) {
+      console.warn("[App] Assessment start request ignored: connection already in progress or room active.");
+      return;
+    }
+
+    isConnectingRef.current = true;
+    setIsConnecting(true);
+    console.log("[App] Assessment start requested.");
+
     try {
       setErrorMessage("");
 
@@ -319,17 +341,18 @@ function App() {
           handleData,
           () => {
             console.log(
-              "Assessment room connected."
+              "[App] Assessment room connected."
             );
 
             setConnected(true);
           },
           (reason) => {
             console.log(
-              "Assessment room disconnected:",
+              "[App] Assessment room disconnected. Reason:",
               reason
             );
 
+            roomRef.current = null;
             setConnected(false);
             setRoom(null);
             setEnding(false);
@@ -342,9 +365,22 @@ function App() {
               }
               return finished;
             });
+          },
+          (micError) => {
+            console.warn(
+              "[App] Microphone setup warning:",
+              micError?.message || micError
+            );
+
+            setErrorMessage(
+              "Microphone setup warning: " +
+                (micError?.message ||
+                  "Please verify your microphone is connected and browser permissions are allowed.")
+            );
           }
         );
 
+      roomRef.current = newRoom;
       setRoom(newRoom);
 
       setConnected(true);
@@ -353,7 +389,7 @@ function App() {
 
     } catch (error) {
       console.error(
-        "Assessment start error:",
+        "[App] Connection error during assessment startup:",
         error
       );
 
@@ -362,6 +398,9 @@ function App() {
           ? `Could not start the assessment: ${error.message}`
           : "Could not start the assessment. Make sure the Node.js server and Python AI agent are running."
       );
+    } finally {
+      isConnectingRef.current = false;
+      setIsConnecting(false);
     }
   }
 
@@ -370,8 +409,9 @@ function App() {
   // ==========================================================
 
   async function endAssessment() {
-    console.log("END CLICKED — room:", room);
-    if (!room || ending) {
+    const activeRoom = roomRef.current || room;
+    console.log("[App] Assessment completion requested. Active room present:", !!activeRoom);
+    if (!activeRoom || ending) {
       return;
     }
 
@@ -379,7 +419,7 @@ function App() {
       setEnding(true);
 
       console.log(
-        "Requesting assessment completion..."
+        "[App] Publishing end_assessment request to agent..."
       );
 
       const payload =
@@ -389,7 +429,7 @@ function App() {
           })
         );
 
-      await room.localParticipant.publishData(
+      await activeRoom.localParticipant.publishData(
         payload,
         {
           reliable: true,
@@ -910,9 +950,39 @@ function App() {
 
             <button
               onClick={startAssessment}
-              className="mt-8 rounded-xl bg-indigo-500 px-8 py-4 font-semibold hover:bg-indigo-600"
+              disabled={isConnecting}
+              className={`mt-8 rounded-xl px-8 py-4 font-semibold transition ${
+                isConnecting
+                  ? "bg-indigo-500/50 cursor-not-allowed opacity-75"
+                  : "bg-indigo-500 hover:bg-indigo-600"
+              }`}
             >
-              Start Assessment
+              {isConnecting ? (
+                <span className="flex items-center justify-center gap-2">
+                  <svg
+                    className="h-5 w-5 animate-spin"
+                    viewBox="0 0 24 24"
+                    fill="none"
+                  >
+                    <circle
+                      className="opacity-25"
+                      cx="12"
+                      cy="12"
+                      r="10"
+                      stroke="currentColor"
+                      strokeWidth="4"
+                    />
+                    <path
+                      className="opacity-75"
+                      fill="currentColor"
+                      d="M4 12a8 8 0 018-8v4a4 4 0 00-4 4H4z"
+                    />
+                  </svg>
+                  Connecting to AI Interviewer...
+                </span>
+              ) : (
+                "Start Assessment"
+              )}
             </button>
 
           </section>
