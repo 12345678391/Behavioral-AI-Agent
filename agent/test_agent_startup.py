@@ -257,5 +257,55 @@ class TestAgentStartup(unittest.TestCase):
             self.assertNotEqual(q, FALLBACK_BEHAVIORAL_QUESTIONS[0])
             self.assertEqual(q, FALLBACK_BEHAVIORAL_QUESTIONS[1])
 
+    def test_behavioral_interview_agent_turn_callback(self):
+        """Verify BehavioralInterviewAgent executes callback and stops automatic generation."""
+        import asyncio
+        from unittest.mock import MagicMock
+        from agent.agent import BehavioralInterviewAgent, StopResponse
+
+        captured_text = []
+
+        async def callback(text):
+            captured_text.append(text)
+
+        agent = BehavioralInterviewAgent(on_turn_completed_callback=callback)
+        mock_msg = MagicMock()
+        mock_msg.text_content = "I handled a critical production incident with structured communication."
+
+        with self.assertRaises(StopResponse):
+            asyncio.run(agent.on_user_turn_completed(None, mock_msg))
+
+        self.assertEqual(captured_text, ["I handled a critical production incident with structured communication."])
+
+    def test_pending_answer_drained_and_analyzed(self):
+        """Verify pending answers in queue are analyzed before completing assessment."""
+        import asyncio
+        from unittest.mock import AsyncMock, patch, MagicMock
+        from agent.agent import AssessmentState, analyze_candidate_answer
+
+        state = AssessmentState()
+        mock_choice = MagicMock()
+        mock_choice.message.content = '{"evidence": [{"area": "leadership", "evidence": "Led engineering migration", "strength": "strong", "confidence": 0.95}]}'
+        mock_chat_resp = MagicMock()
+        mock_chat_resp.choices = [mock_choice]
+
+        with patch("agent.agent.openai_client.responses.create", new_callable=AsyncMock) as mock_resp, \
+             patch("agent.agent.openai_client.chat.completions.create", new_callable=AsyncMock) as mock_chat:
+            mock_resp.side_effect = RuntimeError("Responses 500 endpoint error")
+            mock_chat.return_value = mock_chat_resp
+
+            answer_queue = asyncio.Queue()
+            answer_queue.put_nowait("I stepped up to lead the migration when our team lead was unavailable.")
+
+            async def drain_queue():
+                while not answer_queue.empty():
+                    ans = answer_queue.get_nowait()
+                    await analyze_candidate_answer(state, ans)
+
+            asyncio.run(drain_queue())
+
+            self.assertEqual(len(state.evidence["leadership"]), 1)
+            self.assertEqual(state.evidence["leadership"][0].evidence, "Led engineering migration")
+
 if __name__ == "__main__":
     unittest.main()

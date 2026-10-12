@@ -1003,7 +1003,7 @@ class BehavioralInterviewAgent(
     Agent
 ):
 
-    def __init__(self):
+    def __init__(self, on_turn_completed_callback=None):
 
         super().__init__(
             instructions="""
@@ -1040,12 +1040,29 @@ Keep spoken responses short and natural.
 The interview controller will decide when to ask the next question.
 """
         )
+        self._on_turn_completed_callback = on_turn_completed_callback
 
     async def on_user_turn_completed(
         self,
         chat_ctx,
         new_message,
     ):
+        if self._on_turn_completed_callback and new_message:
+            try:
+                text = (
+                    getattr(new_message, "text_content", None)
+                    or getattr(new_message, "content", None)
+                    or ""
+                )
+                if isinstance(text, list):
+                    text = " ".join(str(t) for t in text)
+                text = str(text).strip()
+                if text:
+                    res = self._on_turn_completed_callback(text)
+                    if asyncio.iscoroutine(res):
+                        await res
+            except Exception as cb_err:
+                print(f"[Agent] on_turn_completed_callback warning: {cb_err!r}")
 
         # We manually control every interviewer response.
         raise StopResponse()
@@ -1225,6 +1242,48 @@ async def entrypoint(
         "[Agent] [Stage 3/5] Creating AgentSession with uninterrupted speech delivery and 16kHz VAD..."
     )
 
+    speech_lock = asyncio.Lock()
+    is_agent_speaking = False
+
+    async def speak_safely(text: str, stage_label: str = "Speech"):
+        nonlocal is_agent_speaking
+        async with speech_lock:
+            is_agent_speaking = True
+            try:
+                print(f"[Agent] [{stage_label}] Queuing speech delivery via TTS: {text[:60]}...")
+                handle = session.say(text, allow_interruptions=False)
+                start_t = time.monotonic()
+                await handle
+                dur = time.monotonic() - start_t
+                err = handle.exception()
+                if err:
+                    print(f"[Agent] [{stage_label}] Speech FAILED after {dur:.2f}s: {err!r}")
+                else:
+                    print(f"[Agent] [{stage_label}] Speech playout completed without errors in {dur:.2f}s")
+                # Wait 0.4s buffer to allow WebRTC playout buffer in browser to drain
+                await asyncio.sleep(0.4)
+            finally:
+                is_agent_speaking = False
+
+    async def handle_completed_candidate_turn(answer_text: str):
+        if is_agent_speaking:
+            print(f"[Agent] Ignoring speech detected while interviewer was speaking (acoustic echo): {answer_text[:50]}")
+            return
+        answer_key = answer_text.lower().strip()
+        if answer_key in processed_transcripts:
+            return
+        processed_transcripts.add(answer_key)
+        state.add_transcript("candidate", answer_text)
+        if not state.candidate_introduction:
+            state.candidate_introduction = answer_text
+        await send_ui_event(
+            ctx,
+            "candidate_answer",
+            {"answer": answer_text},
+        )
+        user_answer_queue.put_nowait(answer_text)
+        print(f"[Agent] Completed candidate turn queued for analysis: {answer_text[:60]}")
+
     session = AgentSession(
 
         stt=deepgram.STT(
@@ -1245,7 +1304,14 @@ async def entrypoint(
         vad=vad,
 
         turn_handling={
+            "endpointing": {
+                "min_delay": 1.2,
+                "max_delay": 3.0,
+            },
             "interruption": {
+                "enabled": False,
+            },
+            "preemptive_generation": {
                 "enabled": False,
             },
         },
@@ -1270,7 +1336,7 @@ async def entrypoint(
             pass
 
     # --------------------------------------------------------
-    # USER TRANSCRIPT EVENT
+    # USER TRANSCRIPT EVENT (LIVE UI STREAMING)
     # --------------------------------------------------------
 
     @session.on("user_input_transcribed")
@@ -1290,7 +1356,7 @@ async def entrypoint(
                 False,
             )
 
-            if not transcript:
+            if not transcript or is_agent_speaking:
                 return
 
             transcript = transcript.strip()
@@ -1299,48 +1365,16 @@ async def entrypoint(
                 f"USER TRANSCRIPT | final={is_final}: {transcript}"
             )
 
-            # Ignore partial/interim speech.
-            if not is_final:
-                return
-
-            # Prevent duplicate final transcripts.
-            transcript_key = transcript.lower()
-
-            if transcript_key in processed_transcripts:
-                return
-
-            processed_transcripts.add(
-                transcript_key
-            )
-
-            # Store candidate answer.
-            state.add_transcript(
-                "candidate",
-                transcript,
-            )
-
-            # First answer = introduction.
-            if not state.candidate_introduction:
-                state.candidate_introduction = transcript
-
-            # Send candidate answer to React.
+            # Stream live interim/final candidate speech to React UI for immediate feedback
             asyncio.create_task(
                 send_ui_event(
                     ctx,
-                    "candidate_answer",
+                    "candidate_speech",
                     {
-                        "answer": transcript,
+                        "transcript": transcript,
+                        "is_final": is_final,
                     },
                 )
-            )
-
-            # Put completed answer into interview queue.
-            user_answer_queue.put_nowait(
-                transcript
-            )
-
-            print(
-                "Candidate answer added to interview queue."
             )
 
         except Exception as error:
@@ -1426,7 +1460,9 @@ async def entrypoint(
 
     await session.start(
         room=ctx.room,
-        agent=BehavioralInterviewAgent(),
+        agent=BehavioralInterviewAgent(
+            on_turn_completed_callback=handle_completed_candidate_turn
+        ),
     )
 
     published_tracks = [
@@ -1476,36 +1512,10 @@ async def entrypoint(
         },
     )
 
-    print(
-        "[Agent] [Stage 5/5] Requesting opening speech delivery via TTS..."
-    )
-
-    speech_start_time = time.monotonic()
-    speech_handle = session.say(
+    await speak_safely(
         opening_question,
-        allow_interruptions=False,
+        "Stage 5/5 Opening speech",
     )
-
-    print(
-        f"[Agent] [Stage 5/5] Opening speech queued (speech_id: {speech_handle.id}). Awaiting speech playout..."
-    )
-
-    await speech_handle
-
-    speech_duration = time.monotonic() - speech_start_time
-    speech_error = speech_handle.exception()
-    if speech_error:
-        print(
-            f"[Agent] [Stage 5/5] ERROR: Opening speech TTS/playout FAILED after {speech_duration:.2f}s (speech_id: {speech_handle.id}): {speech_error!r}"
-        )
-    elif speech_handle.interrupted:
-        print(
-            f"[Agent] [Stage 5/5] Opening speech was interrupted by candidate after {speech_duration:.2f}s (speech_id: {speech_handle.id})."
-        )
-    else:
-        print(
-            f"[Agent] [Stage 5/5] Opening speech playout completed without errors in {speech_duration:.2f}s (speech_id: {speech_handle.id})."
-        )
 
     # --------------------------------------------------------
     # ASSESSMENT CLOCK
@@ -1566,9 +1576,9 @@ async def entrypoint(
            "Thank you for your time."
         )
 
-        await session.say(
+        await speak_safely(
             warning_message,
-            allow_interruptions=False,
+            "Assessment warning",
         )
 
         final_wait = (
@@ -1880,36 +1890,18 @@ async def entrypoint(
                     },
                 )
 
-                print(
-                    f"[Agent] Requesting adaptive question speech delivery via TTS (question #{state.questions_asked})..."
-                )
-
-                adaptive_start_time = time.monotonic()
-                adaptive_handle = session.say(
+                await speak_safely(
                     question,
-                    allow_interruptions=False,
+                    f"Adaptive question #{state.questions_asked}",
                 )
 
-                print(
-                    f"[Agent] Adaptive question queued (speech_id: {adaptive_handle.id}). Awaiting speech playout..."
-                )
-
-                await adaptive_handle
-
-                adaptive_duration = time.monotonic() - adaptive_start_time
-                adaptive_error = adaptive_handle.exception()
-                if adaptive_error:
-                    print(
-                        f"[Agent] ERROR: Adaptive question speech FAILED after {adaptive_duration:.2f}s (speech_id: {adaptive_handle.id}): {adaptive_error!r}"
-                    )
-                elif adaptive_handle.interrupted:
-                    print(
-                        f"[Agent] Adaptive question speech was interrupted by candidate after {adaptive_duration:.2f}s (speech_id: {adaptive_handle.id})."
-                    )
-                else:
-                    print(
-                        f"[Agent] Adaptive question speech playout completed without errors in {adaptive_duration:.2f}s (speech_id: {adaptive_handle.id})."
-                    )
+                # Clear any echo or speech fragments captured while the question was playing
+                while not user_answer_queue.empty():
+                    try:
+                        stale_item = user_answer_queue.get_nowait()
+                        print(f"[Agent] Cleared residual speech fragment captured during question playback: {stale_item[:40]}")
+                    except Exception:
+                        break
 
     except Exception as error:
 
@@ -1957,14 +1949,19 @@ async def entrypoint(
 
     elif manual_end_requested.is_set():
 
-        # IMPORTANT:
-        # Do not send assessment_closing or wait for a spoken
-        # closing message here. The frontend may treat the
-        # closing event as a signal to disconnect the LiveKit
-        # room. We must generate and publish final_result first.
         print(
-            "Manual end requested. Proceeding directly to final analysis."
+            "Manual end requested. Completing pending answers and proceeding directly to final analysis."
         )
+
+        # Complete pending transcript and assessment processing
+        while not user_answer_queue.empty():
+            try:
+                pending_ans = user_answer_queue.get_nowait()
+                if pending_ans and pending_ans.strip():
+                    print(f"[Agent] Analyzing pending candidate response before completion: {pending_ans[:50]}...")
+                    await analyze_candidate_answer(state, pending_ans.strip())
+            except Exception as drain_err:
+                print("[Agent] Pending answer analysis notice:", repr(drain_err))
 
     else:
 
@@ -1984,9 +1981,9 @@ async def entrypoint(
             },
         )
 
-        await session.say(
+        await speak_safely(
             closing_message,
-            allow_interruptions=False,
+            "Closing message",
         )
 
         await asyncio.sleep(
@@ -2065,7 +2062,7 @@ async def entrypoint(
     state.completed = True
 
     # ========================================================
-    # SAVE
+    # SAVE & SYNC
     # ========================================================
 
     await asyncio.to_thread(
@@ -2073,6 +2070,27 @@ async def entrypoint(
         state,
         assessment_id,
     )
+
+    # Sync to backend HTTP endpoint (bridges cross-container filesystem isolation on Render)
+    backend_url = os.getenv("BACKEND_URL") or os.getenv("REACT_APP_API_BASE_URL") or "https://behavioral-backend-gc62.onrender.com"
+    if backend_url:
+        try:
+            import urllib.request
+            sync_payload = json.dumps(state.to_dict()).encode("utf-8")
+            sync_url = f"{backend_url.rstrip('/')}/assessment-result?assessmentId={assessment_id}"
+            req = urllib.request.Request(
+                sync_url,
+                data=sync_payload,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            def _post_sync():
+                with urllib.request.urlopen(req, timeout=5) as resp:
+                    pass
+            await asyncio.to_thread(_post_sync)
+            print("[Agent] Assessment result synced to backend HTTP endpoint.")
+        except Exception as sync_err:
+            print("[Agent] Backend sync notice (non-fatal):", repr(sync_err))
 
     # ========================================================
     # SEND FINAL RESULT TO FRONTEND
@@ -2092,6 +2110,12 @@ async def entrypoint(
             "Final result send failed:",
             repr(error),
         )
+
+    # Allow candidate browser sufficient time to receive final_result and disconnect
+    try:
+        await asyncio.wait_for(candidate_disconnected.wait(), timeout=4.0)
+    except asyncio.TimeoutError:
+        pass
     
     
 
