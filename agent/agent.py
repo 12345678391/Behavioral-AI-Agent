@@ -13,6 +13,7 @@ from livekit.agents import (
     Agent,
     AgentSession,
     JobContext,
+    JobExecutorType,
     WorkerOptions,
     cli,
 )
@@ -1906,5 +1907,6 @@ if __name__ == "__main__":
             port=int(os.environ.get("PORT", "8081")),
             num_idle_processes=0,
             initialize_process_timeout=60.0,
+            job_executor_type=JobExecutorType.THREAD,
         )
     )
