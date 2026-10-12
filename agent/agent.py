@@ -1138,11 +1138,12 @@ async def entrypoint(
         "[Agent] [Stage 3/5] Loading VAD model in background worker thread..."
     )
 
-    # Load VAD in a worker thread so the main asyncio event loop is not blocked during ONNX initialization
-    vad = await asyncio.to_thread(silero.VAD.load)
+    # Load VAD in a worker thread so the main asyncio event loop is not blocked during ONNX initialization.
+    # Use sample_rate=8000 to halve ONNX inference workload on constrained CPU containers.
+    vad = await asyncio.to_thread(silero.VAD.load, sample_rate=8000)
 
     print(
-        "[Agent] [Stage 3/5] VAD model loaded successfully. Creating AgentSession..."
+        "[Agent] [Stage 3/5] Silero VAD loaded (sample_rate=8000 Hz for low-latency inference). Creating AgentSession..."
     )
 
     session = AgentSession(
@@ -1328,8 +1329,12 @@ async def entrypoint(
         agent=BehavioralInterviewAgent(),
     )
 
+    published_tracks = [
+        f"{pub.sid} (kind={getattr(pub.kind, 'name', pub.kind)}, name={pub.name}, muted={pub.muted})"
+        for pub in ctx.room.local_participant.track_publications.values()
+    ]
     print(
-        "[Agent] [Stage 4/5] Agent session started. Audio track publication initiated."
+        f"[Agent] [Stage 4/5] Agent session started. Confirmed published tracks ({len(published_tracks)}): {published_tracks}"
     )
 
     print(
@@ -1375,6 +1380,7 @@ async def entrypoint(
         "[Agent] [Stage 5/5] Requesting opening speech delivery via TTS..."
     )
 
+    speech_start_time = time.monotonic()
     speech_handle = session.say(
         opening_question
     )
@@ -1385,18 +1391,19 @@ async def entrypoint(
 
     await speech_handle
 
+    speech_duration = time.monotonic() - speech_start_time
     speech_error = speech_handle.exception()
     if speech_error:
         print(
-            f"[Agent] [Stage 5/5] ERROR: Opening speech TTS/playout FAILED (speech_id: {speech_handle.id}): {speech_error!r}"
+            f"[Agent] [Stage 5/5] ERROR: Opening speech TTS/playout FAILED after {speech_duration:.2f}s (speech_id: {speech_handle.id}): {speech_error!r}"
         )
     elif speech_handle.interrupted:
         print(
-            f"[Agent] [Stage 5/5] Opening speech was interrupted by candidate before completion (speech_id: {speech_handle.id})."
+            f"[Agent] [Stage 5/5] Opening speech was interrupted by candidate after {speech_duration:.2f}s (speech_id: {speech_handle.id})."
         )
     else:
         print(
-            f"[Agent] [Stage 5/5] Opening speech playout completed without errors (speech_id: {speech_handle.id})."
+            f"[Agent] [Stage 5/5] Opening speech playout completed without errors in {speech_duration:.2f}s (speech_id: {speech_handle.id})."
         )
 
     # --------------------------------------------------------
@@ -1775,6 +1782,7 @@ async def entrypoint(
                     f"[Agent] Requesting adaptive question speech delivery via TTS (question #{state.questions_asked})..."
                 )
 
+                adaptive_start_time = time.monotonic()
                 adaptive_handle = session.say(
                     question
                 )
@@ -1785,18 +1793,19 @@ async def entrypoint(
 
                 await adaptive_handle
 
+                adaptive_duration = time.monotonic() - adaptive_start_time
                 adaptive_error = adaptive_handle.exception()
                 if adaptive_error:
                     print(
-                        f"[Agent] ERROR: Adaptive question speech FAILED (speech_id: {adaptive_handle.id}): {adaptive_error!r}"
+                        f"[Agent] ERROR: Adaptive question speech FAILED after {adaptive_duration:.2f}s (speech_id: {adaptive_handle.id}): {adaptive_error!r}"
                     )
                 elif adaptive_handle.interrupted:
                     print(
-                        f"[Agent] Adaptive question speech was interrupted by candidate (speech_id: {adaptive_handle.id})."
+                        f"[Agent] Adaptive question speech was interrupted by candidate after {adaptive_duration:.2f}s (speech_id: {adaptive_handle.id})."
                     )
                 else:
                     print(
-                        f"[Agent] Adaptive question speech playout completed without errors (speech_id: {adaptive_handle.id})."
+                        f"[Agent] Adaptive question speech playout completed without errors in {adaptive_duration:.2f}s (speech_id: {adaptive_handle.id})."
                     )
 
     except Exception as error:

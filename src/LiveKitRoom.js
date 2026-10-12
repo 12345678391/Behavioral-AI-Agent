@@ -10,7 +10,8 @@ export async function joinRoom(
   onData,
   onConnected,
   onDisconnected,
-  onMicrophoneError
+  onMicrophoneError,
+  onAudioPlaybackStatusChanged
 ) {
   const room = new Room({
     adaptiveStream: true,
@@ -25,8 +26,12 @@ export async function joinRoom(
     RoomEvent.TrackSubscribed,
     async (track, publication, participant) => {
       console.log(
-        "Track subscribed:",
+        "[LiveKit Audio] Track subscribed:",
         track.kind,
+        "name:",
+        track.name,
+        "sid:",
+        track.sid,
         "from:",
         participant.identity
       );
@@ -35,32 +40,103 @@ export async function joinRoom(
         return;
       }
 
-      console.log("AI audio track received.");
+      console.log("[LiveKit Audio] AI audio track received. Attaching media element...");
 
-      const audioElement = track.attach();
-      audioElement.autoplay = true;
-      audioElement.muted = false;
-      audioElement.volume = 1;
-      audioElement.style.display = "none";
-      audioElement.setAttribute("data-livekit-track-sid", track.sid);
+      let audioElement = document.querySelector(
+        `[data-livekit-track-sid="${track.sid}"]`
+      );
 
-      document.body.appendChild(audioElement);
+      if (!audioElement) {
+        audioElement = track.attach();
+        audioElement.autoplay = true;
+        audioElement.muted = false;
+        audioElement.volume = 1;
+
+        // Use offscreen layout instead of display: none to prevent browser audio pipeline throttling
+        audioElement.style.position = "fixed";
+        audioElement.style.top = "-9999px";
+        audioElement.style.left = "-9999px";
+        audioElement.style.width = "1px";
+        audioElement.style.height = "1px";
+        audioElement.style.opacity = "0.001";
+        audioElement.style.pointerEvents = "none";
+        audioElement.setAttribute("data-livekit-track-sid", track.sid);
+
+        // Attach comprehensive audio diagnostic listeners
+        audioElement.addEventListener("playing", () => {
+          console.log(
+            `[LiveKit Audio] AI audio element is actively PLAYING. Volume=${audioElement.volume}, Muted=${audioElement.muted}`
+          );
+          if (onAudioPlaybackStatusChanged) {
+            onAudioPlaybackStatusChanged(true);
+          }
+        });
+
+        audioElement.addEventListener("pause", () => {
+          console.warn("[LiveKit Audio] AI audio element was PAUSED.");
+        });
+
+        audioElement.addEventListener("waiting", () => {
+          console.log("[LiveKit Audio] AI audio element is WAITING for audio frames...");
+        });
+
+        audioElement.addEventListener("error", () => {
+          console.error(
+            "[LiveKit Audio] AI audio element playback ERROR:",
+            audioElement.error
+          );
+          if (onAudioPlaybackStatusChanged) {
+            onAudioPlaybackStatusChanged(false);
+          }
+        });
+
+        document.body.appendChild(audioElement);
+      }
 
       try {
         await audioElement.play();
-        console.log("AI audio playback started.");
+        console.log("[LiveKit Audio] AI audio element play() succeeded.");
+        if (onAudioPlaybackStatusChanged) {
+          onAudioPlaybackStatusChanged(true);
+        }
       } catch (error) {
-        console.error("AI audio playback failed:", error);
+        console.warn(
+          "[LiveKit Audio] Initial audioElement.play() blocked by browser autoplay policy:",
+          error?.message || error
+        );
+
         try {
           await room.startAudio();
           await audioElement.play();
-          console.log("AI audio started after startAudio().");
+          console.log("[LiveKit Audio] AI audio playback started after room.startAudio().");
+          if (onAudioPlaybackStatusChanged) {
+            onAudioPlaybackStatusChanged(true);
+          }
         } catch (audioError) {
-          console.error("Could not start AI audio:", audioError);
+          console.warn(
+            "[LiveKit Audio] room.startAudio() also requires user gesture. Flagging audio as blocked for UI prompt:",
+            audioError?.message || audioError
+          );
+          if (onAudioPlaybackStatusChanged) {
+            onAudioPlaybackStatusChanged(false);
+          }
         }
       }
     }
   );
+
+  // ==========================================================
+  // AUDIO PLAYBACK STATUS CHANGED (AUTOPLAY POLICY WATCHDOG)
+  // ==========================================================
+
+  room.on(RoomEvent.AudioPlaybackStatusChanged, () => {
+    console.log(
+      `[LiveKit Audio] Room audio playback status changed: canPlaybackAudio=${room.canPlaybackAudio}`
+    );
+    if (onAudioPlaybackStatusChanged) {
+      onAudioPlaybackStatusChanged(room.canPlaybackAudio);
+    }
+  });
 
   // ==========================================================
   // TRACK UNSUBSCRIBED (CLEANUP AUDIO ELEMENTS)
@@ -68,11 +144,23 @@ export async function joinRoom(
 
   room.on(RoomEvent.TrackUnsubscribed, (track) => {
     if (track.kind === Track.Kind.Audio) {
-      console.log("Detaching audio track:", track.sid);
-      const detached = track.detach();
-      detached.forEach((element) => {
-        if (element && element.parentNode) {
-          element.parentNode.removeChild(element);
+      console.log("[LiveKit Audio] Detaching AI audio track:", track.sid);
+      try {
+        const detached = track.detach();
+        detached.forEach((element) => {
+          if (element && element.parentNode) {
+            element.parentNode.removeChild(element);
+          }
+        });
+      } catch (detachError) {
+        console.warn("[LiveKit Audio] Notice while detaching track:", detachError);
+      }
+      const remaining = document.querySelectorAll(
+        `[data-livekit-track-sid="${track.sid}"]`
+      );
+      remaining.forEach((el) => {
+        if (el.parentNode) {
+          el.parentNode.removeChild(el);
         }
       });
     }

@@ -60,6 +60,46 @@ function App() {
   const [errorMessage, setErrorMessage] =
     useState("");
 
+  const [audioBlocked, setAudioBlocked] =
+    useState(false);
+
+  // Synchronously prime the Web Audio pipeline during a user gesture
+  function unlockBrowserAudio() {
+    try {
+      const AudioCtx = window.AudioContext || window.webkitAudioContext;
+      if (AudioCtx) {
+        const ctx = new AudioCtx();
+        if (ctx.state === "suspended") {
+          ctx.resume();
+        }
+        const osc = ctx.createOscillator();
+        const gain = ctx.createGain();
+        gain.gain.value = 0;
+        osc.connect(gain);
+        gain.connect(ctx.destination);
+        osc.start(0);
+        osc.stop(0.001);
+      }
+    } catch (e) {
+      console.warn("[App] Browser audio unlock notice:", e);
+    }
+  }
+
+  // Explicit user gesture to unmute / resume room audio if blocked by autoplay policy
+  async function enableAudio() {
+    const activeRoom = roomRef.current || room;
+    if (activeRoom) {
+      console.log("[App] Explicit user gesture to enable AI audio...");
+      try {
+        await activeRoom.startAudio();
+        console.log("[App] activeRoom.startAudio() succeeded.");
+        setAudioBlocked(false);
+      } catch (err) {
+        console.warn("[App] Error enabling audio:", err);
+      }
+    }
+  }
+
   // ==========================================================
   // FORMAT TIME
   // ==========================================================
@@ -341,8 +381,12 @@ function App() {
     setIsConnecting(true);
     console.log("[App] Assessment start requested.");
 
+    // Warm up Web Audio during the user click gesture before async fetch
+    unlockBrowserAudio();
+
     try {
       setErrorMessage("");
+      setAudioBlocked(false);
 
       setAssessmentFinished(false);
       setAssessmentResult(null);
@@ -384,6 +428,7 @@ function App() {
             setConnected(false);
             setRoom(null);
             setEnding(false);
+            setAudioBlocked(false);
 
             setAssessmentFinished((finished) => {
               if (!finished) {
@@ -405,6 +450,10 @@ function App() {
                 (micError?.message ||
                   "Please verify your microphone is connected and browser permissions are allowed.")
             );
+          },
+          (canPlay) => {
+            console.log("[App] Audio playback status update. canPlay:", canPlay);
+            setAudioBlocked(!canPlay);
           }
         );
 
@@ -1022,16 +1071,29 @@ function App() {
             </p>
           </div>
 
-          <div
-            className={`rounded-full px-4 py-2 text-sm ${
-              connected
-                ? "bg-green-500/10 text-green-400"
-                : "bg-slate-800 text-slate-400"
-            }`}
-          >
-            {connected
-              ? "Assessment Active"
-              : "Ready"}
+          <div className="flex items-center gap-3">
+            {connected && (
+              <span
+                className={`rounded-full px-3 py-1.5 text-xs font-medium ${
+                  audioBlocked
+                    ? "border border-amber-500/30 bg-amber-500/10 text-amber-300"
+                    : "bg-indigo-500/10 text-indigo-300"
+                }`}
+              >
+                {audioBlocked ? "🔇 Audio Blocked" : "🔊 Audio Active"}
+              </span>
+            )}
+            <div
+              className={`rounded-full px-4 py-2 text-sm ${
+                connected
+                  ? "bg-green-500/10 text-green-400"
+                  : "bg-slate-800 text-slate-400"
+              }`}
+            >
+              {connected
+                ? "Assessment Active"
+                : "Ready"}
+            </div>
           </div>
 
         </div>
@@ -1151,6 +1213,28 @@ function App() {
                   </div>
 
                 </div>
+
+                {audioBlocked && (
+                  <div className="mt-6 flex flex-wrap items-center justify-between gap-4 rounded-2xl border border-amber-500/40 bg-amber-500/10 p-5 text-amber-200">
+                    <div className="flex items-center gap-3">
+                      <span className="text-2xl">🔇</span>
+                      <div>
+                        <p className="text-sm font-semibold text-amber-300">
+                          AI Interviewer audio is paused by your browser
+                        </p>
+                        <p className="mt-0.5 text-xs text-amber-300/80">
+                          Browser autoplay policy requires an explicit click to allow voice playback.
+                        </p>
+                      </div>
+                    </div>
+                    <button
+                      onClick={enableAudio}
+                      className="rounded-xl bg-amber-500 px-5 py-2.5 text-sm font-semibold text-slate-950 transition hover:bg-amber-400"
+                    >
+                      🔊 Enable AI Audio
+                    </button>
+                  </div>
+                )}
 
                 {/* CURRENT QUESTION */}
 
