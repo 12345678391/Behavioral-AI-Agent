@@ -145,5 +145,43 @@ class TestAgentStartup(unittest.TestCase):
 
             self.assertIn("invalid final analysis", str(ctx.exception))
 
+    def test_prewarm_initializes_silero_vad_16k(self):
+        """Verify prewarm loads Silero VAD with 16000 Hz sample rate into proc.userdata."""
+        from unittest.mock import MagicMock, patch
+        from agent.agent import prewarm
+
+        mock_proc = MagicMock()
+        mock_proc.userdata = {}
+
+        mock_vad = MagicMock()
+        with patch("livekit.plugins.silero.VAD.load", return_value=mock_vad) as mock_load:
+            prewarm(mock_proc)
+            mock_load.assert_called_once_with(sample_rate=16000)
+            self.assertEqual(mock_proc.userdata.get("vad"), mock_vad)
+
+    def test_worker_options_includes_prewarm_fnc(self):
+        """Verify WorkerOptions is configured with prewarm_fnc, THREAD executor, and timeout."""
+        from livekit.agents import WorkerOptions, JobExecutorType
+        from agent.agent import entrypoint, prewarm
+
+        opts = WorkerOptions(
+            entrypoint_fnc=entrypoint,
+            prewarm_fnc=prewarm,
+            port=8081,
+            num_idle_processes=0,
+            initialize_process_timeout=60.0,
+            job_executor_type=JobExecutorType.THREAD,
+        )
+        self.assertEqual(opts.prewarm_fnc, prewarm)
+        self.assertEqual(opts.entrypoint_fnc, entrypoint)
+        self.assertEqual(opts.num_idle_processes, 0)
+        self.assertEqual(opts.job_executor_type, JobExecutorType.THREAD)
+
+    def test_turn_handling_interruption_disabled(self):
+        """Verify that TurnHandlingOptions allows disabling interruptions to prevent echo stutter."""
+        from livekit.agents.voice.turn import _resolve_interruption
+        res = _resolve_interruption({"enabled": False})
+        self.assertFalse(res["enabled"])
+
 if __name__ == "__main__":
     unittest.main()

@@ -14,6 +14,7 @@ from livekit.agents import (
     AgentSession,
     JobContext,
     JobExecutorType,
+    JobProcess,
     WorkerOptions,
     cli,
 )
@@ -990,6 +991,20 @@ The interview controller will decide when to ask the next question.
 
 
 # ============================================================
+# PREWARM
+# ============================================================
+
+def prewarm(proc: JobProcess):
+    """Prewarm the Silero VAD model during worker startup to prevent runtime event-loop blocks."""
+    print("[Agent Worker] Prewarming Silero VAD (sample_rate=16000 Hz)...")
+    try:
+        proc.userdata["vad"] = silero.VAD.load(sample_rate=16000)
+        print("[Agent Worker] Silero VAD prewarmed successfully.")
+    except Exception as error:
+        print("[Agent Worker] Silero VAD prewarm warning:", repr(error))
+
+
+# ============================================================
 # ENTRYPOINT
 # ============================================================
 
@@ -1134,16 +1149,19 @@ async def entrypoint(
     # SESSION
     # --------------------------------------------------------
 
-    print(
-        "[Agent] [Stage 3/5] Loading VAD model in background worker thread..."
-    )
+    vad = ctx.proc.userdata.get("vad") if hasattr(ctx, "proc") and hasattr(ctx.proc, "userdata") else None
+    if vad is None:
+        print(
+            "[Agent] [Stage 3/5] Loading Silero VAD in background worker thread (sample_rate=16000 Hz)..."
+        )
+        vad = await asyncio.to_thread(silero.VAD.load, sample_rate=16000)
+    else:
+        print(
+            "[Agent] [Stage 3/5] Using prewarmed Silero VAD (sample_rate=16000 Hz)."
+        )
 
-    # Load VAD in a worker thread so the main asyncio event loop is not blocked during ONNX initialization.
-    # Use sample_rate=8000 to halve ONNX inference workload on constrained CPU containers.
-    vad = await asyncio.to_thread(silero.VAD.load, sample_rate=8000)
-
     print(
-        "[Agent] [Stage 3/5] Silero VAD loaded (sample_rate=8000 Hz for low-latency inference). Creating AgentSession..."
+        "[Agent] [Stage 3/5] Creating AgentSession with uninterrupted speech delivery and 16kHz VAD..."
     )
 
     session = AgentSession(
@@ -1164,10 +1182,28 @@ async def entrypoint(
 
         turn_handling={
             "interruption": {
-                "mode": "vad"
-            }
+                "enabled": False,
+            },
         },
     )
+
+    @session.on("agent_state_changed")
+    def on_agent_state_changed(event):
+        try:
+            print(
+                f"[Agent State] State changed: {event.new_state} (previous: {event.old_state})"
+            )
+        except Exception:
+            pass
+
+    @session.on("error")
+    def on_session_error(event):
+        try:
+            print(
+                f"[Agent Session Error] {event.error}"
+            )
+        except Exception:
+            pass
 
     # --------------------------------------------------------
     # USER TRANSCRIPT EVENT
@@ -1382,7 +1418,8 @@ async def entrypoint(
 
     speech_start_time = time.monotonic()
     speech_handle = session.say(
-        opening_question
+        opening_question,
+        allow_interruptions=False,
     )
 
     print(
@@ -1466,7 +1503,8 @@ async def entrypoint(
         )
 
         await session.say(
-            warning_message
+            warning_message,
+            allow_interruptions=False,
         )
 
         final_wait = (
@@ -1784,7 +1822,8 @@ async def entrypoint(
 
                 adaptive_start_time = time.monotonic()
                 adaptive_handle = session.say(
-                    question
+                    question,
+                    allow_interruptions=False,
                 )
 
                 print(
@@ -1882,7 +1921,8 @@ async def entrypoint(
         )
 
         await session.say(
-            closing_message
+            closing_message,
+            allow_interruptions=False,
         )
 
         await asyncio.sleep(
@@ -1964,7 +2004,8 @@ async def entrypoint(
     # SAVE
     # ========================================================
 
-    save_assessment(
+    await asyncio.to_thread(
+        save_assessment,
         state,
         assessment_id,
     )
@@ -2024,9 +2065,10 @@ if __name__ == "__main__":
     cli.run_app(
         WorkerOptions(
             entrypoint_fnc=entrypoint,
+            prewarm_fnc=prewarm,
             port=int(os.environ.get("PORT", "8081")),
             num_idle_processes=0,
             initialize_process_timeout=60.0,
             job_executor_type=JobExecutorType.THREAD,
         )
-    )
+    )
