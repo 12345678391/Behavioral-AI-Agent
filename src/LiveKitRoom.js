@@ -22,6 +22,9 @@ export async function joinRoom(
   // AI AUDIO
   // ==========================================================
 
+  // Track-level WebRTC statistics monitoring intervals
+  const trackStatsIntervals = new Map();
+
   room.on(
     RoomEvent.TrackSubscribed,
     async (track, publication, participant) => {
@@ -51,6 +54,7 @@ export async function joinRoom(
         audioElement.autoplay = true;
         audioElement.muted = false;
         audioElement.volume = 1;
+        audioElement.preload = "auto";
 
         // Use offscreen layout instead of display: none to prevent browser audio pipeline throttling
         audioElement.style.position = "fixed";
@@ -91,6 +95,52 @@ export async function joinRoom(
         });
 
         document.body.appendChild(audioElement);
+      }
+
+      // Start periodic WebRTC inbound audio statistics diagnostics
+      if (!trackStatsIntervals.has(track.sid)) {
+        let prevPacketsLost = 0;
+        let prevPacketsReceived = 0;
+        let prevConcealed = 0;
+
+        const intervalId = setInterval(async () => {
+          if (room.state !== "connected") {
+            clearInterval(intervalId);
+            trackStatsIntervals.delete(track.sid);
+            return;
+          }
+
+          try {
+            const stats = typeof track.getReceiverStats === "function"
+              ? await track.getReceiverStats()
+              : null;
+
+            if (stats) {
+              const jitterMs = stats.jitter ? (stats.jitter * 1000).toFixed(1) : "0.0";
+              const packetsLostDelta = (stats.packetsLost || 0) - prevPacketsLost;
+              const packetsRcvdDelta = (stats.packetsReceived || 0) - prevPacketsReceived;
+              const concealedDelta = (stats.concealedSamples || 0) - prevConcealed;
+
+              prevPacketsLost = stats.packetsLost || 0;
+              prevPacketsReceived = stats.packetsReceived || 0;
+              prevConcealed = stats.concealedSamples || 0;
+
+              if (packetsLostDelta > 0 || (stats.jitter && stats.jitter > 0.05) || concealedDelta > 0) {
+                console.warn(
+                  `[LiveKit WebRTC Audio WARNING] Jitter=${jitterMs}ms, packetsLost=+${packetsLostDelta} (total ${stats.packetsLost}), concealed=+${concealedDelta}, rcvd=+${packetsRcvdDelta}`
+                );
+              } else {
+                console.log(
+                  `[LiveKit WebRTC Audio Stats] Reception healthy: jitter=${jitterMs}ms, rcvd=${stats.packetsReceived}, lost=${stats.packetsLost}`
+                );
+              }
+            }
+          } catch (e) {
+            // Stats polling notice (non-fatal)
+          }
+        }, 5000);
+
+        trackStatsIntervals.set(track.sid, intervalId);
       }
 
       try {
@@ -145,6 +195,13 @@ export async function joinRoom(
   room.on(RoomEvent.TrackUnsubscribed, (track) => {
     if (track.kind === Track.Kind.Audio) {
       console.log("[LiveKit Audio] Detaching AI audio track:", track.sid);
+
+      const statsInterval = trackStatsIntervals.get(track.sid);
+      if (statsInterval) {
+        clearInterval(statsInterval);
+        trackStatsIntervals.delete(track.sid);
+      }
+
       try {
         const detached = track.detach();
         detached.forEach((element) => {
@@ -274,6 +331,10 @@ export async function joinRoom(
         "[LiveKit] Room disconnected event received. Reason:",
         reason
       );
+
+      // Clean up track stats intervals
+      trackStatsIntervals.forEach((intervalId) => clearInterval(intervalId));
+      trackStatsIntervals.clear();
 
       // Clean up any remaining attached audio elements
       const elements = document.querySelectorAll(
