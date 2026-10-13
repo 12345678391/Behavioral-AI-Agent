@@ -129,22 +129,94 @@ function App() {
     }
 
     // --------------------------------------------------------
-    // CANDIDATE ANSWER TRANSCRIPT
+    // CANDIDATE INTERIM TRANSCRIPTION (REAL-TIME PROGRESSIVE)
+    // --------------------------------------------------------
+
+    if (
+      type === "candidate_interim_transcript" ||
+      type === "candidate_answer_interim" ||
+      (type === "candidate_answer" && eventData.is_final === false)
+    ) {
+      const interimText = (eventData.answer || eventData.text || "").trim();
+
+      if (!interimText) {
+        return;
+      }
+
+      setConversation((previous) => {
+        const interimIndex = previous.findIndex((item) => item.isInterim);
+
+        if (interimIndex !== -1) {
+          if (previous[interimIndex].text === interimText) {
+            return previous;
+          }
+          const updated = [...previous];
+          updated[interimIndex] = {
+            ...updated[interimIndex],
+            text: interimText,
+          };
+          return updated;
+        }
+
+        return [
+          ...previous,
+          {
+            id: safeRandomUUID(),
+            role: "candidate",
+            text: interimText,
+            isInterim: true,
+          },
+        ];
+      });
+
+      return;
+    }
+
+    // --------------------------------------------------------
+    // CANDIDATE ANSWER TRANSCRIPT (FINAL)
     // --------------------------------------------------------
 
     if (type === "candidate_answer") {
-      const answer = eventData.answer || "";
+      const answer = (eventData.answer || eventData.text || "").trim();
 
-      if (answer) {
-        setConversation((previous) => [
+      if (!answer) {
+        return;
+      }
+
+      setConversation((previous) => {
+        const interimIndex = previous.findIndex((item) => item.isInterim);
+
+        if (interimIndex !== -1) {
+          const updated = [...previous];
+          updated[interimIndex] = {
+            ...updated[interimIndex],
+            text: answer,
+            isInterim: false,
+          };
+          return updated;
+        }
+
+        // Prevent duplicate final message if identical answer is already at the end
+        const lastItem = previous[previous.length - 1];
+        if (
+          lastItem &&
+          lastItem.role === "candidate" &&
+          !lastItem.isInterim &&
+          lastItem.text.trim().toLowerCase() === answer.toLowerCase()
+        ) {
+          return previous;
+        }
+
+        return [
           ...previous,
           {
             id: safeRandomUUID(),
             role: "candidate",
             text: answer,
+            isInterim: false,
           },
-        ]);
-      }
+        ];
+      });
 
       return;
     }
@@ -163,14 +235,20 @@ function App() {
         setCurrentQuestion(question);
 
         setConversation(
-          (previous) => [
-            ...previous,
-            {
-              id: safeRandomUUID(),
-              role: "ai",
-              text: question,
-            },
-          ]
+          (previous) => {
+            const cleaned = previous.map((item) =>
+              item.isInterim ? { ...item, isInterim: false } : item
+            );
+
+            return [
+              ...cleaned,
+              {
+                id: safeRandomUUID(),
+                role: "ai",
+                text: question,
+              },
+            ];
+          }
         );
       }
 
@@ -384,6 +462,13 @@ function App() {
             setConnected(false);
             setRoom(null);
             setEnding(false);
+
+            // Safely finalize any lingering interim candidate message upon disconnect
+            setConversation((previous) =>
+              previous
+                .map((item) => (item.isInterim ? { ...item, isInterim: false } : item))
+                .filter((item) => item.text && item.text.trim())
+            );
 
             setAssessmentFinished((finished) => {
               if (!finished) {
@@ -1198,9 +1283,20 @@ function App() {
                             {item.role === "ai"
                               ? "AI Interviewer"
                               : "Candidate"}
+                            {item.isInterim && (
+                              <span className="ml-2 font-normal lowercase italic text-indigo-400">
+                                speaking...
+                              </span>
+                            )}
                           </p>
 
-                          <p className="mt-2 text-sm leading-relaxed text-slate-300">
+                          <p
+                            className={`mt-2 text-sm leading-relaxed ${
+                              item.isInterim
+                                ? "text-indigo-200"
+                                : "text-slate-300"
+                            }`}
+                          >
                             {item.text}
                           </p>
 

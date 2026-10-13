@@ -989,6 +989,60 @@ The interview controller will decide when to ask the next question.
         raise StopResponse()
 
 
+def process_transcript_event(
+    transcript: str,
+    is_final: bool,
+    state: AssessmentState,
+    processed_transcripts: set,
+    user_answer_queue: asyncio.Queue,
+    send_event_fn,
+) -> str | None:
+    """Process incoming STT transcript event, separating interim UI updates from final candidate turns."""
+    if not transcript:
+        return None
+
+    transcript = transcript.strip()
+    if not transcript:
+        return None
+
+    # Progressive interim speech: emit UI update without mutating interview state or queue
+    if not is_final:
+        send_event_fn(
+            "candidate_interim_transcript",
+            {
+                "answer": transcript,
+                "is_final": False,
+            },
+        )
+        return "interim"
+
+    # Prevent duplicate final transcripts
+    transcript_key = transcript.lower()
+    if transcript_key in processed_transcripts:
+        return "duplicate"
+
+    processed_transcripts.add(transcript_key)
+
+    # Store final candidate answer into state
+    state.add_transcript("candidate", transcript)
+
+    if not state.candidate_introduction:
+        state.candidate_introduction = transcript
+
+    # Send finalized candidate answer event to React UI
+    send_event_fn(
+        "candidate_answer",
+        {
+            "answer": transcript,
+            "is_final": True,
+        },
+    )
+
+    # Put completed answer into interview queue
+    user_answer_queue.put_nowait(transcript)
+    return "final"
+
+
 # ============================================================
 # ENTRYPOINT
 # ============================================================
@@ -1189,58 +1243,28 @@ async def entrypoint(
                 False,
             )
 
-            if not transcript:
-                return
-
-            transcript = transcript.strip()
-
-            print(
-                f"USER TRANSCRIPT | final={is_final}: {transcript}"
-            )
-
-            # Ignore partial/interim speech.
-            if not is_final:
-                return
-
-            # Prevent duplicate final transcripts.
-            transcript_key = transcript.lower()
-
-            if transcript_key in processed_transcripts:
-                return
-
-            processed_transcripts.add(
-                transcript_key
-            )
-
-            # Store candidate answer.
-            state.add_transcript(
-                "candidate",
-                transcript,
-            )
-
-            # First answer = introduction.
-            if not state.candidate_introduction:
-                state.candidate_introduction = transcript
-
-            # Send candidate answer to React.
-            asyncio.create_task(
-                send_ui_event(
-                    ctx,
-                    "candidate_answer",
-                    {
-                        "answer": transcript,
-                    },
+            def _send_event(event_type: str, data: dict):
+                asyncio.create_task(
+                    send_ui_event(
+                        ctx,
+                        event_type,
+                        data,
+                    )
                 )
+
+            action = process_transcript_event(
+                transcript,
+                is_final,
+                state,
+                processed_transcripts,
+                user_answer_queue,
+                _send_event,
             )
 
-            # Put completed answer into interview queue.
-            user_answer_queue.put_nowait(
-                transcript
-            )
-
-            print(
-                "Candidate answer added to interview queue."
-            )
+            if action == "final":
+                print(
+                    "Candidate answer added to interview queue."
+                )
 
         except Exception as error:
 

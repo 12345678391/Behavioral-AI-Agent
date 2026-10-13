@@ -145,5 +145,102 @@ class TestAgentStartup(unittest.TestCase):
 
             self.assertIn("invalid final analysis", str(ctx.exception))
 
+    def test_process_transcript_event_interim_sends_ui_event_and_does_not_advance_queue(self):
+        """Verify interim speech triggers candidate_interim_transcript UI event without modifying state or queue."""
+        import asyncio
+        from agent.agent import AssessmentState, process_transcript_event
+
+        state = AssessmentState()
+        processed_transcripts = set()
+        queue = asyncio.Queue()
+        sent_events = []
+
+        def mock_send(event_type, data):
+            sent_events.append((event_type, data))
+
+        action = process_transcript_event(
+            "I spearheaded",
+            False,
+            state,
+            processed_transcripts,
+            queue,
+            mock_send,
+        )
+
+        self.assertEqual(action, "interim")
+        self.assertEqual(len(sent_events), 1)
+        self.assertEqual(sent_events[0][0], "candidate_interim_transcript")
+        self.assertEqual(sent_events[0][1]["answer"], "I spearheaded")
+        self.assertFalse(sent_events[0][1]["is_final"])
+
+        # Must NOT mutate persistent interview transcript or queue
+        self.assertEqual(len(state.transcript), 0)
+        self.assertEqual(queue.qsize(), 0)
+        self.assertEqual(len(processed_transcripts), 0)
+
+    def test_process_transcript_event_final_advances_queue_and_state(self):
+        """Verify final transcription stores state, advances interview queue, and sends candidate_answer event."""
+        import asyncio
+        from agent.agent import AssessmentState, process_transcript_event
+
+        state = AssessmentState()
+        processed_transcripts = set()
+        queue = asyncio.Queue()
+        sent_events = []
+
+        def mock_send(event_type, data):
+            sent_events.append((event_type, data))
+
+        action = process_transcript_event(
+            "I spearheaded the cloud migration.",
+            True,
+            state,
+            processed_transcripts,
+            queue,
+            mock_send,
+        )
+
+        self.assertEqual(action, "final")
+        self.assertEqual(len(sent_events), 1)
+        self.assertEqual(sent_events[0][0], "candidate_answer")
+        self.assertEqual(sent_events[0][1]["answer"], "I spearheaded the cloud migration.")
+        self.assertTrue(sent_events[0][1]["is_final"])
+
+        # Mutates state and queue
+        self.assertEqual(len(state.transcript), 1)
+        self.assertEqual(state.transcript[0]["text"], "I spearheaded the cloud migration.")
+        self.assertEqual(state.candidate_introduction, "I spearheaded the cloud migration.")
+        self.assertEqual(queue.qsize(), 1)
+        self.assertEqual(queue.get_nowait(), "I spearheaded the cloud migration.")
+        self.assertIn("i spearheaded the cloud migration.", processed_transcripts)
+
+        # Duplicate final transcript is rejected
+        dup_action = process_transcript_event(
+            "I spearheaded the cloud migration.",
+            True,
+            state,
+            processed_transcripts,
+            queue,
+            mock_send,
+        )
+        self.assertEqual(dup_action, "duplicate")
+        self.assertEqual(len(state.transcript), 1)
+        self.assertEqual(queue.qsize(), 0)
+
+    def test_process_transcript_event_empty_transcripts_ignored(self):
+        """Verify empty or whitespace-only transcripts are safely ignored."""
+        import asyncio
+        from agent.agent import AssessmentState, process_transcript_event
+
+        state = AssessmentState()
+        processed_transcripts = set()
+        queue = asyncio.Queue()
+        sent_events = []
+
+        self.assertIsNone(process_transcript_event("", False, state, processed_transcripts, queue, lambda t, d: sent_events.append((t, d))))
+        self.assertIsNone(process_transcript_event("   ", False, state, processed_transcripts, queue, lambda t, d: sent_events.append((t, d))))
+        self.assertIsNone(process_transcript_event("", True, state, processed_transcripts, queue, lambda t, d: sent_events.append((t, d))))
+        self.assertEqual(len(sent_events), 0)
+
 if __name__ == "__main__":
     unittest.main()
