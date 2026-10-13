@@ -1,4 +1,6 @@
 import asyncio
+import hashlib
+import hmac
 import json
 import os
 import time
@@ -82,6 +84,8 @@ def sanitize_environment():
         "LIVEKIT_API_SECRET",
         "LIVEKIT_URL",
         "OPENAI_MODEL",
+        "ASSESSMENT_SYNC_SECRET",
+        "BACKEND_URL",
     )
     for key in target_keys:
         val = os.environ.get(key)
@@ -1069,6 +1073,408 @@ The interview controller will decide when to ask the next question.
 
 
 # ============================================================
+# LIFECYCLE & TURN MANAGEMENT HELPERS
+# ============================================================
+
+def compute_sync_signature(assessment_id: str, secret: str) -> str:
+    """Compute HMAC-SHA256 signature for authenticating assessment result sync requests."""
+    return hmac.new(
+        secret.strip().encode("utf-8"),
+        assessment_id.strip().encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+
+
+async def sync_assessment_to_backend(
+    state: AssessmentState,
+    assessment_id: str,
+    backend_url: str | None = None,
+    timeout: float = 3.5,
+) -> bool:
+    """Synchronize completed assessment result to backend HTTP endpoint with bounded timeout."""
+    resolved_url = (
+        backend_url
+        or os.getenv("BACKEND_URL")
+        or os.getenv("REACT_APP_API_BASE_URL")
+        or "https://behavioral-backend-gc62.onrender.com"
+    )
+    if not resolved_url:
+        return False
+    try:
+        import urllib.request
+        sync_payload = json.dumps(state.to_dict()).encode("utf-8")
+        sync_url = f"{resolved_url.rstrip('/')}/assessment-result?assessmentId={assessment_id}"
+        headers = {"Content-Type": "application/json"}
+        sync_secret = (
+            os.getenv("ASSESSMENT_SYNC_SECRET")
+            or os.getenv("LIVEKIT_API_SECRET")
+            or ""
+        ).strip()
+        if sync_secret:
+            headers["X-Assessment-Signature"] = compute_sync_signature(
+                assessment_id, sync_secret
+            )
+        req = urllib.request.Request(
+            sync_url,
+            data=sync_payload,
+            headers=headers,
+            method="POST",
+        )
+        def _post_sync():
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return resp.status == 200
+        ok = await asyncio.to_thread(_post_sync)
+        print("[Agent] Assessment result synced to backend HTTP endpoint.")
+        return bool(ok)
+    except Exception as sync_err:
+        print("[Agent] Backend sync notice (non-fatal):", repr(sync_err))
+        return False
+
+
+async def deliver_final_result_and_sync(
+    ctx,
+    state: AssessmentState,
+    assessment_id: str,
+    candidate_disconnected: asyncio.Event,
+    send_event_fn=send_ui_event,
+    save_fn=save_assessment,
+    sync_fn=sync_assessment_to_backend,
+    disconnect_timeout: float = 4.0,
+) -> None:
+    """Send final_result over LiveKit immediately without blocking on disk/HTTP, then persist & sync concurrently."""
+    try:
+        await send_event_fn(
+            ctx,
+            "final_result",
+            state.to_dict(),
+        )
+        print("FINAL RESULT SENT TO FRONTEND.")
+    except Exception as error:
+        print("Final result send failed:", repr(error))
+
+    async def _wait_disconnect():
+        try:
+            await asyncio.wait_for(
+                candidate_disconnected.wait(),
+                timeout=disconnect_timeout,
+            )
+        except asyncio.TimeoutError:
+            pass
+
+    await asyncio.gather(
+        asyncio.to_thread(save_fn, state, assessment_id),
+        sync_fn(state, assessment_id),
+        _wait_disconnect(),
+        return_exceptions=True,
+    )
+
+
+async def finalize_uncommitted_speech(
+    session,
+    uncommitted_final_segments: list[str],
+    on_turn_callback,
+    commit_timeout: float = 1.5,
+) -> str | None:
+    """Commit any in-flight user turn via supported AgentSession API and flush finalized STT segments."""
+    snapshot_segments = [s.strip() for s in uncommitted_final_segments if s and s.strip()]
+    uncommitted_final_segments.clear()
+    committed_text = ""
+
+    if session is not None and hasattr(session, "commit_user_turn"):
+        try:
+            commit_fut = session.commit_user_turn(
+                transcript_timeout=1.0,
+                stt_flush_duration=0.8,
+                skip_reply=True,
+            )
+            if asyncio.isfuture(commit_fut) or asyncio.iscoroutine(commit_fut):
+                res = await asyncio.wait_for(commit_fut, timeout=commit_timeout)
+                if isinstance(res, str) and res.strip():
+                    committed_text = res.strip()
+        except Exception as commit_err:
+            print(f"[Agent] commit_user_turn notice during finalization: {commit_err!r}")
+
+    final_text = committed_text or (" ".join(snapshot_segments).strip() if snapshot_segments else "")
+    if final_text and on_turn_callback is not None:
+        res = on_turn_callback(final_text)
+        if asyncio.iscoroutine(res):
+            await res
+        return final_text
+    return None
+
+
+async def drain_and_analyze_pending_answers(
+    state: AssessmentState,
+    user_answer_queue: asyncio.Queue,
+    analyzed_answers: set[str],
+    answer_task: asyncio.Task | None = None,
+    extra_answers: list[str] | None = None,
+    analyze_fn=analyze_candidate_answer,
+) -> list[str]:
+    """Rescue any completed or pending answer_task result and drain user_answer_queue, analyzing each valid answer once."""
+    collected: list[str] = []
+    if extra_answers:
+        for item in extra_answers:
+            if isinstance(item, str) and item.strip():
+                collected.append(item.strip())
+
+    if answer_task is not None:
+        if not answer_task.done():
+            answer_task.cancel()
+            try:
+                rescued = await answer_task
+                if isinstance(rescued, str) and rescued.strip():
+                    collected.append(rescued.strip())
+            except (asyncio.CancelledError, Exception):
+                pass
+        else:
+            if not answer_task.cancelled() and answer_task.exception() is None:
+                try:
+                    rescued = answer_task.result()
+                    if isinstance(rescued, str) and rescued.strip():
+                        collected.append(rescued.strip())
+                except Exception:
+                    pass
+
+    while not user_answer_queue.empty():
+        try:
+            queued_ans = user_answer_queue.get_nowait()
+            if isinstance(queued_ans, str) and queued_ans.strip():
+                collected.append(queued_ans.strip())
+        except Exception:
+            break
+
+    newly_analyzed: list[str] = []
+    for ans in collected:
+        ans_clean = ans.strip()
+        if not ans_clean:
+            continue
+        ans_key = ans_clean.lower()
+        if ans_key in analyzed_answers:
+            continue
+        analyzed_answers.add(ans_key)
+        if not state.candidate_introduction:
+            state.candidate_introduction = ans_clean
+        try:
+            print(f"[Agent] Analyzing pending candidate response: {ans_clean[:60]}...")
+            await analyze_fn(state, ans_clean)
+            newly_analyzed.append(ans_clean)
+        except Exception as drain_err:
+            print("[Agent] Pending answer analysis notice:", repr(drain_err))
+
+    return newly_analyzed
+
+
+async def speak_with_lock(
+    session,
+    text: str,
+    speech_lock: asyncio.Lock,
+    stage_label: str = "Speech",
+    manual_end_event: asyncio.Event | None = None,
+    disconnect_event: asyncio.Event | None = None,
+    set_speaking_state=None,
+) -> bool:
+    """Serialize session.say calls with speech_lock and handle End Assessment / disconnect cleanly during playback."""
+    if (manual_end_event and manual_end_event.is_set()) or (
+        disconnect_event and disconnect_event.is_set()
+    ):
+        return False
+
+    async with speech_lock:
+        if (manual_end_event and manual_end_event.is_set()) or (
+            disconnect_event and disconnect_event.is_set()
+        ):
+            return False
+
+        if set_speaking_state is not None:
+            set_speaking_state(True)
+
+        playout_task: asyncio.Task | None = None
+        event_tasks: set[asyncio.Task] = set()
+        try:
+            print(f"[Agent] [{stage_label}] Queuing speech delivery via TTS: {text[:60]}...")
+            handle = session.say(text, allow_interruptions=False)
+            start_t = time.monotonic()
+
+            async def _await_handle():
+                return await handle
+
+            playout_task = asyncio.create_task(_await_handle())
+            wait_set: set[asyncio.Task] = {playout_task}
+
+            if manual_end_event is not None:
+                t_manual = asyncio.create_task(manual_end_event.wait())
+                event_tasks.add(t_manual)
+                wait_set.add(t_manual)
+
+            if disconnect_event is not None:
+                t_disc = asyncio.create_task(disconnect_event.wait())
+                event_tasks.add(t_disc)
+                wait_set.add(t_disc)
+
+            done, _ = await asyncio.wait(
+                wait_set,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+
+            if playout_task not in done:
+                print(f"[Agent] [{stage_label}] Stopping active speech due to assessment end/disconnect.")
+                try:
+                    if hasattr(handle, "interrupt"):
+                        handle.interrupt(force=True)
+                    elif hasattr(session, "interrupt"):
+                        session.interrupt(force=True)
+                except Exception:
+                    pass
+                playout_task.cancel()
+                try:
+                    await playout_task
+                except (asyncio.CancelledError, Exception):
+                    pass
+                return False
+
+            dur = time.monotonic() - start_t
+            err = handle.exception() if hasattr(handle, "exception") else None
+            if err:
+                print(f"[Agent] [{stage_label}] Speech FAILED after {dur:.2f}s: {err!r}")
+            else:
+                print(f"[Agent] [{stage_label}] Speech playout completed without errors in {dur:.2f}s")
+            return True
+        finally:
+            for t in event_tasks:
+                if not t.done():
+                    t.cancel()
+            if event_tasks:
+                await asyncio.gather(*event_tasks, return_exceptions=True)
+            if set_speaking_state is not None:
+                set_speaking_state(False)
+
+
+async def process_interview_turn(
+    ctx,
+    state: AssessmentState,
+    answer: str,
+    remaining_seconds: int,
+    warning_sent: bool,
+    user_answer_queue: asyncio.Queue,
+    analyzed_answers: set[str],
+    manual_end_event: asyncio.Event,
+    timer_finished_event: asyncio.Event,
+    disconnect_event: asyncio.Event,
+    speak_fn,
+    analyze_fn=analyze_candidate_answer,
+    generate_question_fn=generate_adaptive_question,
+    send_event_fn=send_ui_event,
+) -> bool:
+    """Analyze candidate answer, drain any continuation turns arriving during LLM generation, and ask next question if active."""
+    answer = (answer or "").strip()
+    if not answer:
+        return True
+
+    if not state.candidate_introduction:
+        state.candidate_introduction = answer
+
+    # If warning or end condition already reached, analyze this final valid answer before stopping question generation
+    if (
+        warning_sent
+        or remaining_seconds <= WARNING_SECONDS
+        or manual_end_event.is_set()
+        or timer_finished_event.is_set()
+    ):
+        if warning_sent:
+            print("Candidate finished current response after warning.")
+        if not disconnect_event.is_set():
+            await drain_and_analyze_pending_answers(
+                state,
+                user_answer_queue,
+                analyzed_answers,
+                extra_answers=[answer],
+                analyze_fn=analyze_fn,
+            )
+        return False
+
+    question_transcript = format_transcript(state)
+    question_evidence = format_evidence(state)
+
+    ans_key = answer.lower()
+    should_analyze_primary = ans_key not in analyzed_answers
+    if should_analyze_primary:
+        analyzed_answers.add(ans_key)
+
+    print("DEBUG: starting analysis + question generation")
+    start_time = time.perf_counter()
+
+    if should_analyze_primary:
+        analysis_task = asyncio.create_task(analyze_fn(state, answer))
+    else:
+        analysis_task = asyncio.create_task(asyncio.sleep(0))
+
+    question_task = asyncio.create_task(
+        generate_question_fn(
+            state,
+            remaining_seconds,
+            current_answer=answer,
+            transcript=question_transcript,
+            evidence=question_evidence,
+        )
+    )
+
+    _, question = await asyncio.gather(analysis_task, question_task)
+    elapsed = time.perf_counter() - start_time
+    print(f"DEBUG: analysis + question generation took {elapsed:.2f} seconds")
+    print("Candidate answer analyzed.")
+
+    # Any additional speech turn that completed while LLM was generating belongs to the
+    # current question, NOT the next question that hasn't been asked yet.
+    if not user_answer_queue.empty() and not disconnect_event.is_set():
+        await drain_and_analyze_pending_answers(
+            state,
+            user_answer_queue,
+            analyzed_answers,
+            analyze_fn=analyze_fn,
+        )
+
+    if (
+        not question
+        or warning_sent
+        or manual_end_event.is_set()
+        or timer_finished_event.is_set()
+        or disconnect_event.is_set()
+    ):
+        return False
+
+    state.questions_asked += 1
+    print()
+    print("--------------------------------------------")
+    print("ADAPTIVE QUESTION")
+    print(question)
+    print("--------------------------------------------")
+
+    await send_event_fn(
+        ctx,
+        "interview_question",
+        {
+            "question": question,
+            "question_number": state.questions_asked,
+        },
+    )
+
+    spoke_ok = await speak_fn(
+        question,
+        f"Adaptive question #{state.questions_asked}",
+    )
+    if (
+        not spoke_ok
+        or manual_end_event.is_set()
+        or timer_finished_event.is_set()
+        or disconnect_event.is_set()
+    ):
+        return False
+
+    return True
+
+
+# ============================================================
 # PREWARM
 # ============================================================
 
@@ -1156,12 +1562,14 @@ async def entrypoint(
     warning_sent = False
 
     # --------------------------------------------------------
-    # USER ANSWER QUEUE
+    # USER ANSWER QUEUE & TRACKING
     # --------------------------------------------------------
 
     user_answer_queue = asyncio.Queue()
 
     processed_transcripts = set()
+    analyzed_answers = set()
+    uncommitted_final_segments: list[str] = []
 
     # --------------------------------------------------------
     # PARTICIPANT DISCONNECTED
@@ -1245,44 +1653,43 @@ async def entrypoint(
     speech_lock = asyncio.Lock()
     is_agent_speaking = False
 
-    async def speak_safely(text: str, stage_label: str = "Speech"):
+    def _set_speaking_state(val: bool):
         nonlocal is_agent_speaking
-        async with speech_lock:
-            is_agent_speaking = True
-            try:
-                print(f"[Agent] [{stage_label}] Queuing speech delivery via TTS: {text[:60]}...")
-                handle = session.say(text, allow_interruptions=False)
-                start_t = time.monotonic()
-                await handle
-                dur = time.monotonic() - start_t
-                err = handle.exception()
-                if err:
-                    print(f"[Agent] [{stage_label}] Speech FAILED after {dur:.2f}s: {err!r}")
-                else:
-                    print(f"[Agent] [{stage_label}] Speech playout completed without errors in {dur:.2f}s")
-                # Wait 0.4s buffer to allow WebRTC playout buffer in browser to drain
-                await asyncio.sleep(0.4)
-            finally:
-                is_agent_speaking = False
+        is_agent_speaking = val
+
+    async def speak_safely(text: str, stage_label: str = "Speech", track_speaking_state: bool = True) -> bool:
+        return await speak_with_lock(
+            session=session,
+            text=text,
+            speech_lock=speech_lock,
+            stage_label=stage_label,
+            manual_end_event=manual_end_requested,
+            disconnect_event=candidate_disconnected,
+            set_speaking_state=_set_speaking_state if track_speaking_state else None,
+        )
 
     async def handle_completed_candidate_turn(answer_text: str):
         if is_agent_speaking:
             print(f"[Agent] Ignoring speech detected while interviewer was speaking (acoustic echo): {answer_text[:50]}")
             return
-        answer_key = answer_text.lower().strip()
+        answer_clean = (answer_text or "").strip()
+        if not answer_clean:
+            return
+        uncommitted_final_segments.clear()
+        answer_key = answer_clean.lower()
         if answer_key in processed_transcripts:
             return
         processed_transcripts.add(answer_key)
-        state.add_transcript("candidate", answer_text)
+        state.add_transcript("candidate", answer_clean)
         if not state.candidate_introduction:
-            state.candidate_introduction = answer_text
+            state.candidate_introduction = answer_clean
         await send_ui_event(
             ctx,
             "candidate_answer",
-            {"answer": answer_text},
+            {"answer": answer_clean},
         )
-        user_answer_queue.put_nowait(answer_text)
-        print(f"[Agent] Completed candidate turn queued for analysis: {answer_text[:60]}")
+        user_answer_queue.put_nowait(answer_clean)
+        print(f"[Agent] Completed candidate turn queued for analysis: {answer_clean[:60]}")
 
     session = AgentSession(
 
@@ -1336,7 +1743,7 @@ async def entrypoint(
             pass
 
     # --------------------------------------------------------
-    # USER TRANSCRIPT EVENT (LIVE UI STREAMING)
+    # USER TRANSCRIPT EVENT (FINALIZED SEGMENT BUFFERING)
     # --------------------------------------------------------
 
     @session.on("user_input_transcribed")
@@ -1360,22 +1767,17 @@ async def entrypoint(
                 return
 
             transcript = transcript.strip()
+            if not transcript:
+                return
 
             print(
                 f"USER TRANSCRIPT | final={is_final}: {transcript}"
             )
 
-            # Stream live interim/final candidate speech to React UI for immediate feedback
-            asyncio.create_task(
-                send_ui_event(
-                    ctx,
-                    "candidate_speech",
-                    {
-                        "transcript": transcript,
-                        "is_final": is_final,
-                    },
-                )
-            )
+            # Record only finalized STT segments as fallback if End Assessment is clicked
+            # before the endpointing turn delay expires. Never treat interim text as a final answer.
+            if is_final:
+                uncommitted_final_segments.append(transcript)
 
         except Exception as error:
 
@@ -1427,11 +1829,6 @@ async def entrypoint(
             print(
                 f"CONVERSATION | {role}: {text}"
             )
-
-            # Candidate messages are already stored
-            # by user_input_transcribed.
-            #
-            # Only store interviewer messages here.
 
             if role in (
                 "assistant",
@@ -1524,6 +1921,10 @@ async def entrypoint(
     assessment_start_time = (
         time.monotonic()
     )
+    deadline_at = (
+        assessment_start_time
+        + ASSESSMENT_DURATION_SECONDS
+    )
 
     async def assessment_clock():
 
@@ -1556,7 +1957,6 @@ async def entrypoint(
         print(
             f"{WARNING_SECONDS} seconds remaining."
         )
-        
 
         await send_ui_event(
             ctx,
@@ -1567,23 +1967,44 @@ async def entrypoint(
             },
         )
 
-        warning_message = (
-           "Thank you for sharing your responses. "
-           f"We have about {WARNING_SECONDS} seconds remaining in the assessment. "
-           "Please finish your current response. "
-           "I won't start another question. "
-           "Once you're finished, we'll conclude the interview. "
-           "Thank you for your time."
-        )
+        # Wait briefly if the candidate is actively speaking so the warning does not
+        # interrupt or discard their active answer.
+        while (
+            not candidate_disconnected.is_set()
+            and not manual_end_requested.is_set()
+            and time.monotonic() < deadline_at - 3.0
+            and (
+                getattr(session, "user_state", None) == "speaking"
+                or bool(uncommitted_final_segments)
+            )
+        ):
+            await asyncio.sleep(0.2)
 
-        await speak_safely(
-            warning_message,
-            "Assessment warning",
-        )
+        if (
+            not candidate_disconnected.is_set()
+            and not manual_end_requested.is_set()
+            and time.monotonic() < deadline_at - 2.0
+        ):
+            warning_message = (
+                "Thank you for sharing your responses. "
+                f"We have about {WARNING_SECONDS} seconds remaining in the assessment. "
+                "Please finish your current response. "
+                "I won't start another question. "
+                "Once you're finished, we'll conclude the interview. "
+                "Thank you for your time."
+            )
+
+            # Do not set is_agent_speaking=True during warning so a candidate finishing
+            # their response is never ignored.
+            await speak_safely(
+                warning_message,
+                "Assessment warning",
+                track_speaking_state=False,
+            )
 
         final_wait = (
-            ASSESSMENT_DURATION_SECONDS
-            - WARNING_DELAY_SECONDS
+            deadline_at
+            - time.monotonic()
         )
 
         if final_wait > 0:
@@ -1606,9 +2027,8 @@ async def entrypoint(
     # INTERVIEW LOOP
     # --------------------------------------------------------
 
-    answer_task = asyncio.create_task(
-    user_answer_queue.get()
-    )
+    answer_task: asyncio.Task | None = None
+    rescued_answers: list[str] = []
 
     try:
 
@@ -1616,16 +2036,8 @@ async def entrypoint(
 
             if (
                 candidate_disconnected.is_set()
-            ):
-                break
-
-            if (
-                manual_end_requested.is_set()
-            ):
-                break
-
-            if (
-                timer_finished.is_set()
+                or manual_end_requested.is_set()
+                or timer_finished.is_set()
             ):
                 break
 
@@ -1633,7 +2045,9 @@ async def entrypoint(
             # WAIT FOR CANDIDATE ANSWER
             # ----------------------------------------------
 
-            
+            answer_task = asyncio.create_task(
+                user_answer_queue.get()
+            )
 
             disconnect_task = asyncio.create_task(
                 candidate_disconnected.wait()
@@ -1658,9 +2072,9 @@ async def entrypoint(
             )
 
             pending_event_tasks = {
-               task
-               for task in pending
-               if task is not answer_task
+                task
+                for task in pending
+                if task is not answer_task
             }
 
             for task in pending_event_tasks:
@@ -1668,240 +2082,67 @@ async def entrypoint(
 
             if pending_event_tasks:
                 await asyncio.gather(
-                   *pending_event_tasks,
+                    *pending_event_tasks,
                     return_exceptions=True,
                 )
 
-            # ----------------------------------------------
-            # CANDIDATE DISCONNECTED
-            # ----------------------------------------------
+            answer = None
+            if answer_task in done:
+                try:
+                    answer = answer_task.result()
+                except Exception:
+                    answer = None
+                answer_task = None
+            else:
+                answer_task.cancel()
+                try:
+                    maybe_ans = await answer_task
+                    if isinstance(maybe_ans, str) and maybe_ans.strip():
+                        rescued_answers.append(maybe_ans.strip())
+                except (asyncio.CancelledError, Exception):
+                    pass
+                answer_task = None
 
             if candidate_disconnected.is_set():
                 break
 
-            # ----------------------------------------------
-            # MANUAL END
-            # ----------------------------------------------
-
-            if manual_end_requested.is_set():
+            if manual_end_requested.is_set() or timer_finished.is_set():
+                if isinstance(answer, str) and answer.strip():
+                    rescued_answers.append(answer.strip())
                 break
 
-            # ----------------------------------------------
-            # TIMER
-            # ----------------------------------------------
+            if not answer or not answer.strip():
+                continue
 
-            if timer_finished.is_set():
+            answer = answer.strip()
+
+            print()
+            print("============================================")
+            print("CANDIDATE ANSWER RECEIVED")
+            print(answer)
+            print("============================================")
+
+            elapsed = time.monotonic() - assessment_start_time
+            remaining_seconds = max(
+                1,
+                int(ASSESSMENT_DURATION_SECONDS - elapsed),
+            )
+
+            should_continue = await process_interview_turn(
+                ctx=ctx,
+                state=state,
+                answer=answer,
+                remaining_seconds=remaining_seconds,
+                warning_sent=warning_sent,
+                user_answer_queue=user_answer_queue,
+                analyzed_answers=analyzed_answers,
+                manual_end_event=manual_end_requested,
+                timer_finished_event=timer_finished,
+                disconnect_event=candidate_disconnected,
+                speak_fn=speak_safely,
+            )
+            if not should_continue:
                 break
-
-            # ----------------------------------------------
-            # ANSWER
-            # ----------------------------------------------
-
-            if answer_task in done:
-
-                try:
-
-                    answer = (
-                        answer_task.result()
-                    )
-
-                except Exception:
-
-                    answer = None
-
-                finally:
-
-                    answer_task = asyncio.create_task(
-                        user_answer_queue.get()
-                    )
-
-                if not answer:
-                    continue
-
-                answer = answer.strip()
-
-                if not answer:
-                    continue
-
-                print()
-                print(
-                    "============================================"
-                )
-                print(
-                    "CANDIDATE ANSWER RECEIVED"
-                )
-                print(
-                    answer
-                )
-                print(
-                    "============================================"
-                )
-
-                # ------------------------------------------
-                # FIRST ANSWER = INTRODUCTION
-                # ------------------------------------------
-
-                if (
-                    not state.candidate_introduction
-                ):
-
-                    state.candidate_introduction = (
-                        answer
-                    )
-
-                # ------------------------------------------
-                # DON'T ASK AFTER WARNING
-                # ------------------------------------------
-
-                if warning_sent:
-
-                    print(
-                        "Candidate finished current response after warning."
-                    )
-
-                    break
-
-                # ------------------------------------------
-                # ACTUAL REMAINING TIME
-                # ------------------------------------------
-
-                elapsed = (
-                    time.monotonic()
-                    - assessment_start_time
-                )
-
-                remaining_seconds = max(
-                    1,
-                    int(
-                        ASSESSMENT_DURATION_SECONDS
-                        - elapsed
-                    ),
-                )
-
-                if (
-                    remaining_seconds
-                    <= WARNING_SECONDS
-                ):
-                    break
-
-                # ------------------------------------------
-                # ANALYZE ANSWER + GENERATE QUESTION
-                # IN PARALLEL
-                # ------------------------------------------
-
-                # Snapshot the context before analysis mutates
-                # state.evidence. The latest answer is passed
-                # explicitly to the question generator.
-                question_transcript = format_transcript(
-                    state
-                )
-
-                question_evidence = format_evidence(
-                    state
-                )
-
-                print(
-                    "DEBUG: starting analysis + question generation"
-                )
-
-                start_time = time.perf_counter()
-
-                analysis_task = asyncio.create_task(
-                    analyze_candidate_answer(
-                        state,
-                        answer,
-                    )
-                )
-
-                question_task = asyncio.create_task(
-                    generate_adaptive_question(
-                        state,
-                        remaining_seconds,
-                        current_answer=answer,
-                        transcript=question_transcript,
-                        evidence=question_evidence,
-                    )
-                )
-
-                analysis_result, question = await asyncio.gather(
-                    analysis_task,
-                    question_task,
-                )
-
-                elapsed = time.perf_counter() - start_time
-
-                print(
-                    f"DEBUG: analysis + question generation took {elapsed:.2f} seconds"
-                )
-
-                print(
-                    "Candidate answer analyzed."
-                )
-
-                # ------------------------------------------
-                # NEXT ADAPTIVE QUESTION
-                # ------------------------------------------
-
-                if not question:
-                    break
-
-                # ------------------------------------------
-                # SAFETY CHECK
-                # ------------------------------------------
-
-                if warning_sent:
-                    break
-
-                if (
-                    manual_end_requested.is_set()
-                    or timer_finished.is_set()
-                    or candidate_disconnected.is_set()
-                ):
-                    break
-
-                # ------------------------------------------
-                # ASK NEXT QUESTION
-                # ------------------------------------------
-
-                state.questions_asked += 1
-
-                print()
-                print(
-                    "--------------------------------------------"
-                )
-                print(
-                    "ADAPTIVE QUESTION"
-                )
-                print(
-                    question
-                )
-                print(
-                    "--------------------------------------------"
-                )
-
-                await send_ui_event(
-                    ctx,
-                    "interview_question",
-                    {
-                        "question":
-                            question,
-                        "question_number":
-                            state.questions_asked,
-                    },
-                )
-
-                await speak_safely(
-                    question,
-                    f"Adaptive question #{state.questions_asked}",
-                )
-
-                # Clear any echo or speech fragments captured while the question was playing
-                while not user_answer_queue.empty():
-                    try:
-                        stale_item = user_answer_queue.get_nowait()
-                        print(f"[Agent] Cleared residual speech fragment captured during question playback: {stale_item[:40]}")
-                    except Exception:
-                        break
 
     except Exception as error:
 
@@ -1913,19 +2154,7 @@ async def entrypoint(
     finally:
 
         # ----------------------------------------------------
-        # STOP ANSWER TASK
-        # ----------------------------------------------------
-
-        if not answer_task.done():
-            answer_task.cancel()
-
-        try:
-            await answer_task
-        except asyncio.CancelledError:
-            pass
-
-        # ----------------------------------------------------
-        # STOP CLOCK
+        # STOP CLOCK FIRST
         # ----------------------------------------------------
 
         if not clock_task.done():
@@ -1936,6 +2165,33 @@ async def entrypoint(
                 await clock_task
             except asyncio.CancelledError:
                 pass
+
+        # ----------------------------------------------------
+        # FINALIZE UNCOMMITTED SPEECH & DRAIN PENDING ANSWERS
+        # ----------------------------------------------------
+
+        if not candidate_disconnected.is_set():
+            await finalize_uncommitted_speech(
+                session=session,
+                uncommitted_final_segments=uncommitted_final_segments,
+                on_turn_callback=handle_completed_candidate_turn,
+            )
+            await drain_and_analyze_pending_answers(
+                state=state,
+                user_answer_queue=user_answer_queue,
+                analyzed_answers=analyzed_answers,
+                answer_task=answer_task,
+                extra_answers=rescued_answers,
+            )
+            answer_task = None
+        elif answer_task is not None:
+            if not answer_task.done():
+                answer_task.cancel()
+            try:
+                await answer_task
+            except (asyncio.CancelledError, Exception):
+                pass
+            answer_task = None
 
     # ========================================================
     # CLOSING
@@ -1950,18 +2206,8 @@ async def entrypoint(
     elif manual_end_requested.is_set():
 
         print(
-            "Manual end requested. Completing pending answers and proceeding directly to final analysis."
+            "Manual end requested. Pending answers finalized; proceeding directly to final analysis."
         )
-
-        # Complete pending transcript and assessment processing
-        while not user_answer_queue.empty():
-            try:
-                pending_ans = user_answer_queue.get_nowait()
-                if pending_ans and pending_ans.strip():
-                    print(f"[Agent] Analyzing pending candidate response before completion: {pending_ans[:50]}...")
-                    await analyze_candidate_answer(state, pending_ans.strip())
-            except Exception as drain_err:
-                print("[Agent] Pending answer analysis notice:", repr(drain_err))
 
     else:
 
@@ -1989,7 +2235,6 @@ async def entrypoint(
         await asyncio.sleep(
             CLOSING_MESSAGE_PAUSE_SECONDS
         )
-        
 
     # ========================================================
     # FINAL ANALYSIS
@@ -2030,7 +2275,8 @@ async def entrypoint(
         # Save the interview/transcript even when the final LLM
         # analysis fails. Never replace a failed analysis with
         # a misleading all-zero report.
-        save_assessment(
+        await asyncio.to_thread(
+            save_assessment,
             state,
             assessment_id,
         )
@@ -2056,68 +2302,26 @@ async def entrypoint(
             },
         )
 
+        try:
+            await asyncio.wait_for(candidate_disconnected.wait(), timeout=4.0)
+        except asyncio.TimeoutError:
+            pass
+
         return
 
     state.final_analysis = final_analysis
     state.completed = True
 
     # ========================================================
-    # SAVE & SYNC
+    # DELIVER FINAL RESULT IMMEDIATELY, THEN SAVE & SYNC
     # ========================================================
 
-    await asyncio.to_thread(
-        save_assessment,
-        state,
-        assessment_id,
+    await deliver_final_result_and_sync(
+        ctx=ctx,
+        state=state,
+        assessment_id=assessment_id,
+        candidate_disconnected=candidate_disconnected,
     )
-
-    # Sync to backend HTTP endpoint (bridges cross-container filesystem isolation on Render)
-    backend_url = os.getenv("BACKEND_URL") or os.getenv("REACT_APP_API_BASE_URL") or "https://behavioral-backend-gc62.onrender.com"
-    if backend_url:
-        try:
-            import urllib.request
-            sync_payload = json.dumps(state.to_dict()).encode("utf-8")
-            sync_url = f"{backend_url.rstrip('/')}/assessment-result?assessmentId={assessment_id}"
-            req = urllib.request.Request(
-                sync_url,
-                data=sync_payload,
-                headers={"Content-Type": "application/json"},
-                method="POST",
-            )
-            def _post_sync():
-                with urllib.request.urlopen(req, timeout=5) as resp:
-                    pass
-            await asyncio.to_thread(_post_sync)
-            print("[Agent] Assessment result synced to backend HTTP endpoint.")
-        except Exception as sync_err:
-            print("[Agent] Backend sync notice (non-fatal):", repr(sync_err))
-
-    # ========================================================
-    # SEND FINAL RESULT TO FRONTEND
-    # ========================================================
-
-    try:
-        await send_ui_event(
-            ctx,
-            "final_result",
-            state.to_dict(),
-        )
-        print(
-            "FINAL RESULT SENT TO FRONTEND."
-        )
-    except Exception as error:
-        print(
-            "Final result send failed:",
-            repr(error),
-        )
-
-    # Allow candidate browser sufficient time to receive final_result and disconnect
-    try:
-        await asyncio.wait_for(candidate_disconnected.wait(), timeout=4.0)
-    except asyncio.TimeoutError:
-        pass
-    
-    
 
     print()
     print(

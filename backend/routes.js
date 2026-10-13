@@ -1,9 +1,136 @@
 const express = require("express");
 const path = require("path");
 const fs = require("fs");
+const crypto = require("crypto");
 const createToken = require("./livekit");
 
 const router = express.Router();
+
+// ============================================================
+// ASSESSMENT RESULT CACHE & VALIDATION HELPERS
+// ============================================================
+// IMPORTANT ARCHITECTURAL LIMITATION:
+// Both assessmentResultsCache (in-memory Map) and local disk files under
+// agent/assessments/ only bridge cross-container requests while the Render
+// backend instance remains running. Neither in-memory state nor container-local
+// ephemeral storage survives Render container restarts, redeployments, or
+// free-tier spin-downs without an external durable database (e.g., PostgreSQL/Redis).
+const CACHE_MAX_ENTRIES = 100;
+const CACHE_TTL_MS = 60 * 60 * 1000; // 1 hour
+const assessmentResultsCache = new Map();
+
+function sanitizeEnvValue(val) {
+  if (!val || typeof val !== "string") return "";
+  let cleaned = val.trim().replace(/[\r\n]/g, "").trim();
+  if (
+    (cleaned.startsWith('"') && cleaned.endsWith('"')) ||
+    (cleaned.startsWith("'") && cleaned.endsWith("'"))
+  ) {
+    cleaned = cleaned.slice(1, -1).trim();
+  }
+  return cleaned;
+}
+
+function getSyncSecret() {
+  return (
+    sanitizeEnvValue(process.env.ASSESSMENT_SYNC_SECRET) ||
+    sanitizeEnvValue(process.env.LIVEKIT_API_SECRET)
+  );
+}
+
+function computeSyncSignature(assessmentId, secret) {
+  return crypto
+    .createHmac("sha256", sanitizeEnvValue(secret))
+    .update(String(assessmentId).trim())
+    .digest("hex");
+}
+
+function verifySyncSignature(assessmentId, providedSignature) {
+  const secret = getSyncSecret();
+  if (!secret) {
+    return true;
+  }
+  if (!providedSignature || typeof providedSignature !== "string") {
+    return false;
+  }
+  const expected = computeSyncSignature(assessmentId, secret);
+  const expectedBuf = Buffer.from(expected, "utf8");
+  const providedBuf = Buffer.from(providedSignature.trim(), "utf8");
+  if (expectedBuf.length !== providedBuf.length) {
+    return false;
+  }
+  return crypto.timingSafeEqual(expectedBuf, providedBuf);
+}
+
+function isValidAssessmentId(assessmentId) {
+  return (
+    typeof assessmentId === "string" &&
+    assessmentId.length > 0 &&
+    assessmentId.length <= 128 &&
+    /^[a-zA-Z0-9_-]+$/.test(assessmentId)
+  );
+}
+
+function isValidCompletedResult(data) {
+  if (!data || typeof data !== "object" || Array.isArray(data)) {
+    return false;
+  }
+  if (data.completed !== true) {
+    return false;
+  }
+  const analysis = data.final_analysis || data.finalAnalysis;
+  if (!analysis || typeof analysis !== "object" || Array.isArray(analysis)) {
+    return false;
+  }
+  if (
+    typeof analysis.overall_score !== "number" ||
+    !Number.isFinite(analysis.overall_score)
+  ) {
+    return false;
+  }
+  if (
+    !analysis.scores ||
+    typeof analysis.scores !== "object" ||
+    Array.isArray(analysis.scores)
+  ) {
+    return false;
+  }
+  return true;
+}
+
+function pruneAssessmentCache(now = Date.now()) {
+  for (const [key, entry] of assessmentResultsCache.entries()) {
+    if (!entry || now - entry.timestamp > CACHE_TTL_MS) {
+      assessmentResultsCache.delete(key);
+    }
+  }
+  while (assessmentResultsCache.size >= CACHE_MAX_ENTRIES) {
+    const oldestKey = assessmentResultsCache.keys().next().value;
+    if (oldestKey === undefined) break;
+    assessmentResultsCache.delete(oldestKey);
+  }
+}
+
+function setCachedAssessmentResult(safeId, resultData, now = Date.now()) {
+  if (assessmentResultsCache.has(safeId)) {
+    assessmentResultsCache.delete(safeId);
+  }
+  pruneAssessmentCache(now);
+  assessmentResultsCache.set(safeId, {
+    data: resultData,
+    timestamp: now,
+  });
+}
+
+function getCachedAssessmentResult(safeId, now = Date.now()) {
+  const entry = assessmentResultsCache.get(safeId);
+  if (!entry) return null;
+  if (now - entry.timestamp > CACHE_TTL_MS) {
+    assessmentResultsCache.delete(safeId);
+    return null;
+  }
+  return entry.data;
+}
 
 // ============================================================
 // TOKEN GENERATION
@@ -29,11 +156,7 @@ router.get("/token", async (req, res) => {
 
     // Validate room if provided
     if (rawRoom) {
-      if (
-        typeof rawRoom !== "string" ||
-        rawRoom.length > 128 ||
-        !/^[a-zA-Z0-9_-]+$/.test(rawRoom)
-      ) {
+      if (!isValidAssessmentId(rawRoom)) {
         return res.status(400).json({
           error:
             "Invalid room name. Must be alphanumeric with dashes or underscores, maximum 128 characters.",
@@ -63,9 +186,6 @@ router.get("/token", async (req, res) => {
   }
 });
 
-// In-memory cache for assessment results (bridges cross-container Render environments)
-const assessmentResultsCache = new Map();
-
 // ============================================================
 // ASSESSMENT RESULT STORAGE (CROSS-CONTAINER SYNC)
 // ============================================================
@@ -82,26 +202,32 @@ router.post("/assessment-result", express.json({ limit: "2mb" }), (req, res) => 
       });
     }
 
-    if (
-      typeof assessmentId !== "string" ||
-      assessmentId.length > 128
-    ) {
+    if (!isValidAssessmentId(assessmentId)) {
       return res.status(400).json({
-        error: "Invalid assessment ID.",
+        error:
+          "Invalid assessment ID. Must be alphanumeric with dashes or underscores, maximum 128 characters.",
+      });
+    }
+
+    const providedSignature = req.headers["x-assessment-signature"];
+    if (!verifySyncSignature(assessmentId, providedSignature)) {
+      return res.status(401).json({
+        error: "Unauthorized assessment result submission.",
+      });
+    }
+
+    const resultData = req.body;
+    if (!isValidCompletedResult(resultData)) {
+      return res.status(400).json({
+        error:
+          "Incomplete or invalid assessment result payload. A completed final_analysis is required.",
       });
     }
 
     const safeId = assessmentId.replace(/[^a-zA-Z0-9_-]/g, "_");
-    const resultData = req.body;
 
-    if (!resultData || typeof resultData !== "object") {
-      return res.status(400).json({
-        error: "Valid result payload is required.",
-      });
-    }
-
-    // Cache in memory for immediate retrieval
-    assessmentResultsCache.set(safeId, resultData);
+    // Cache in bounded memory map for immediate retrieval
+    setCachedAssessmentResult(safeId, resultData);
 
     // Persist to local disk if directory is writable
     try {
@@ -146,21 +272,18 @@ router.get("/assessment-result", (req, res) => {
       });
     }
 
-    if (
-      typeof assessmentId !== "string" ||
-      assessmentId.length > 128
-    ) {
+    if (!isValidAssessmentId(assessmentId)) {
       return res.status(400).json({
         error: "Invalid assessment ID.",
       });
     }
 
-    // Prevent path traversal by sanitizing file name
     const safeId = assessmentId.replace(/[^a-zA-Z0-9_-]/g, "_");
 
-    // 1. Check in-memory cache first (handles cross-container sync)
-    if (assessmentResultsCache.has(safeId)) {
-      return res.json(assessmentResultsCache.get(safeId));
+    // 1. Check bounded in-memory cache first (handles cross-container sync while process is live)
+    const cached = getCachedAssessmentResult(safeId);
+    if (cached && isValidCompletedResult(cached)) {
+      return res.json(cached);
     }
 
     // 2. Check local disk
@@ -181,6 +304,13 @@ router.get("/assessment-result", (req, res) => {
     const content = fs.readFileSync(resultPath, "utf-8");
     const parsed = JSON.parse(content);
 
+    // Do not serve incomplete assessment snapshots (e.g. final_analysis: null) as completed reports
+    if (!isValidCompletedResult(parsed)) {
+      return res.status(404).json({
+        error: "Assessment result is incomplete or not yet finalized.",
+      });
+    }
+
     res.json(parsed);
   } catch (error) {
     console.error("Failed to read assessment result:", error.message || error);
@@ -189,5 +319,14 @@ router.get("/assessment-result", (req, res) => {
     });
   }
 });
+
+router.assessmentResultsCache = assessmentResultsCache;
+router.CACHE_MAX_ENTRIES = CACHE_MAX_ENTRIES;
+router.CACHE_TTL_MS = CACHE_TTL_MS;
+router.computeSyncSignature = computeSyncSignature;
+router.isValidCompletedResult = isValidCompletedResult;
+router.pruneAssessmentCache = pruneAssessmentCache;
+router.setCachedAssessmentResult = setCachedAssessmentResult;
+router.getCachedAssessmentResult = getCachedAssessmentResult;
 
 module.exports = router;

@@ -254,23 +254,29 @@ const server = app.listen(0, async () => {
       process.env.LIVEKIT_API_SECRET = origSecret;
     }
 
-    // Test 19: POST /assessment-result and cached retrieval via GET /assessment-result
+    // Test 19: Authenticated POST /assessment-result and cached retrieval via GET /assessment-result
+    const routes = require("./routes");
+    const syncRoomId = "test-assessment-sync-room";
+    const validSignature = routes.computeSyncSignature(syncRoomId, process.env.LIVEKIT_API_SECRET);
     const testAssessmentPayload = {
-      assessment_id: "test-assessment-sync-room",
+      assessment_id: syncRoomId,
       completed: true,
       final_analysis: {
         overall_score: 85,
         scores: { communication: 90, teamwork: 85 },
       },
     };
-    const postRes = await fetch(`http://localhost:${port}/assessment-result?assessmentId=test-assessment-sync-room`, {
+    const postRes = await fetch(`http://localhost:${port}/assessment-result?assessmentId=${syncRoomId}`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: {
+        "Content-Type": "application/json",
+        "X-Assessment-Signature": validSignature,
+      },
       body: JSON.stringify(testAssessmentPayload),
     });
     const postJson = await postRes.json();
 
-    const getRes = await fetch(`http://localhost:${port}/assessment-result?assessmentId=test-assessment-sync-room`);
+    const getRes = await fetch(`http://localhost:${port}/assessment-result?assessmentId=${syncRoomId}`);
     const getJson = await getRes.json();
 
     if (
@@ -279,9 +285,77 @@ const server = app.listen(0, async () => {
       getRes.status === 200 &&
       getJson.final_analysis?.overall_score === 85
     ) {
-      console.log("PASS: POST and cached GET /assessment-result cross-container sync works");
+      console.log("PASS: Authenticated POST and cached GET /assessment-result cross-container sync works");
     } else {
       console.error("FAIL: POST /assessment-result sync test failed", postRes.status, getRes.status);
+      failures++;
+    }
+
+    // Test 20: POST /assessment-result rejects missing or invalid signature with 401
+    const unauthRes = await fetch(`http://localhost:${port}/assessment-result?assessmentId=${syncRoomId}`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Assessment-Signature": "deadbeef0000",
+      },
+      body: JSON.stringify(testAssessmentPayload),
+    });
+    if (unauthRes.status === 401) {
+      console.log("PASS: Unauthorized POST /assessment-result rejected with 401");
+    } else {
+      console.error("FAIL: Expected 401 for unauthorized POST /assessment-result, got", unauthRes.status);
+      failures++;
+    }
+
+    // Test 21: POST /assessment-result rejects incomplete payload (final_analysis: null) with 400
+    const incompleteRoomId = "test-incomplete-room";
+    const incompleteSig = routes.computeSyncSignature(incompleteRoomId, process.env.LIVEKIT_API_SECRET);
+    const incompleteRes = await fetch(`http://localhost:${port}/assessment-result?assessmentId=${incompleteRoomId}`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Assessment-Signature": incompleteSig,
+      },
+      body: JSON.stringify({
+        assessment_id: incompleteRoomId,
+        completed: false,
+        final_analysis: null,
+      }),
+    });
+    if (incompleteRes.status === 400) {
+      console.log("PASS: Incomplete assessment payload rejected with 400");
+    } else {
+      console.error("FAIL: Expected 400 for incomplete assessment payload, got", incompleteRes.status);
+      failures++;
+    }
+
+    // Test 22: Bounded cache enforces CACHE_MAX_ENTRIES and TTL eviction
+    routes.assessmentResultsCache.clear();
+    const maxEntries = routes.CACHE_MAX_ENTRIES;
+    for (let i = 0; i < maxEntries + 15; i++) {
+      routes.setCachedAssessmentResult(`room-cap-${i}`, testAssessmentPayload);
+    }
+    const oldestEvicted = routes.getCachedAssessmentResult("room-cap-0") === null;
+    const newestRetained = routes.getCachedAssessmentResult(`room-cap-${maxEntries + 14}`) !== null;
+    const sizeWithinCap = routes.assessmentResultsCache.size <= maxEntries;
+
+    // Also verify TTL expiration
+    routes.assessmentResultsCache.set("room-expired", {
+      data: testAssessmentPayload,
+      timestamp: Date.now() - routes.CACHE_TTL_MS - 1000,
+    });
+    const expiredEvicted = routes.getCachedAssessmentResult("room-expired") === null;
+
+    if (oldestEvicted && newestRetained && sizeWithinCap && expiredEvicted) {
+      console.log("PASS: assessmentResultsCache enforces max entry cap and TTL eviction");
+    } else {
+      console.error("FAIL: Cache bounds test failed", {
+        oldestEvicted,
+        newestRetained,
+        sizeWithinCap,
+        expiredEvicted,
+        size: routes.assessmentResultsCache.size,
+      });
       failures++;
     }
 

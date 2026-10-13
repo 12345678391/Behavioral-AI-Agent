@@ -559,5 +559,176 @@ describe('Behavioral AI Agent App', () => {
     // publishData must only be called once
     expect(mockRoom.localParticipant.publishData).toHaveBeenCalledTimes(1);
   });
+
+  test('incomplete final_result (final_analysis: null) is not rendered as a valid 0-score report', async () => {
+    let capturedOnData = null;
+    const mockRoom = {
+      name: 'test-room-incomplete',
+      disconnect: jest.fn(),
+      localParticipant: {
+        publishData: jest.fn().mockResolvedValue(true),
+      },
+    };
+
+    api.getToken.mockResolvedValueOnce({
+      token: 'fake-jwt',
+      serverUrl: 'wss://test.livekit.cloud',
+      room: 'test-room-incomplete',
+    });
+
+    livekitRoom.joinRoom.mockImplementation((token, url, onData, onConnected) => {
+      capturedOnData = onData;
+      if (onConnected) onConnected();
+      return Promise.resolve(mockRoom);
+    });
+
+    render(<App />);
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: /Start Assessment/i }));
+    });
+
+    // Deliver incomplete final_result with final_analysis: null
+    await act(async () => {
+      capturedOnData({
+        type: 'final_result',
+        data: {
+          completed: false,
+          final_analysis: null,
+        },
+      });
+    });
+
+    // Must NOT render the score overview with 0/100 scores
+    expect(screen.queryByText(/Behavioral Score Overview/i)).not.toBeInTheDocument();
+    // Must render Completed with Notice and offer Retry Report Retrieval
+    expect(screen.getByText(/Completed with Notice/i)).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /Retry Report Retrieval/i })).toBeInTheDocument();
+  });
+
+  test('temporary getAssessmentResult failures retry within bounded limits and render report on success', async () => {
+    jest.useFakeTimers();
+    try {
+      let capturedOnDisconnected = null;
+      const mockRoom = {
+        name: 'test-room-retry',
+        disconnect: jest.fn(),
+        localParticipant: {
+          publishData: jest.fn().mockResolvedValue(true),
+        },
+      };
+
+      api.getToken.mockResolvedValueOnce({
+        token: 'fake-jwt',
+        serverUrl: 'wss://test.livekit.cloud',
+        room: 'test-room-retry',
+      });
+
+      // Fail first 2 attempts, succeed on 3rd attempt
+      api.getAssessmentResult
+        .mockRejectedValueOnce(new Error('Assessment result not found (404)'))
+        .mockRejectedValueOnce(new Error('Assessment result not found (404)'))
+        .mockResolvedValueOnce({
+          assessment_id: 'test-room-retry',
+          completed: true,
+          final_analysis: {
+            overall_score: 91,
+            scores: {
+              communication: 92,
+              teamwork: 90,
+            },
+            strengths: ['Resilient under pressure.'],
+            areas_for_improvement: ['None noted.'],
+            behavioral_summary: 'Strong overall behavioral performance.',
+          },
+        });
+
+      livekitRoom.joinRoom.mockImplementation((
+        token,
+        url,
+        onData,
+        onConnected,
+        onDisconnected
+      ) => {
+        capturedOnDisconnected = onDisconnected;
+        if (onConnected) onConnected();
+        return Promise.resolve(mockRoom);
+      });
+
+      render(<App />);
+      await act(async () => {
+        fireEvent.click(screen.getByRole('button', { name: /Start Assessment/i }));
+      });
+
+      // Click End Assessment so intentionalEndRef.current = true
+      await act(async () => {
+        fireEvent.click(screen.getByRole('button', { name: /End Assessment/i }));
+      });
+
+      // Trigger disconnect before final_result arrives over data channel
+      await act(async () => {
+        capturedOnDisconnected('client_initiated');
+      });
+
+      // Attempt 1 failed; advance 2000ms for Attempt 2
+      await act(async () => {
+        jest.advanceTimersByTime(2000);
+      });
+
+      // Attempt 2 failed; advance 2000ms for Attempt 3 (which resolves with valid report)
+      await act(async () => {
+        jest.advanceTimersByTime(2000);
+      });
+
+      expect(api.getAssessmentResult).toHaveBeenCalledTimes(3);
+      expect(screen.getByText(/Behavioral Score Overview/i)).toBeInTheDocument();
+      expect(screen.getByText(/Resilient under pressure/i)).toBeInTheDocument();
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  test('endAssessment resets endingRef when publishData fails so candidate can retry', async () => {
+    const mockRoom = {
+      name: 'test-room-publish-fail',
+      disconnect: jest.fn(),
+      localParticipant: {
+        publishData: jest
+          .fn()
+          .mockRejectedValueOnce(new Error('Data channel temporarily unavailable'))
+          .mockResolvedValueOnce(true),
+      },
+    };
+
+    api.getToken.mockResolvedValueOnce({
+      token: 'fake-jwt',
+      serverUrl: 'wss://test.livekit.cloud',
+      room: 'test-room-publish-fail',
+    });
+
+    livekitRoom.joinRoom.mockImplementation((token, url, onData, onConnected) => {
+      if (onConnected) onConnected();
+      return Promise.resolve(mockRoom);
+    });
+
+    render(<App />);
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: /Start Assessment/i }));
+    });
+
+    // First click fails publishData
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: /End Assessment/i }));
+    });
+
+    expect(screen.getByText(/Could not complete the assessment/i)).toBeInTheDocument();
+
+    // Second click must be allowed because endingRef was reset on failure
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: /End Assessment/i }));
+    });
+
+    expect(mockRoom.localParticipant.publishData).toHaveBeenCalledTimes(2);
+  });
 });
+
 

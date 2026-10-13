@@ -25,6 +25,28 @@ function safeRandomUUID() {
   );
 }
 
+export function isValidAssessmentReport(data) {
+  if (!data || typeof data !== "object" || Array.isArray(data)) {
+    return false;
+  }
+  if (data.completed === false) {
+    return false;
+  }
+  const analysis = data.final_analysis || data.finalAnalysis;
+  if (!analysis || typeof analysis !== "object" || Array.isArray(analysis)) {
+    return false;
+  }
+  return (
+    typeof analysis.overall_score === "number" &&
+    Number.isFinite(analysis.overall_score) &&
+    Boolean(
+      analysis.scores &&
+        typeof analysis.scores === "object" &&
+        !Array.isArray(analysis.scores)
+    )
+  );
+}
+
 function App() {
   const [room, setRoom] = useState(null);
   const roomRef = useRef(null);
@@ -33,7 +55,10 @@ function App() {
   const assessmentFinishedRef = useRef(false);
   const assessmentResultRef = useRef(null);
   const currentRoomNameRef = useRef("");
+  const retryTimerRef = useRef(null);
+  const isMountedRef = useRef(true);
   const [isConnecting, setIsConnecting] = useState(false);
+  const [retryingReport, setRetryingReport] = useState(false);
 
   const [connected, setConnected] =
     useState(false);
@@ -128,7 +153,13 @@ function App() {
   // ==========================================================
 
   useEffect(() => {
+    isMountedRef.current = true;
     return () => {
+      isMountedRef.current = false;
+      if (retryTimerRef.current) {
+        clearTimeout(retryTimerRef.current);
+        retryTimerRef.current = null;
+      }
       if (roomRef.current) {
         console.log("[App] Room disconnection requested due to component unmount.");
         try {
@@ -347,15 +378,21 @@ function App() {
         finalData
       );
 
-      setErrorMessage("");
+      if (isValidAssessmentReport(finalData)) {
+        setErrorMessage("");
+        assessmentResultRef.current = finalData;
+        setAssessmentResult(finalData);
+      } else {
+        console.warn("[App] Received incomplete final_result payload:", finalData);
+        assessmentResultRef.current = null;
+        setAssessmentResult(null);
+        setErrorMessage(
+          "The assessment completed, but the final behavioral report was incomplete."
+        );
+      }
 
-      assessmentResultRef.current = finalData;
       assessmentFinishedRef.current = true;
       endingRef.current = false;
-
-      setAssessmentResult(
-        finalData
-      );
 
       setAssessmentFinished(true);
       setConnected(false);
@@ -374,6 +411,74 @@ function App() {
       }
 
       return;
+    }
+  }
+
+  // ==========================================================
+  // BOUNDED REPORT FALLBACK POLLING
+  // ==========================================================
+
+  async function fetchReportWithBoundedRetry(
+    roomName,
+    maxAttempts = 5,
+    retryDelayMs = 2000
+  ) {
+    if (!roomName) return false;
+    if (isMountedRef.current) {
+      setRetryingReport(true);
+    }
+
+    try {
+      for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+        if (!isMountedRef.current) return false;
+        if (isValidAssessmentReport(assessmentResultRef.current)) {
+          return true;
+        }
+
+        try {
+          const res = await getAssessmentResult(roomName);
+          const fallbackData = res?.data || res;
+          if (isValidAssessmentReport(fallbackData)) {
+            console.log(
+              "[App] Retrieved assessment result via backend fallback:",
+              fallbackData
+            );
+            assessmentResultRef.current = fallbackData;
+            if (isMountedRef.current) {
+              setAssessmentResult(fallbackData);
+              setErrorMessage("");
+            }
+            return true;
+          }
+        } catch (err) {
+          console.log(
+            `[App] Backend result fallback attempt ${attempt}/${maxAttempts} notice:`,
+            err?.message || err
+          );
+        }
+
+        if (attempt < maxAttempts && isMountedRef.current) {
+          await new Promise((resolve) => {
+            retryTimerRef.current = setTimeout(resolve, retryDelayMs);
+          });
+        }
+      }
+
+      if (
+        isMountedRef.current &&
+        !isValidAssessmentReport(assessmentResultRef.current)
+      ) {
+        setErrorMessage(
+          (prev) =>
+            prev ||
+            "The final assessment report could not be retrieved from the server. You can retry fetching the report or start a new assessment."
+        );
+      }
+      return false;
+    } finally {
+      if (isMountedRef.current) {
+        setRetryingReport(false);
+      }
     }
   }
 
@@ -447,7 +552,10 @@ function App() {
             setAudioBlocked(false);
 
             // If the assessment was completed or intentional ending is in progress, do not treat disconnection as failure
-            if (assessmentResultRef.current || assessmentFinishedRef.current) {
+            if (
+              isValidAssessmentReport(assessmentResultRef.current) ||
+              assessmentFinishedRef.current
+            ) {
               setEnding(false);
               setAssessmentFinished(true);
               return;
@@ -457,21 +565,9 @@ function App() {
               console.log("[App] Room disconnected during intentional assessment conclusion.");
               setEnding(false);
               setAssessmentFinished(true);
-              // If final result wasn't received via data channel, attempt fallback retrieval
+              // If final result wasn't received via data channel, attempt bounded fallback retrieval
               if (currentRoomNameRef.current) {
-                Promise.resolve()
-                  .then(() => getAssessmentResult(currentRoomNameRef.current))
-                  .then((res) => {
-                    const fallbackData = res?.data || res;
-                    if (fallbackData) {
-                      console.log("[App] Retrieved assessment result via backend fallback:", fallbackData);
-                      assessmentResultRef.current = fallbackData;
-                      setAssessmentResult(fallbackData);
-                    }
-                  })
-                  .catch((err) => {
-                    console.log("[App] Backend result fallback notice:", err?.message || err);
-                  });
+                fetchReportWithBoundedRetry(currentRoomNameRef.current, 5, 2000);
               }
               return;
             }
@@ -578,6 +674,7 @@ function App() {
         error
       );
 
+      endingRef.current = false;
       setEnding(false);
 
       setErrorMessage(
@@ -689,7 +786,7 @@ function App() {
 
   if (
     assessmentFinished &&
-    !assessmentResult
+    !isValidAssessmentReport(assessmentResult)
   ) {
     return (
       <div className="min-h-screen bg-slate-950 text-white">
@@ -761,7 +858,22 @@ function App() {
               )}
             </div>
 
-            <div className="mt-8 flex justify-end">
+            <div className="mt-8 flex justify-end gap-4">
+              {currentRoomNameRef.current && (
+                <button
+                  onClick={() =>
+                    fetchReportWithBoundedRetry(
+                      currentRoomNameRef.current,
+                      3,
+                      1500
+                    )
+                  }
+                  disabled={retryingReport}
+                  className="rounded-xl border border-slate-700 bg-slate-800 px-6 py-3 font-semibold text-slate-200 hover:bg-slate-700 disabled:opacity-50 transition"
+                >
+                  {retryingReport ? "Retrieving Report..." : "Retry Report Retrieval"}
+                </button>
+              )}
               <button
                 onClick={startNewAssessment}
                 className="rounded-xl bg-indigo-500 px-6 py-3 font-semibold text-white hover:bg-indigo-600 transition"
@@ -781,7 +893,7 @@ function App() {
 
   if (
     assessmentFinished &&
-    assessmentResult
+    isValidAssessmentReport(assessmentResult)
   ) {
     const analysis =
       getAnalysis();
