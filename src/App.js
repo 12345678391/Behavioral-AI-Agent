@@ -204,21 +204,85 @@ function App() {
     }
 
     // --------------------------------------------------------
-    // CANDIDATE ANSWER TRANSCRIPT
+    // CANDIDATE INTERIM TRANSCRIPTION PROGRESSION
     // --------------------------------------------------------
 
-    if (type === "candidate_answer") {
-      const answer = eventData.answer || "";
+    if (
+      type === "candidate_interim_transcript" ||
+      (type === "candidate_answer" && eventData.is_final === false)
+    ) {
+      const interimText = (eventData.answer || eventData.text || "").trim();
+      if (!interimText) {
+        return;
+      }
 
-      if (answer) {
-        setConversation((previous) => [
+      setConversation((previous) => {
+        const existingIndex = previous.findIndex((item) => item.isInterim);
+        if (existingIndex !== -1) {
+          const updated = [...previous];
+          updated[existingIndex] = {
+            ...updated[existingIndex],
+            text: interimText,
+            isInterim: true,
+          };
+          return updated;
+        }
+
+        return [
           ...previous,
           {
             id: safeRandomUUID(),
             role: "candidate",
-            text: answer,
+            text: interimText,
+            isInterim: true,
           },
-        ]);
+        ];
+      });
+
+      return;
+    }
+
+    // --------------------------------------------------------
+    // CANDIDATE ANSWER TRANSCRIPT (FINAL)
+    // --------------------------------------------------------
+
+    if (type === "candidate_answer") {
+      const answer = (eventData.answer || eventData.text || "").trim();
+
+      if (answer) {
+        setConversation((previous) => {
+          const existingIndex = previous.findIndex((item) => item.isInterim);
+          if (existingIndex !== -1) {
+            const updated = [...previous];
+            updated[existingIndex] = {
+              ...updated[existingIndex],
+              text: answer,
+              isInterim: false,
+            };
+            return updated.filter((item, idx) => idx === existingIndex || !item.isInterim);
+          }
+
+          // Deduplication: prevent duplicate final message if identical candidate message was just added
+          const lastItem = previous[previous.length - 1];
+          if (
+            lastItem &&
+            lastItem.role === "candidate" &&
+            lastItem.text === answer &&
+            !lastItem.isInterim
+          ) {
+            return previous;
+          }
+
+          return [
+            ...previous,
+            {
+              id: safeRandomUUID(),
+              role: "candidate",
+              text: answer,
+              isInterim: false,
+            },
+          ];
+        });
       }
 
       return;
@@ -239,7 +303,7 @@ function App() {
 
         setConversation(
           (previous) => [
-            ...previous,
+            ...previous.map((item) => (item.isInterim ? { ...item, isInterim: false } : item)),
             {
               id: safeRandomUUID(),
               role: "ai",
@@ -267,7 +331,7 @@ function App() {
 
       setConversation(
         (previous) => [
-          ...previous,
+          ...previous.map((item) => (item.isInterim ? { ...item, isInterim: false } : item)),
           {
             id: safeRandomUUID(),
             role: "ai",
@@ -289,7 +353,7 @@ function App() {
     ) {
       setConversation(
         (previous) => [
-          ...previous,
+          ...previous.map((item) => (item.isInterim ? { ...item, isInterim: false } : item)),
           {
             id: safeRandomUUID(),
             role: "ai",
@@ -550,6 +614,11 @@ function App() {
             setConnected(false);
             setRoom(null);
             setAudioBlocked(false);
+
+            // Safely finalize any in-flight interim message upon disconnection
+            setConversation((previous) =>
+              previous.map((item) => (item.isInterim ? { ...item, isInterim: false } : item))
+            );
 
             // If the assessment was completed or intentional ending is in progress, do not treat disconnection as failure
             if (
@@ -1431,20 +1500,30 @@ function App() {
 
                         <div
                           key={item.id}
-                          className={`rounded-2xl p-4 ${
+                          className={`rounded-2xl p-4 transition-all duration-150 ${
                             item.role === "ai"
                               ? "bg-slate-800"
+                              : item.isInterim
+                              ? "bg-indigo-500/20 border border-indigo-400/30"
                               : "bg-indigo-500/10"
                           }`}
                         >
 
-                          <p className="text-xs uppercase tracking-wider text-slate-500">
-                            {item.role === "ai"
-                              ? "AI Interviewer"
-                              : "Candidate"}
-                          </p>
+                          <div className="flex items-center justify-between">
+                            <p className="text-xs uppercase tracking-wider text-slate-500">
+                              {item.role === "ai"
+                                ? "AI Interviewer"
+                                : "Candidate"}
+                            </p>
+                            {item.isInterim && (
+                              <span className="flex items-center gap-1.5 text-xs text-indigo-400 font-medium">
+                                <span className="inline-block h-1.5 w-1.5 rounded-full bg-indigo-400 animate-pulse"></span>
+                                speaking...
+                              </span>
+                            )}
+                          </div>
 
-                          <p className="mt-2 text-sm leading-relaxed text-slate-300">
+                          <p className={`mt-2 text-sm leading-relaxed ${item.isInterim ? "text-slate-200 italic" : "text-slate-300"}`}>
                             {item.text}
                           </p>
 

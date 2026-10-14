@@ -605,6 +605,69 @@ class TestAgentStartup(unittest.TestCase):
         self.assertEqual(interrupted_flags, [True])
         self.assertEqual(speaking_states, [True, False])
 
+    def test_handle_user_input_transcribed_event(self):
+        """Verify handle_user_input_transcribed_event emits candidate_interim_transcript for interim STT,
+        buffers finalized segments for fallback, and safely ignores acoustic echo and empty transcripts."""
+        from agent.agent import handle_user_input_transcribed_event
+
+        events = []
+        def mock_send(event_type, payload):
+            events.append((event_type, payload))
+
+        uncommitted_segments = []
+
+        # 1. Non-empty interim transcript: dispatches candidate_interim_transcript, does not buffer
+        handled = handle_user_input_transcribed_event(
+            transcript="I led a team",
+            is_final=False,
+            is_agent_speaking=False,
+            uncommitted_final_segments=uncommitted_segments,
+            send_ui_event_fn=mock_send,
+        )
+        self.assertTrue(handled)
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0][0], "candidate_interim_transcript")
+        self.assertEqual(events[0][1], {"answer": "I led a team", "is_final": False})
+        self.assertEqual(uncommitted_segments, [])
+
+        # 2. Finalized STT segment: buffers for commit fallback, does not dispatch interim event
+        events.clear()
+        handled = handle_user_input_transcribed_event(
+            transcript="I led a team of five engineers.",
+            is_final=True,
+            is_agent_speaking=False,
+            uncommitted_final_segments=uncommitted_segments,
+            send_ui_event_fn=mock_send,
+        )
+        self.assertTrue(handled)
+        self.assertEqual(len(events), 0)
+        self.assertEqual(uncommitted_segments, ["I led a team of five engineers."])
+
+        # 3. Acoustic echo (agent is speaking): completely ignored
+        events.clear()
+        uncommitted_segments.clear()
+        handled = handle_user_input_transcribed_event(
+            transcript="interviewer echo speech",
+            is_final=False,
+            is_agent_speaking=True,
+            uncommitted_final_segments=uncommitted_segments,
+            send_ui_event_fn=mock_send,
+        )
+        self.assertFalse(handled)
+        self.assertEqual(events, [])
+        self.assertEqual(uncommitted_segments, [])
+
+        # 4. Empty or whitespace-only transcript: ignored
+        handled = handle_user_input_transcribed_event(
+            transcript="   ",
+            is_final=False,
+            is_agent_speaking=False,
+            uncommitted_final_segments=uncommitted_segments,
+            send_ui_event_fn=mock_send,
+        )
+        self.assertFalse(handled)
+        self.assertEqual(events, [])
+
 
 if __name__ == "__main__":
     unittest.main()

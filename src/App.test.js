@@ -729,6 +729,157 @@ describe('Behavioral AI Agent App', () => {
 
     expect(mockRoom.localParticipant.publishData).toHaveBeenCalledTimes(2);
   });
+
+  test('interim candidate transcription updates one message progressively and finalizes without duplication', async () => {
+    let capturedOnData;
+    const mockRoom = {
+      name: 'test-room-interim',
+      disconnect: jest.fn(),
+      localParticipant: { publishData: jest.fn() },
+    };
+
+    api.getToken.mockResolvedValueOnce({
+      token: 'fake-jwt',
+      serverUrl: 'wss://test.livekit.cloud',
+      room: 'test-room-interim',
+    });
+
+    livekitRoom.joinRoom.mockImplementation((token, url, onData, onConnected) => {
+      capturedOnData = onData;
+      if (onConnected) onConnected();
+      return Promise.resolve(mockRoom);
+    });
+
+    render(<App />);
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: /Start Assessment/i }));
+    });
+
+    // Interviewer asks question
+    await act(async () => {
+      capturedOnData({
+        type: 'interview_question',
+        data: { question: 'Tell me about a challenging project.' },
+      });
+    });
+
+    expect(screen.getAllByText(/Tell me about a challenging project/i).length).toBeGreaterThan(0);
+
+    // 1. First interim chunk arrives
+    await act(async () => {
+      capturedOnData({
+        type: 'candidate_interim_transcript',
+        data: { answer: 'I led the migration', is_final: false },
+      });
+    });
+
+    expect(screen.getByText('I led the migration')).toBeInTheDocument();
+    expect(screen.getByText(/speaking\.\.\./i)).toBeInTheDocument();
+    expect(screen.getAllByText(/Candidate/i).length).toBe(1);
+
+    // 2. Second interim chunk arrives - updates the SAME bubble
+    await act(async () => {
+      capturedOnData({
+        type: 'candidate_interim_transcript',
+        data: { answer: 'I led the migration to a microservices architecture', is_final: false },
+      });
+    });
+
+    expect(screen.queryByText('I led the migration')).not.toBeInTheDocument();
+    expect(screen.getByText('I led the migration to a microservices architecture')).toBeInTheDocument();
+    expect(screen.getByText(/speaking\.\.\./i)).toBeInTheDocument();
+    expect(screen.getAllByText(/Candidate/i).length).toBe(1);
+
+    // 3. Final candidate answer arrives - converts interim bubble to final without duplication
+    await act(async () => {
+      capturedOnData({
+        type: 'candidate_answer',
+        data: {
+          answer: 'I led the migration to a microservices architecture and reduced latency by 40%.',
+          is_final: true,
+        },
+      });
+    });
+
+    expect(screen.getByText('I led the migration to a microservices architecture and reduced latency by 40%.')).toBeInTheDocument();
+    expect(screen.queryByText(/speaking\.\.\./i)).not.toBeInTheDocument();
+    expect(screen.getAllByText(/Candidate/i).length).toBe(1);
+
+    // 4. Repeated final candidate answer - deduplicated, still only 1 candidate message
+    await act(async () => {
+      capturedOnData({
+        type: 'candidate_answer',
+        data: {
+          answer: 'I led the migration to a microservices architecture and reduced latency by 40%.',
+          is_final: true,
+        },
+      });
+    });
+
+    expect(screen.getAllByText(/Candidate/i).length).toBe(1);
+  });
+
+  test('candidate interim transcript ignores empty strings, and is finalized when end assessment disconnects', async () => {
+    let capturedOnData;
+    let capturedOnDisconnected;
+    const mockRoom = {
+      name: 'test-room-empty-interim',
+      disconnect: jest.fn(),
+      localParticipant: { publishData: jest.fn().mockResolvedValue(true) },
+    };
+
+    api.getToken.mockResolvedValueOnce({
+      token: 'fake-jwt',
+      serverUrl: 'wss://test.livekit.cloud',
+      room: 'test-room-empty-interim',
+    });
+
+    livekitRoom.joinRoom.mockImplementation((token, url, onData, onConnected, onDisconnected) => {
+      capturedOnData = onData;
+      capturedOnDisconnected = onDisconnected;
+      if (onConnected) onConnected();
+      return Promise.resolve(mockRoom);
+    });
+
+    render(<App />);
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: /Start Assessment/i }));
+    });
+
+    // Send empty interim transcript: should be ignored
+    await act(async () => {
+      capturedOnData({
+        type: 'candidate_interim_transcript',
+        data: { answer: '   ', is_final: false },
+      });
+    });
+
+    expect(screen.getByText(/The assessment conversation will appear here/i)).toBeInTheDocument();
+    expect(screen.queryByText(/speaking\.\.\./i)).not.toBeInTheDocument();
+
+    // Send valid interim transcript
+    await act(async () => {
+      capturedOnData({
+        type: 'candidate_interim_transcript',
+        data: { answer: 'I was in the middle of saying...', is_final: false },
+      });
+    });
+
+    expect(screen.getByText('I was in the middle of saying...')).toBeInTheDocument();
+    expect(screen.getByText(/speaking\.\.\./i)).toBeInTheDocument();
+
+    // End assessment and disconnect: in-flight interim bubble must finalize cleanly and be preserved in conversation review
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: /End Assessment/i }));
+    });
+
+    await act(async () => {
+      capturedOnDisconnected('intentional_conclusion');
+    });
+
+    expect(screen.getByText('I was in the middle of saying...')).toBeInTheDocument();
+    expect(screen.queryByText(/speaking\.\.\./i)).not.toBeInTheDocument();
+  });
 });
 
 

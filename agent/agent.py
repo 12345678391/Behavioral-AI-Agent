@@ -1169,6 +1169,44 @@ async def deliver_final_result_and_sync(
     )
 
 
+def handle_user_input_transcribed_event(
+    transcript: str,
+    is_final: bool,
+    is_agent_speaking: bool,
+    uncommitted_final_segments: list[str],
+    send_ui_event_fn=None,
+) -> bool:
+    """Handle a user transcript event from STT.
+
+    If speech arrives while agent is speaking, or transcript is empty, ignore it.
+    If final: record segment to uncommitted_final_segments for turn fallback.
+    If interim: dispatch candidate_interim_transcript over UI data channel without modifying
+    permanent transcript or candidate answer queue.
+    Returns True if an event was handled, False if ignored.
+    """
+    if not transcript or is_agent_speaking:
+        return False
+
+    transcript = transcript.strip()
+    if not transcript:
+        return False
+
+    print(f"USER TRANSCRIPT | final={is_final}: {transcript}")
+
+    if is_final:
+        uncommitted_final_segments.append(transcript)
+    else:
+        if send_ui_event_fn is not None:
+            send_ui_event_fn(
+                "candidate_interim_transcript",
+                {
+                    "answer": transcript,
+                    "is_final": False,
+                },
+            )
+    return True
+
+
 async def finalize_uncommitted_speech(
     session,
     uncommitted_final_segments: list[str],
@@ -1686,7 +1724,10 @@ async def entrypoint(
         await send_ui_event(
             ctx,
             "candidate_answer",
-            {"answer": answer_clean},
+            {
+                "answer": answer_clean,
+                "is_final": True,
+            },
         )
         user_answer_queue.put_nowait(answer_clean)
         print(f"[Agent] Completed candidate turn queued for analysis: {answer_clean[:60]}")
@@ -1763,21 +1804,15 @@ async def entrypoint(
                 False,
             )
 
-            if not transcript or is_agent_speaking:
-                return
-
-            transcript = transcript.strip()
-            if not transcript:
-                return
-
-            print(
-                f"USER TRANSCRIPT | final={is_final}: {transcript}"
+            handle_user_input_transcribed_event(
+                transcript=transcript,
+                is_final=is_final,
+                is_agent_speaking=is_agent_speaking,
+                uncommitted_final_segments=uncommitted_final_segments,
+                send_ui_event_fn=lambda event_type, data: asyncio.create_task(
+                    send_ui_event(ctx, event_type, data)
+                ),
             )
-
-            # Record only finalized STT segments as fallback if End Assessment is clicked
-            # before the endpointing turn delay expires. Never treat interim text as a final answer.
-            if is_final:
-                uncommitted_final_segments.append(transcript)
 
         except Exception as error:
 
