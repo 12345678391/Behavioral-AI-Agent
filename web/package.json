@@ -3,7 +3,7 @@
   "version": "1.0.0",
   "private": true,
   "scripts": {
-    "start": "node server.cjs"
+    "start": "node --use-system-ca server.cjs"
   },
   "dependencies": {
     "cors": "^2.8.6",

@@ -3,6 +3,7 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import time
 from pathlib import Path
 from dataclasses import dataclass, field
@@ -19,6 +20,7 @@ from livekit.agents import (
     JobProcess,
     WorkerOptions,
     cli,
+    room_io,
 )
 
 try:
@@ -209,6 +211,14 @@ class AssessmentState:
     questions_asked: int = 0
     completed: bool = False
 
+    refused_questions: List[str] = field(
+        default_factory=list
+    )
+    abusive_language_count: int = 0
+    off_topic_count: int = 0
+    is_paused: bool = False
+    is_finalized: bool = False
+
     final_analysis: Dict = field(
         default_factory=dict
     )
@@ -278,11 +288,26 @@ class AssessmentState:
                 for area, items in self.evidence.items()
             },
 
+            "refused_questions":
+                self.refused_questions,
+
+            "abusive_language_count":
+                self.abusive_language_count,
+
+            "off_topic_count":
+                self.off_topic_count,
+
             "questions_asked":
                 self.questions_asked,
 
             "completed":
                 self.completed,
+
+            "is_paused":
+                self.is_paused,
+
+            "is_finalized":
+                self.is_finalized,
 
             "final_analysis":
                 self.final_analysis,
@@ -331,6 +356,636 @@ def save_assessment(
     print(
         f"Assessment saved to: {path}"
     )
+
+
+# ============================================================
+# CANDIDATE REFUSAL HANDLING & DETECTION HELPERS
+# ============================================================
+
+REFUSAL_EXACT_PATTERNS = [
+    # Explicit unwillingness / preference not to answer
+    r"\b(?:i\s+)?(?:do\s*n['’]?t|do\s+not|would\s+rather\s+not|'d\s+rather\s+not|prefer\s+not\s+to|'d\s+prefer\s+not\s+to|refuse\s+to|cannot|can['’]?t|won['’]?t)\s+(?:want\s+to\s+|wish\s+to\s+)?(?:answer|respond\s+to)\b",
+    r"\bnot\s+(?:going\s+to\s+)?answer\s+(?:that|this|the\s+question|it)\b",
+    # Discomfort with answering / question / topic
+    r"\b(?:not|un|don['’]?t\s+feel|do\s+not\s+feel)\s*comfortable\s+(?:answering|discussing|with\s+(?:this|that|the)\s+(?:question|topic))\b",
+    r"\b(?:rather|prefer)\s+not\s+to\s+(?:talk\s+about|discuss|get\s+into)\s+(?:this|that)\b",
+    r"\b(?:do\s*n['’]?t|do\s+not)\s+want\s+to\s+(?:talk\s+about|discuss|get\s+into)\s+(?:this|that)\b",
+    # Request to skip, move on, or change question / topic
+    r"\b(?:can|could|would|may)\s+(?:you|we|i)\s+(?:please\s+)?(?:skip(?:\s+to)?|pass\s+on|move\s+(?:on\s+)?(?:to|from)|change)\s+(?:this|that|the|another|a\s+different|next|the\s+next|something\s+else)(?:\s+(?:question|topic|subject))?\b",
+    r"\b(?:can|could|would)\s+(?:you\s+)?ask\s+(?:me\s+)?(?:something\s+else|a\s+different\s+question|another\s+question)\b",
+    r"\b(?:let['’]?s|please)\s+(?:skip|move\s+(?:on\s+)?to\s+(?:another|a\s+different|the\s+next|something\s+else)\s*(?:question|topic)?|change\s+the\s+topic)\b",
+    r"\b(?:pass|skip)\s+on\s+this\s+(?:question)?\b",
+    r"\b(?:i['’]?d\s+like\s+to\s+|i\s+want\s+to\s+|i['’]?d\s+rather\s+)?(?:pass|skip)\s+(?:on\s+)?(?:this|that|it|to\s+the\s+next)(?:\s+(?:one|question))?\b",
+    r"\bask\s+(?:me\s+)?(?:something\s+else|a\s+different\s+question)\b",
+    r"\bnext\s+question(?:\s+please)?\b",
+]
+
+_COMPILED_REFUSAL_PATTERNS = [re.compile(p, re.IGNORECASE) for p in REFUSAL_EXACT_PATTERNS]
+
+def is_candidate_refusal(text: str) -> bool:
+    """Deterministic detection for explicit candidate refusals, discomfort,
+    and requests to skip or change a question.
+    Does NOT classify ordinary answers or 'I don't know' as refusals.
+    """
+    if not text or not isinstance(text, str):
+        return False
+    cleaned = text.strip().lower()
+    if not cleaned:
+        return False
+    return any(p.search(cleaned) is not None for p in _COMPILED_REFUSAL_PATTERNS)
+
+
+def get_last_interviewer_question(state: AssessmentState) -> str:
+    """Return the text of the most recent question asked by the interviewer."""
+    for item in reversed(state.transcript):
+        if item.get("role") in ("interviewer", "assistant", "agent"):
+            text = (item.get("text") or "").strip()
+            if text:
+                return text
+    return ""
+
+
+# ============================================================
+# CANDIDATE INTERVIEW ENDING INTENT & AMBIGUITY HELPERS
+# ============================================================
+
+INTERVIEW_END_EXACT_PATTERNS = [
+    # Explicit commands / requests to stop, end, conclude, or finish the interview/assessment/session
+    r"\b(?:please\s+)?(?:stop|end|conclude|finish|terminate|wrap\s+up|close|quit|cancel)\s+(?:this|the|our)?\s*(?:(?:fucking|damn|f\*\*\*ing|stupid|bullshit|crappy)\s+)?(?:interview|assessment|session|meeting|call)\b",
+    r"\b(?:can|could|would|may|should)\s+(?:we|you|i)\s+(?:please\s+)?(?:stop|end|conclude|finish|wrap\s+up)\s+(?:this|the|our)?\s*(?:(?:fucking|damn|f\*\*\*ing|stupid|bullshit|crappy)\s+)?(?:interview|assessment|session)\b",
+    r"\b(?:let['’]?s|can\s+we|could\s+we|we\s+can|we\s+should|should\s+we|shall\s+we|please)\s+(?:stop|end|conclude|finish|wrap\s+up)(?:\s+(?:it|this))?\s*(?:now|here|today)\b",
+    r"\b(?:let['’]?s|please|we\s+can|we\s+should)\s+conclude\s+now\b",
+    r"\bstop\s+(?:this|the)?\s*(?:(?:fucking|damn|f\*\*\*ing|stupid|bullshit|crappy)\s+)?interview\b",
+    r"\bplease\s+end\s+(?:this|the)\s+interview\b",
+    r"\blet['’]?s\s+conclude\s+now\b",
+
+    # Unwillingness to continue the interview / assessment
+    r"\b(?:i\s+)?(?:do\s*n['’]?t|do\s+not|would\s+rather\s+not|'d\s+rather\s+not|prefer\s+not\s+to|cannot|can['’]?t|won['’]?t)\s+(?:want\s+to\s+|wish\s+to\s+)?continue(?:\s+(?:with\s+)?(?:this|the)?\s*(?:(?:fucking|damn|f\*\*\*ing|stupid|bullshit|crappy)\s+)?(?:interview|assessment|session|further|anymore))?\b",
+    r"\b(?:i['’]?m|i\s+am)\s+done\s+with\s+(?:this|the)\s+(?:interview|assessment)\b",
+
+    # Explicit desire to stop / end / conclude here or now
+    r"\b(?:i['’]?d\s+like\s+to|i\s+want\s+to|i\s+would\s+like\s+to|i\s+wish\s+to)\s+(?:stop|end|conclude|wrap\s+up)\s+(?:here|now)\b",
+    r"\b(?:i['’]?d\s+like\s+to|i\s+want\s+to|i\s+would\s+like\s+to|i\s+wish\s+to)\s+(?:stop|end|conclude|finish|wrap\s+up)\s+(?:the|this|our)?\s*(?:(?:fucking|damn|f\*\*\*ing|stupid|bullshit|crappy)\s+)?(?:interview|assessment|session)\b",
+    r"\b(?:i\s+)?want\s+to\s+stop\s+here\b",
+
+    # "Please finish and give me the conclusion / results"
+    r"\b(?:please\s+)?(?:finish|conclude|end)\s+(?:and\s+)?(?:give\s+me|show\s+me|provide)\s+(?:the\s+)?(?:conclusion|results?|feedback|report|assessment)\b",
+
+    # "I don't want to do this anymore" / "exit the interview"
+    r"\b(?:i\s+)?(?:do\s*n['’]?t|do\s+not)\s+want\s+to\s+do\s+this\s+anymore\b",
+    r"\b(?:i\s+want\s+to\s+|can\s+i\s+)?exit\s+(?:the|this)\s+(?:(?:fucking|damn|f\*\*\*ing|stupid|bullshit|crappy)\s+)?(?:interview|assessment)\b",
+]
+
+_COMPILED_END_PATTERNS = [re.compile(p, re.IGNORECASE) for p in INTERVIEW_END_EXACT_PATTERNS]
+
+AMBIGUOUS_END_PATTERNS = [
+    r"^(?:can|could)\s+(?:we|i)\s+stop(?:\s+now)?[?.!]?$",
+    r"^(?:are|am)\s+(?:we|i)\s+done[?.!]?$",
+    r"^is\s+(?:this|it)\s+(?:done|over|finished)[?.!]?$",
+    r"^(?:should|can|could)\s+we\s+finish(?:\s+now)?[?.!]?$",
+    r"^that['’]?s\s+(?:all|it)[?.!]?$",
+]
+
+_COMPILED_AMBIGUOUS_END = [re.compile(p, re.IGNORECASE) for p in AMBIGUOUS_END_PATTERNS]
+
+CANDIDATE_END_CLOSING_MESSAGE = (
+    "Understood. We will conclude the interview here and finalize your assessment. "
+    "Thank you for your time."
+)
+
+AMBIGUOUS_END_CLARIFICATION_MESSAGE = (
+    "Would you like to end the interview now, or would you like to continue with the next question?"
+)
+
+
+def is_candidate_end_request(text: str) -> bool:
+    """Detect explicit candidate intent to stop, end, or conclude the interview.
+    Distinguishes explicit ending requests from substantive answers discussing past work
+    (e.g. 'I stopped the server', 'We finished the project').
+    """
+    if not text or not isinstance(text, str):
+        return False
+    cleaned = text.strip().lower()
+    if not cleaned:
+        return False
+    return any(p.search(cleaned) is not None for p in _COMPILED_END_PATTERNS)
+
+
+def is_ambiguous_end_request(text: str) -> bool:
+    """Detect short candidate questions that are ambiguous regarding ending the interview."""
+    if not text or not isinstance(text, str):
+        return False
+    cleaned = text.strip().lower()
+    if not cleaned:
+        return False
+    if is_candidate_end_request(cleaned):
+        return False
+    return any(p.search(cleaned) is not None for p in _COMPILED_AMBIGUOUS_END)
+
+
+PROFESSIONAL_REFUSAL_PREFIX = (
+    "I understand. We can move to another relevant area. "
+    "Please note that skipping a question may limit the evidence available for assessing this competency."
+)
+
+PROFESSIONAL_BOUNDARY_PREFIX = (
+    "This interview focuses on evaluating your professional background, skills, and job-related experiences. "
+    "Let's refocus on your workplace experience."
+)
+
+ABUSE_WARNING_FIRST_PREFIX = (
+    "Please maintain a respectful and professional tone during this assessment. "
+    "Let's return to the interview."
+)
+
+ABUSE_WARNING_REPEATED_PREFIX = (
+    "As a reminder, professional and respectful communication is required throughout this assessment. "
+    "Let's refocus on the discussion."
+)
+
+PERSONAL_OR_UNRELATED_REQUEST_PATTERNS = [
+    r"\b(?:can|could|would|may|let['’]?s|i\s+want\s+to|i['’]?d\s+like\s+to|shall\s+we)\s+(?:we|you|i)?\s*(?:please\s+)?(?:talk|chat|speak|discuss|focus)\s+(?:about\s+)?(?:my\s+|our\s+)?(?:personal\s+life|private\s+life|non-?work\s+topics?|something\s+outside\s+(?:of\s+)?work|things\s+unrelated\s+to\s+work)\b",
+    r"\b(?:can|could|would|let['’]?s)\s+(?:we|you|i)?\s*(?:talk|chat|speak|discuss)\s+(?:about\s+)?(?:movies|sports|weather|politics|dating|relationships|celebrities|video\s+games)\b",
+    r"\b(?:can\s+we|let['’]?s)\s+(?:talk\s+(?:about\s+)?|discuss\s+)(?:something|topics?)\s+(?:outside\s+(?:of\s+)?work|unrelated\s+to\s+work|not\s+related\s+to\s+(?:work|the\s+job))\b",
+    r"\bwhat\s+do\s+you\s+(?:like\s+to\s+)?do\s+on\s+(?:the\s+)?weekends?\b",
+    r"\btell\s+me\s+about\s+your\s+(?:personal\s+life|hobbies|weekend)\b",
+    r"\bwhat\s+are\s+your\s+(?:personal\s+)?hobbies\b",
+]
+
+ABUSIVE_LANGUAGE_PATTERNS = [
+    r"\b(?:fuck|fucking|f\*\*\*)\s+(?:you|off|u)\b",
+    r"\b(?:go\s+fuck\s+yourself|go\s+to\s+hell|eat\s+shit)\b",
+    r"\b(?:shut\s+the\s+fuck\s+up|stfu)\b",
+    r"\b(?:you\s+are|you're|u\s+r|you)\s+(?:a\s+)?(?:stupid|idiot|moron|dumbass|dumb\s+(?:bot|ai|interviewer)|worthless|bitch|asshole|bastard|piece\s+of\s+shit|garbage)\b",
+    r"\b(?:you\s+suck|you're\s+useless|you\s+are\s+useless)\b",
+    r"\b(?:i\s+will|i'm\s+going\s+to|i['’]?ll)\s+(?:kill|hurt|destroy|break|punch|attack|smash)\s+(?:you|this\s+machine)\b",
+]
+
+_COMPILED_PERSONAL = [re.compile(p, re.IGNORECASE) for p in PERSONAL_OR_UNRELATED_REQUEST_PATTERNS]
+_COMPILED_ABUSE = [re.compile(p, re.IGNORECASE) for p in ABUSIVE_LANGUAGE_PATTERNS]
+
+
+def is_personal_or_unrelated_request(text: str) -> bool:
+    """Detect explicit requests by candidate to switch interview focus to personal life,
+    hobbies, or unrelated conversational topics.
+    Does NOT match substantive answers that mention personal background in support of a job competency.
+    """
+    if not text or not isinstance(text, str):
+        return False
+    cleaned = text.strip().lower()
+    if not cleaned:
+        return False
+    return any(p.search(cleaned) is not None for p in _COMPILED_PERSONAL)
+
+
+def is_abusive_language(text: str) -> bool:
+    """Conservative, context-aware detection for abusive, hostile, or insulting language directed at the interviewer.
+    Does NOT flag ordinary frustration, technical disagreement, nervousness, or polite refusals.
+    """
+    if not text or not isinstance(text, str):
+        return False
+    cleaned = text.strip().lower()
+    if not cleaned:
+        return False
+    return any(p.search(cleaned) is not None for p in _COMPILED_ABUSE)
+
+
+# Off-topic patterns detecting non-work entertainment, cinema, games, sports, or weather
+OFF_TOPIC_PATTERNS = [
+    # Movies, cinema, films, actors, Hollywood, streaming entertainment
+    r"\b(?:watch|watching|watched|love|likes?|favorite|favourite|enjoy|saw|see|seen)\s+(?:a\s+lot\s+of\s+|many\s+)?(?:movies?|films?|cinema|hollywood|netflix|tv\s+shows?|series|marvel|avengers|batman|superman|disney|anime|action\s+movies?|sci-?fi\s+movies?|thrillers?)\b",
+    r"\b(?:i\s+said\s+|i\s+told\s+you\s+|i\s+already\s+said\s+)?(?:i\s+)?(?:love|like|enjoy|watch|am\s+into)\s+(?:watching\s+)?(?:marvel\s+)?(?:movies?|films?|cinema)\b",
+    r"\b(?:my\s+favorite\s+(?:movie|film|actor|actress|director|tv\s+show|series)|favorite\s+movie\s+is|favorite\s+film\s+is|favourite\s+movie\s+is)\b",
+    r"\b(?:movie|film|cinema)\s+(?:theater|theatre|tickets?|popcorn|acting|actors?|actress|director|night|nights)\b",
+    r"\b(?:in\s+the\s+movie|in\s+that\s+film|the\s+movie\s+was|the\s+film\s+was)\b",
+    r"\b(?:watching\s+films?|watching\s+movies?)\b",
+    r"\b(?:movies?|films?)\s+(?:are|is)\s+(?:my\s+favorite|great|awesome|fun|cool|what\s+i\s+like)\b",
+    r"\b(?:marvel\s+movies?|avengers(?:\s+endgame)?|inception|titanic|spider-?man|the\s+godfather|star\s+wars)\b",
+    # Video games, gaming
+    r"\b(?:play|playing|played)\s+(?:video\s+games?|computer\s+games?|playstation|xbox|nintendo|fortnite|call\s+of\s+duty|minecraft|gta|league\s+of\s+legends|valorant|fifa)\b",
+    r"\b(?:my\s+favorite\s+(?:game|video\s+game)|favorite\s+game\s+is)\b",
+    # Sports matches, fandom
+    r"\b(?:watch|watching|watched|see|saw|catch|caught|follow|fan\s+of|love)\s+(?:the\s+)?(?:football|soccer|cricket|basketball|nba|nfl|baseball|tennis)\s+(?:game|match|tournament|league|cup|scores?|highlights?|team)\b",
+    r"\b(?:did\s+you\s+(?:see|watch|catch)|who\s+won)\s+(?:the\s+)?(?:game|match|championship|super\s*bowl|world\s*cup|football|soccer|cricket|basketball)\b",
+    # Weather banter
+    r"\b(?:the\s+weather\s+is|it['’]?s\s+(?:so\s+)?(?:sunny|rainy|raining|cold|hot|snowing|humid)\s+outside|nice\s+weather|bad\s+weather)\b",
+    # Celebrity gossip, dating, nightlife
+    r"\b(?:my\s+(?:boyfriend|girlfriend|partner|date)\s+and\s+i|went\s+on\s+a\s+date|dating|tinder|party\s+last\s+night|clubbing|hungover)\b",
+]
+
+_COMPILED_OFF_TOPIC = [re.compile(p, re.IGNORECASE) for p in OFF_TOPIC_PATTERNS]
+
+WORKPLACE_INDICATORS = {
+    "project", "team", "engineer", "engineering", "developer", "development",
+    "work", "worked", "working", "job", "company", "client", "stakeholder",
+    "code", "coding", "software", "system", "architecture", "database", "api",
+    "manager", "leadership", "production", "incident", "deadline", "bug",
+    "feature", "resolved", "solved", "deliver", "delivered", "responsibility",
+    "responsible", "career", "experience", "lead", "mentor", "mentored",
+    "collaborate", "collaborated", "communication", "challenge", "challenging",
+    "role", "backend", "frontend", "fullstack", "devops", "cloud", "aws", "gcp",
+    "azure", "docker", "kubernetes", "git", "python", "javascript", "react", "node",
+    "sql", "nosql", "linux", "testing", "unit test", "design", "designed",
+}
+
+CLARIFICATION_PATTERNS = [
+    r"\b(?:can|could|would)\s+you\s+(?:please\s+)?(?:repeat|clarify|rephrase|say\s+that\s+again|explain)\b",
+    r"\b(?:what\s+do\s+you\s+mean|what\s+does\s+that\s+mean)\b",
+    r"\b(?:pardon|excuse\s+me|come\s+again|didn['’]?t\s+(?:hear|catch)\s+that)\b",
+    r"\brepeat\s+the\s+question\b",
+]
+_COMPILED_CLARIFICATION = [re.compile(p, re.IGNORECASE) for p in CLARIFICATION_PATTERNS]
+
+NERVOUSNESS_PATTERNS = [
+    r"\b(?:i\s+am|i'm|feeling)\s+(?:very\s+|a\s+bit\s+|a\s+little\s+|quite\s+)?(?:nervous|anxious|stressed)\b",
+    r"\b(?:give\s+me\s+a\s+moment|let\s+me\s+think|just\s+thinking)\b",
+]
+_COMPILED_NERVOUSNESS = [re.compile(p, re.IGNORECASE) for p in NERVOUSNESS_PATTERNS]
+
+DISAGREEMENT_PATTERNS = [
+    r"\b(?:i\s+)?(?:disagree|disagreed)\b",
+    r"\b(?:i\s+)?(?:don['’]?t|do\s+not)\s+agree\b",
+]
+_COMPILED_DISAGREEMENT = [re.compile(p, re.IGNORECASE) for p in DISAGREEMENT_PATTERNS]
+
+
+def is_clarification_request(text: str) -> bool:
+    """Detect reasonable candidate clarification requests (e.g. asking to repeat or explain)."""
+    if not text or not isinstance(text, str):
+        return False
+    cleaned = text.strip().lower()
+    return any(p.search(cleaned) is not None for p in _COMPILED_CLARIFICATION)
+
+
+def is_nervousness_or_disagreement(text: str) -> bool:
+    """Detect natural expressions of nervousness, anxiety, or technical disagreement."""
+    if not text or not isinstance(text, str):
+        return False
+    cleaned = text.strip().lower()
+    return (
+        any(p.search(cleaned) is not None for p in _COMPILED_NERVOUSNESS)
+        or any(p.search(cleaned) is not None for p in _COMPILED_DISAGREEMENT)
+    )
+
+
+def has_substantive_workplace_context(text: str) -> bool:
+    """Return True if the text contains substantive workplace or technical keywords."""
+    if not text:
+        return False
+    words = set(re.findall(r"\b[a-z]{3,}\b", text.lower()))
+    matches = words & WORKPLACE_INDICATORS
+    return len(matches) >= 2
+
+
+def is_off_topic_answer(text: str) -> bool:
+    """Detect when the candidate's response is unrelated to the interview question (e.g. movies, gaming, sports).
+    Does NOT flag relevant personal examples, nervousness, disagreement, or clarification requests.
+    """
+    if not text or not isinstance(text, str):
+        return False
+    cleaned = text.strip().lower()
+    if not cleaned:
+        return False
+
+    if is_clarification_request(cleaned):
+        return False
+    if is_nervousness_or_disagreement(cleaned):
+        return False
+
+    matched = any(p.search(cleaned) is not None for p in _COMPILED_OFF_TOPIC)
+    if not matched:
+        return False
+
+    if has_substantive_workplace_context(cleaned):
+        return False
+
+    return True
+
+
+OFF_TOPIC_FIRST_PREFIX = (
+    "This assessment focuses on evaluating your professional background, skills, and workplace experiences. "
+    "Let's refocus on your workplace experience."
+)
+
+OFF_TOPIC_REPEATED_PREFIX = (
+    "As a reminder, our assessment time is dedicated to your professional background and qualifications. "
+    "Let's stay focused on the interview questions."
+)
+
+UNRELATED_ENTERTAINMENT_QUESTION_PATTERNS = [
+    r"\bmovie\s+nights?\b",
+    r"\b(?:favorite|favourite)\s+(?:movie|film|actor|actress|director|song|band|album|celebrity|video\s+game|game|show|series)\b",
+    r"\b(?:organize|organizing|host|hosting|plan|planning)\s+(?:a\s+)?(?:movie\s+night|film\s+screening|game\s+night)\b",
+    r"\b(?:marvel|inception|avengers|hollywood|netflix\s+show|disney\s+plus)\b",
+    r"\b(?:watch|watching)\s+(?:movies?|films?|tv\s+shows?|series)\b",
+    r"\b(?:video\s+games?|gaming|playstation|xbox|nintendo)\b",
+    r"\b(?:celebrities|celebrity|gossip)\b",
+]
+_COMPILED_UNRELATED_QUESTION = [re.compile(p, re.IGNORECASE) for p in UNRELATED_ENTERTAINMENT_QUESTION_PATTERNS]
+
+
+def is_unrelated_entertainment_question(text: str) -> bool:
+    """Return True if a question mentions movies, movie nights, entertainment preferences, gaming, or celebrities."""
+    if not text or not isinstance(text, str):
+        return False
+    cleaned = text.strip().lower()
+    return any(p.search(cleaned) is not None for p in _COMPILED_UNRELATED_QUESTION)
+
+
+def is_repeated_off_topic(state: AssessmentState, current_text: str = "") -> bool:
+    """Detect if an off-topic answer is repeated, checking state counter and prior candidate turns in transcript."""
+    if getattr(state, "off_topic_count", 0) >= 1:
+        return True
+    prior_off_topic_count = sum(
+        1 for item in getattr(state, "transcript", [])
+        if item.get("role") in ("candidate", "user") and is_off_topic_answer(item.get("text", ""))
+    )
+    return prior_off_topic_count >= 1
+
+
+def format_boundary_response(question_text: str) -> str:
+    """Ensure an off-topic redirection begins with professional boundary explanation and refocusing."""
+    q = (question_text or "").strip()
+    if not q:
+        return PROFESSIONAL_BOUNDARY_PREFIX
+    if q.startswith(PROFESSIONAL_BOUNDARY_PREFIX):
+        return q
+    q_substantive = strip_refusal_prefix(q)
+    return f"{PROFESSIONAL_BOUNDARY_PREFIX} {q_substantive}" if q_substantive else PROFESSIONAL_BOUNDARY_PREFIX
+
+
+def format_abuse_warning_response(question_text: str, count: int) -> str:
+    """Ensure an abusive turn response begins with calm warning (1st) or firmer reminder (2nd+)."""
+    prefix = ABUSE_WARNING_FIRST_PREFIX if count <= 1 else ABUSE_WARNING_REPEATED_PREFIX
+    q = (question_text or "").strip()
+    if not q:
+        return prefix
+    if q.startswith(prefix):
+        return q
+    q_substantive = strip_refusal_prefix(q)
+    return f"{prefix} {q_substantive}" if q_substantive else prefix
+
+
+def format_refusal_response(question_text: str) -> str:
+    """Ensure a refusal redirection begins with a professional, respectful acknowledgment.
+    Idempotent: will not duplicate prefix if already formatted or acknowledged.
+    """
+    q = (question_text or "").strip()
+    if not q:
+        return PROFESSIONAL_REFUSAL_PREFIX
+
+    if q.startswith(PROFESSIONAL_REFUSAL_PREFIX):
+        return q
+
+    old_prefix = "I understand. Let's move to another relevant question."
+    if q.startswith(old_prefix):
+        remainder = q[len(old_prefix):].strip()
+        return f"{PROFESSIONAL_REFUSAL_PREFIX} {remainder}" if remainder else PROFESSIONAL_REFUSAL_PREFIX
+
+    ack_starters = (
+        "i understand. we can move to another relevant area",
+        "i understand. let's move to another relevant question",
+        "i understand",
+        "understood",
+        "no problem",
+        "no worries",
+        "that's fine",
+        "that is fine",
+        "that's completely fine",
+        "that is completely fine",
+        "that's okay",
+        "that is okay",
+        "certainly",
+        "sure",
+        "of course",
+    )
+    if q.lower().startswith("i understand") and "skipping a question may limit" not in q.lower():
+        rest = strip_refusal_prefix(q)
+        return f"{PROFESSIONAL_REFUSAL_PREFIX} {rest}" if rest else PROFESSIONAL_REFUSAL_PREFIX
+
+    if not any(q.lower().startswith(starter) for starter in ack_starters):
+        return f"{PROFESSIONAL_REFUSAL_PREFIX} {q}"
+    return q
+
+
+def get_next_redirect_question(state: AssessmentState) -> str:
+    """Select an unasked safe behavioral or neutral fallback question from another dimension to prevent loops."""
+    asked_norm = {
+        normalize_question(item.get("text", ""))
+        for item in state.transcript
+        if item.get("role") in ("interviewer", "assistant", "agent")
+    }
+    refused_norm = {
+        normalize_question(q)
+        for q in getattr(state, "refused_questions", [])
+    }
+    excluded = asked_norm | refused_norm
+
+    for fallback in FALLBACK_BEHAVIORAL_QUESTIONS:
+        fb_norm = normalize_question(fallback)
+        if (
+            fb_norm not in excluded
+            and not is_refused_topic_repetition(fallback, state.refused_questions)
+            and not is_unrelated_entertainment_question(fallback)
+        ):
+            return fallback
+
+    for safe_q in SAFE_NEUTRAL_QUESTIONS:
+        sq_norm = normalize_question(safe_q)
+        if (
+            sq_norm not in excluded
+            and not is_refused_topic_repetition(safe_q, state.refused_questions)
+            and not is_unrelated_entertainment_question(safe_q)
+        ):
+            return safe_q
+
+    return "Could you tell me about what motivated you to pursue your current career path?"
+
+
+def strip_refusal_prefix(text: str) -> str:
+    """Strip professional refusal acknowledgment, boundary, abuse warning, or off-topic phrases from the start of a question.
+    Ensures question comparisons and topic analysis focus solely on the substantive question.
+    """
+    if not text:
+        return ""
+    q = text.strip()
+    prefixes_to_check = (
+        PROFESSIONAL_REFUSAL_PREFIX,
+        PROFESSIONAL_BOUNDARY_PREFIX,
+        ABUSE_WARNING_FIRST_PREFIX,
+        ABUSE_WARNING_REPEATED_PREFIX,
+        OFF_TOPIC_FIRST_PREFIX,
+        OFF_TOPIC_REPEATED_PREFIX,
+    )
+    for pfx in prefixes_to_check:
+        if q.lower().startswith(pfx.lower()):
+            q = q[len(pfx):].strip()
+
+    refusal_starters = (
+        "please note that skipping a question may limit the evidence available for assessing this competency.",
+        "we can move to another relevant area. please note that skipping a question may limit the evidence available for assessing this competency.",
+        "this assessment focuses on evaluating your professional background, skills, and workplace experiences. let's refocus on your workplace experience.",
+        "this assessment focuses on evaluating your professional background, skills, and workplace experiences.",
+        "as a reminder, our assessment time is dedicated to your professional background and qualifications. let's stay focused on the interview questions.",
+        "as a reminder, our assessment time is dedicated to your professional background and qualifications.",
+        "let's stay focused on the interview questions.",
+        "this interview focuses on evaluating your professional background, skills, and job-related experiences. let's refocus on your workplace experience.",
+        "this interview focuses on evaluating your professional background, skills, and job-related experiences.",
+        "let's refocus on your workplace experience.",
+        "let's refocus on the discussion.",
+        "please maintain a respectful and professional tone during this assessment. let's return to the interview.",
+        "please maintain a respectful and professional tone during this assessment.",
+        "let's return to the interview.",
+        "as a reminder, professional and respectful communication is required throughout this assessment. let's refocus on the discussion.",
+        "as a reminder, professional and respectful communication is required throughout this assessment.",
+        "we can move to another relevant area.",
+        "let's move to another relevant question.",
+        "let's move to another question.",
+        "let's move to a different question.",
+        "i understand, that is completely fine.",
+        "i understand, that's completely fine.",
+        "i understand.",
+        "understood.",
+        "no problem.",
+        "no worries.",
+        "that's completely fine.",
+        "that is completely fine.",
+        "that's fine.",
+        "that is fine.",
+    )
+    changed = True
+    while changed:
+        changed = False
+        lower = q.lower()
+        for starter in refusal_starters:
+            if lower.startswith(starter):
+                q = q[len(starter):].strip()
+                changed = True
+                break
+    return q
+
+
+def get_question_behavioral_area(question_text: str) -> str:
+    """Identify the likely behavioral area of a question based on key indicators."""
+    lower = question_text.lower()
+    if any(k in lower for k in ("collaborate", "team member", "coworker", "team", "conflict", "disagree", "disagreement", "perspective")):
+        return "teamwork"
+    if any(k in lower for k in ("mistake", "error", "setback", "ownership", "fail", "accountab")):
+        return "accountability"
+    if any(k in lower for k in ("priorities", "changed unexpectedly", "adapt", "flexible", "ambiguity", "stress")):
+        return "adaptability"
+    if any(k in lower for k in ("decision", "high-stakes", "reasoning", "trade-off", "tradeoff")):
+        return "decision_making"
+    if any(k in lower for k in ("lead", "leadership", "initiative", "guide colleagues", "milestone", "mentor")):
+        return "leadership"
+    if any(k in lower for k in ("communicat", "stakeholder", "persuaded", "cross-functional", "explain complex", "present")):
+        return "communication"
+    if any(k in lower for k in ("problem", "technical", "operational", "resolve", "troubleshoot", "debugging", "bug", "architecture")):
+        return "problem_solving"
+    return ""
+
+
+def normalize_question(text: str) -> str:
+    """Normalize a question by removing refusal prefixes, lowercasing, and stripping punctuation/whitespace."""
+    if not text:
+        return ""
+    q = strip_refusal_prefix(text).strip().lower()
+    return q.rstrip("?.! ")
+
+
+# ============================================================
+# REFUSED TOPIC REPETITION SAFEGUARD
+# ============================================================
+
+REFUSED_TOPIC_CLUSTERS: dict[str, set[str]] = {
+    "conflict_disagreement": {
+        "conflict", "conflicts", "disagree", "disagreement", "disagreements",
+        "disagreed", "clash", "clashed", "dispute", "disputes", "argument",
+        "arguments", "friction",
+    },
+    "mistake_failure": {
+        "mistake", "mistakes", "failure", "failures", "fail", "failed",
+        "error", "errors", "blunder", "blunders", "setback", "setbacks",
+        "regret", "regretted", "regrets", "went wrong",
+    },
+    "criticism_negative_feedback": {
+        "criticism", "critical feedback", "negative feedback", "reprimand",
+        "reprimanded", "underperformance", "underperformed",
+    },
+    "termination_leaving": {
+        "fired", "firing", "terminate", "terminated", "termination",
+        "dismissed", "dismissal", "let go", "laid off", "layoff",
+        "quit", "quitting", "resigned", "resignation",
+    },
+    "stress_burnout": {
+        "burnout", "burned out", "overwhelmed", "overwhelming", "stress", "stressed",
+    },
+}
+
+INTERVIEW_STOPWORDS: set[str] = {
+    "a", "an", "the", "and", "or", "but", "if", "because", "as", "what",
+    "which", "this", "that", "these", "those", "then", "just", "so", "than",
+    "such", "both", "through", "about", "for", "is", "of", "while", "during",
+    "to", "from", "in", "out", "on", "off", "over", "under", "again", "further",
+    "then", "once", "here", "there", "when", "where", "why", "how", "all", "any",
+    "both", "each", "few", "more", "most", "other", "some", "no", "nor", "not",
+    "only", "own", "same", "so", "too", "very", "can", "will", "don", "should",
+    "now", "i", "me", "my", "myself", "we", "our", "ours", "you", "your",
+    "yours", "yourself", "yourselves", "he", "him", "his", "she", "her", "hers",
+    "it", "its", "they", "them", "their", "theirs",
+    "tell", "describe", "share", "give", "example", "situation", "time",
+    "experience", "scenario", "explain", "talk", "discuss", "instance",
+    "would", "could", "did", "were", "was", "have", "had", "handled",
+    "approach", "steps", "take", "took", "action", "actions", "result",
+    "outcome", "handle", "handling", "work", "worked", "working", "job",
+    "role", "workplace", "project", "team", "colleague", "colleagues",
+    "understand", "move", "relevant", "question", "another", "different",
+}
+
+
+def extract_content_tokens(text: str) -> set[str]:
+    raw_tokens = re.findall(r"[a-zA-Z]{3,}", text.lower())
+    return {t for t in raw_tokens if t not in INTERVIEW_STOPWORDS}
+
+
+def get_question_topics(text: str) -> set[str]:
+    lower = text.lower()
+    topics = set()
+    for topic_name, keywords in REFUSED_TOPIC_CLUSTERS.items():
+        if any(kw in lower for kw in keywords):
+            topics.add(topic_name)
+    return topics
+
+
+def is_refused_topic_repetition(candidate_question: str, refused_questions: list[str]) -> bool:
+    """Reliable safeguard checking whether a candidate question repeats a refused topic
+    with different wording, without blocking unrelated questions.
+    """
+    if not candidate_question or not refused_questions:
+        return False
+    c_clean = strip_refusal_prefix(candidate_question).strip().lower()
+    c_topics = get_question_topics(c_clean)
+    c_tokens = extract_content_tokens(c_clean)
+
+    for refused in refused_questions:
+        r_clean = strip_refusal_prefix(refused or "").strip().lower()
+        if not r_clean:
+            continue
+        # Exact or substantive substring match (ignoring refusal prefix and punctuation)
+        r_norm = r_clean.rstrip("?.! ")
+        c_norm = c_clean.rstrip("?.! ")
+        if r_norm == c_norm or (len(r_norm) >= 15 and r_norm in c_norm) or (len(c_norm) >= 15 and c_norm in r_norm):
+            return True
+        # Thematic topic cluster match (e.g. conflict/disagreement or mistake/failure)
+        r_topics = get_question_topics(r_clean)
+        if c_topics and r_topics and bool(c_topics & r_topics):
+            return True
+        # Content keyword overlap (>= 2 non-generic content words)
+        r_tokens = extract_content_tokens(r_clean)
+        shared = c_tokens & r_tokens
+        if len(shared) >= 2:
+            return True
+    return False
 
 
 # ============================================================
@@ -530,6 +1185,10 @@ async def analyze_candidate_answer(
     state: AssessmentState,
     answer: str,
 ):
+    # Fairness guarantee: a candidate's refusal statement alone must never be evaluated for negative evidence
+    if is_candidate_refusal(answer):
+        print(f"[Agent] analyze_candidate_answer: skipping behavioral evaluation for refusal turn: {answer[:50]}")
+        return
 
     prompt = f"""
 You are a behavioral assessment evidence analyst.
@@ -656,13 +1315,29 @@ FALLBACK_BEHAVIORAL_QUESTIONS = [
     "Can you describe how you communicated complex concepts or persuaded cross-functional stakeholders to align on a direction?",
 ]
 
+SAFE_NEUTRAL_QUESTIONS = [
+    "Could you tell me about what motivated you to pursue your current career path?",
+    "What professional accomplishment or project are you most proud of in your career?",
+    "How do you typically approach organizing your daily workflow and priorities?",
+    "What is an area of technology or skill that you have recently enjoyed learning?",
+]
+
 async def generate_adaptive_question(
     state: AssessmentState,
     remaining_seconds: int,
     current_answer: str = "",
     transcript: str | None = None,
     evidence: str | None = None,
+    is_refusal: bool = False,
+    refused_question: str = "",
+    **kwargs,
 ) -> str:
+
+    # Circuit-breaker: if current_answer is clearly an off-topic entertainment monologue,
+    # bypass LLM generation entirely so the model cannot build a question around movies/entertainment.
+    if current_answer and is_off_topic_answer(current_answer):
+        print(f"[Agent] generate_adaptive_question invoked with off-topic candidate answer ('{current_answer[:60]}'). Bypassing LLM generation and returning safe workplace fallback.")
+        return get_next_redirect_question(state)
 
     # Capture the adaptive-question context before the analysis task
     # mutates state.evidence. The current answer is passed explicitly
@@ -673,6 +1348,32 @@ async def generate_adaptive_question(
 
     if evidence is None:
         evidence = format_evidence(state)
+
+    refusal_guidance = ""
+    if is_refusal:
+        refusal_guidance = f"""
+SPECIAL INSTRUCTION - CANDIDATE REFUSAL / SKIP REQUEST:
+The candidate politely declined to answer or requested to skip the previous question:
+"{refused_question or 'the previous question'}"
+
+You must handle this refusal professionally, neutrally, and respectfully:
+1. Begin your response with a courteous, professional acknowledgment and neutral notification:
+   "I understand. We can move to another relevant area. Please note that skipping a question may limit the evidence available for assessing this competency."
+2. Immediately follow with a fresh, relevant question exploring a COMPLETELY DIFFERENT behavioral competency or situational workplace scenario.
+3. Do NOT repeat the declined question or press the candidate on the declined topic.
+4. Do NOT shame, threaten, argue with, or repeatedly pressure the candidate.
+5. Example format:
+   "I understand. We can move to another relevant area. Please note that skipping a question may limit the evidence available for assessing this competency. Could you describe how you would handle a challenging situation at work?"
+"""
+
+    previously_refused_section = ""
+    if getattr(state, "refused_questions", None):
+        refused_items = "\n".join(f"- {q}" for q in state.refused_questions)
+        previously_refused_section = f"""
+Previously declined or skipped questions:
+{refused_items}
+Do NOT ask about these topics or situations again, even with different wording. Pivot to an entirely different behavioral dimension.
+"""
 
     prompt = f"""
 You are an adaptive behavioral interviewer.
@@ -689,6 +1390,9 @@ The assessment dimensions are:
 - leadership
 - problem_solving
 
+Candidate stated background / introduction:
+{state.candidate_introduction or "Not provided"}
+
 The candidate's previous conversation:
 
 {transcript}
@@ -701,6 +1405,8 @@ Candidate's latest answer:
 
 {current_answer}
 
+{refusal_guidance}
+{previously_refused_section}
 Time remaining:
 
 {remaining_seconds} seconds.
@@ -709,14 +1415,22 @@ Generate ONE natural follow-up question.
 
 Important:
 
+- Ground your questions strictly in the candidate's stated background, introduction, and previous answers.
+- Questions must be directly relevant to the candidate's answer, role/interview context, and the target behavioral competency.
+- Never invent or assume candidate qualifications, technical skills, job titles, companies, or experiences that the candidate has not explicitly stated.
+- NEVER ask questions about movies, movie nights, films, cinema, actors, television shows, video games, sports, celebrities, or personal non-work entertainment.
+- Even if the candidate mentions movies or entertainment, do NOT generate scenarios about organizing movie nights, watching films, or personal entertainment activities.
+- All behavioral questions must focus strictly on professional workplace skills, job-related projects, engineering/business challenges, teamwork, or technical problem solving.
 - Do NOT follow a fixed scenario list.
-- Do NOT ask random generic questions.
-- Choose the next question based specifically on the candidate's previous response.
+- Do NOT ask random generic or unrelated questions.
+- Choose the next question based specifically on the candidate's previous response and interview context.
 - Identify behavioral areas where stronger evidence is useful.
+- When the candidate declines a question, pivot to a different behavioral competency while keeping the scenario relevant to their background.
+- Do not shame, argue with, threaten, or pressure the candidate.
 - Create a realistic workplace situation when appropriate.
 - Ask what the candidate would do or what they actually did.
 - Ask for a concrete example when useful.
-- Avoid repeating something already answered.
+- Avoid repeating something already answered or already refused.
 - Do not ask about scores.
 - Do not mention internal analysis.
 - Do not mention the assessment system.
@@ -752,6 +1466,13 @@ Return ONLY the question text.
         except Exception as chat_err:
             print(f"[Agent] generate_adaptive_question chat.completions fallback also failed ({chat_err!r})")
 
+    refused_list = getattr(state, "refused_questions", [])
+    refused_normalized = {
+        normalize_question(q)
+        for q in refused_list
+        if normalize_question(q)
+    }
+
     if raw_question:
         # Strip code fences or surrounding quotes if returned by the model
         if raw_question.startswith("```"):
@@ -765,20 +1486,74 @@ Return ONLY the question text.
             raw_question = raw_question[1:-1].strip()
 
         if len(raw_question) > 10:
-            return raw_question
+            raw_norm = normalize_question(raw_question)
+            if raw_norm in refused_normalized or any(len(r) >= 15 and (r in raw_norm or raw_norm in r) for r in refused_normalized):
+                print(f"[Agent] Model-generated question matches previously refused question. Discarding and using alternative safe fallback.")
+            elif refused_list and is_refused_topic_repetition(raw_question, refused_list):
+                print(f"[Agent] Model-generated question repeats refused topic ('{raw_question[:60]}'). Discarding and using alternative safe fallback.")
+            elif is_unrelated_entertainment_question(raw_question):
+                print(f"[Agent] Model-generated question mentions unrelated entertainment/movies ('{raw_question[:60]}'). Discarding and using alternative safe workplace fallback.")
+            else:
+                if is_refusal:
+                    raw_question = format_refusal_response(raw_question)
+                return raw_question
 
-    # Diverse fallback selection ensuring no question is duplicated
-    asked_questions = {
-        item.get("text", "").lower().strip()
+    # Diverse fallback selection ensuring no question is duplicated or re-asked if refused
+    asked_normalized = {
+        normalize_question(item.get("text", ""))
         for item in state.transcript
         if item.get("role") in ("interviewer", "assistant", "agent")
     }
+    excluded_normalized = asked_normalized | refused_normalized
 
+    refused_area = get_question_behavioral_area(refused_question) if is_refusal and refused_question else ""
+
+    # 1. Unasked predefined behavioral fallback that was not refused and does not match any refused topic
+    candidate_fallbacks = list(FALLBACK_BEHAVIORAL_QUESTIONS)
+    if is_refusal and refused_area:
+        # Prioritize fallbacks from a DIFFERENT behavioral area than the refused question
+        candidate_fallbacks.sort(key=lambda fb: 1 if get_question_behavioral_area(fb) == refused_area else 0)
+
+    for fallback in candidate_fallbacks:
+        fb_norm = normalize_question(fallback)
+        if (
+            fb_norm not in excluded_normalized
+            and not is_refused_topic_repetition(fallback, refused_list)
+            and not is_unrelated_entertainment_question(fallback)
+        ):
+            return format_refusal_response(fallback) if is_refusal else fallback
+
+    # 2. Unasked safe neutral question from another behavioral dimension that was not refused
+    for safe_q in SAFE_NEUTRAL_QUESTIONS:
+        sq_norm = normalize_question(safe_q)
+        if (
+            sq_norm not in excluded_normalized
+            and not is_refused_topic_repetition(safe_q, refused_list)
+            and not is_unrelated_entertainment_question(safe_q)
+        ):
+            return format_refusal_response(safe_q) if is_refusal else safe_q
+
+    # 3. Predefined fallback asked previously, but NEVER refused and not matching any refused topic
     for fallback in FALLBACK_BEHAVIORAL_QUESTIONS:
-        if fallback.lower().strip() not in asked_questions:
-            return fallback
+        fb_norm = normalize_question(fallback)
+        if (
+            fb_norm not in refused_normalized
+            and not is_refused_topic_repetition(fallback, refused_list)
+        ):
+            return format_refusal_response(fallback) if is_refusal else fallback
 
-    return FALLBACK_BEHAVIORAL_QUESTIONS[0]
+    # 4. Safe neutral question that was NEVER refused and does not match any refused topic
+    for safe_q in SAFE_NEUTRAL_QUESTIONS:
+        sq_norm = normalize_question(safe_q)
+        if (
+            sq_norm not in refused_normalized
+            and not is_refused_topic_repetition(safe_q, refused_list)
+        ):
+            return format_refusal_response(safe_q) if is_refusal else safe_q
+
+    # Controlled no-question result: every predefined and safe fallback was refused or matches refused topics
+    print("[Agent] All fallback and safe neutral questions are excluded or match refused topics. Concluding question generation safely.")
+    return ""
 
 
 # ============================================================
@@ -809,6 +1584,11 @@ Transcript:
 Behavioral evidence:
 
 {evidence}
+
+Fairness & Assessment Rules:
+- Base evaluations solely on substantive answers and observable evidence provided by the candidate.
+- If the candidate politely declined, skipped, or requested to redirect a specific question, do NOT treat the refusal itself as evidence of poor communication, lack of teamwork, low adaptability, or weak leadership.
+- Do NOT invent or assume candidate qualifications, skills, or experiences not stated in the transcript.
 
 Evaluate these dimensions:
 
@@ -1062,6 +1842,7 @@ The interview controller will decide when to ask the next question.
                     text = " ".join(str(t) for t in text)
                 text = str(text).strip()
                 if text:
+                    print(f"[Agent Turn] on_user_turn_completed triggered ({len(text.split())} words, {len(text)} chars): '{text}'")
                     res = self._on_turn_completed_callback(text)
                     if asyncio.iscoroutine(res):
                         await res
@@ -1142,6 +1923,12 @@ async def deliver_final_result_and_sync(
     disconnect_timeout: float = 4.0,
 ) -> None:
     """Send final_result over LiveKit immediately without blocking on disk/HTTP, then persist & sync concurrently."""
+    if getattr(state, "is_finalized", False):
+        print("[Agent] Assessment already finalized; skipping duplicate delivery/sync.")
+        return
+    state.is_finalized = True
+    state.completed = True
+
     try:
         await send_event_fn(
             ctx,
@@ -1175,32 +1962,52 @@ def handle_user_input_transcribed_event(
     is_agent_speaking: bool,
     uncommitted_final_segments: list[str],
     send_ui_event_fn=None,
+    active_question: str = "",
 ) -> bool:
     """Handle a user transcript event from STT.
 
-    If speech arrives while agent is speaking, or transcript is empty, ignore it.
-    If final: record segment to uncommitted_final_segments for turn fallback.
-    If interim: dispatch candidate_interim_transcript over UI data channel without modifying
-    permanent transcript or candidate answer queue.
-    Returns True if an event was handled, False if ignored.
+    Buffers finalized segments and dispatches full accumulated interim transcript
+    so the UI candidate bubble is never truncated or replaced with a single word.
+    Safely ignores acoustic echoes of the active interviewer question during speech playback.
     """
-    if not transcript or is_agent_speaking:
+    if not transcript:
         return False
 
     transcript = transcript.strip()
     if not transcript:
         return False
 
-    print(f"USER TRANSCRIPT | final={is_final}: {transcript}")
+    # Check for acoustic echo: ignore only if agent is actively speaking AND transcript echoes the question
+    if is_agent_speaking and active_question:
+        clean_t = re.sub(r"[^\w\s]", "", transcript.lower()).strip()
+        clean_q = re.sub(r"[^\w\s]", "", active_question.lower()).strip()
+        if clean_t and clean_t in clean_q and len(clean_t.split()) >= 2:
+            print(f"[Agent Audio] Ignoring confirmed acoustic echo during interviewer speech: '{clean_t}'")
+            return False
+
+    print(
+        f"[Agent STT] Transcript event received: final={is_final}, chars={len(transcript)}, words={len(transcript.split())}"
+    )
 
     if is_final:
         uncommitted_final_segments.append(transcript)
-    else:
-        if send_ui_event_fn is not None:
+        accumulated = " ".join(s for s in uncommitted_final_segments if s).strip()
+        if send_ui_event_fn is not None and accumulated:
             send_ui_event_fn(
                 "candidate_interim_transcript",
                 {
-                    "answer": transcript,
+                    "answer": accumulated,
+                    "is_final": False,
+                },
+            )
+    else:
+        parts = [s for s in uncommitted_final_segments if s] + [transcript]
+        accumulated = " ".join(parts).strip()
+        if send_ui_event_fn is not None and accumulated:
+            send_ui_event_fn(
+                "candidate_interim_transcript",
+                {
+                    "answer": accumulated,
                     "is_final": False,
                 },
             )
@@ -1291,6 +2098,14 @@ async def drain_and_analyze_pending_answers(
         if ans_key in analyzed_answers:
             continue
         analyzed_answers.add(ans_key)
+        if (
+            is_candidate_refusal(ans_clean)
+            or is_abusive_language(ans_clean)
+            or is_personal_or_unrelated_request(ans_clean)
+            or is_off_topic_answer(ans_clean)
+            or is_clarification_request(ans_clean)
+        ):
+            continue
         if not state.candidate_introduction:
             state.candidate_introduction = ans_clean
         try:
@@ -1311,18 +2126,41 @@ async def speak_with_lock(
     manual_end_event: asyncio.Event | None = None,
     disconnect_event: asyncio.Event | None = None,
     set_speaking_state=None,
+    pause_event: asyncio.Event | None = None,
+    resume_event: asyncio.Event | None = None,
+    is_paused_fn=None,
 ) -> bool:
-    """Serialize session.say calls with speech_lock and handle End Assessment / disconnect cleanly during playback."""
+    """Serialize session.say calls with speech_lock and handle End Assessment / disconnect / pause cleanly during playback."""
     if (manual_end_event and manual_end_event.is_set()) or (
         disconnect_event and disconnect_event.is_set()
     ):
         return False
+
+    if is_paused_fn and is_paused_fn():
+        if resume_event is not None:
+            await resume_event.wait()
+            if (manual_end_event and manual_end_event.is_set()) or (
+                disconnect_event and disconnect_event.is_set()
+            ):
+                return False
+        else:
+            return False
 
     async with speech_lock:
         if (manual_end_event and manual_end_event.is_set()) or (
             disconnect_event and disconnect_event.is_set()
         ):
             return False
+
+        if is_paused_fn and is_paused_fn():
+            if resume_event is not None:
+                await resume_event.wait()
+                if (manual_end_event and manual_end_event.is_set()) or (
+                    disconnect_event and disconnect_event.is_set()
+                ):
+                    return False
+            else:
+                return False
 
         if set_speaking_state is not None:
             set_speaking_state(True)
@@ -1350,13 +2188,20 @@ async def speak_with_lock(
                 event_tasks.add(t_disc)
                 wait_set.add(t_disc)
 
+            t_pause = None
+            if pause_event is not None:
+                t_pause = asyncio.create_task(pause_event.wait())
+                event_tasks.add(t_pause)
+                wait_set.add(t_pause)
+
             done, _ = await asyncio.wait(
                 wait_set,
                 return_when=asyncio.FIRST_COMPLETED,
             )
 
             if playout_task not in done:
-                print(f"[Agent] [{stage_label}] Stopping active speech due to assessment end/disconnect.")
+                reason = "pause request" if (t_pause and t_pause in done) else "assessment end/disconnect"
+                print(f"[Agent] [{stage_label}] Stopping active speech due to {reason}.")
                 try:
                     if hasattr(handle, "interrupt"):
                         handle.interrupt(force=True)
@@ -1403,16 +2248,146 @@ async def process_interview_turn(
     analyze_fn=analyze_candidate_answer,
     generate_question_fn=generate_adaptive_question,
     send_event_fn=send_ui_event,
+    is_paused_fn=None,
+    resume_event: asyncio.Event | None = None,
 ) -> bool:
     """Analyze candidate answer, drain any continuation turns arriving during LLM generation, and ask next question if active."""
     answer = (answer or "").strip()
     if not answer:
         return True
 
-    if not state.candidate_introduction:
+    # If already ending, finished, or disconnected, reject any new question generation
+    if (
+        state.completed
+        or getattr(state, "is_finalized", False)
+        or manual_end_event.is_set()
+        or timer_finished_event.is_set()
+        or disconnect_event.is_set()
+    ):
+        return False
+
+    # If currently paused, wait until resumed before advancing turn logic
+    if is_paused_fn and is_paused_fn():
+        if resume_event is not None:
+            print("[Turn Routing] Turn processing waiting on resume_event...")
+            await resume_event.wait()
+            if (
+                state.completed
+                or getattr(state, "is_finalized", False)
+                or manual_end_event.is_set()
+                or timer_finished_event.is_set()
+                or disconnect_event.is_set()
+            ):
+                return False
+        else:
+            return False
+
+    # Precedence:
+    # 1. Candidate Ending Intent (honored even if abusive words present!)
+    # 2. Ambiguous Ending Request (asks clarification)
+    # 3. Abusive language (issues professional warning, never mirrors abuse)
+    # 4. Boundary request
+    # 5. Question refusal
+    # 6. Clarification request
+    # 7. Off-topic answer
+    # 8. Substantive answer
+    is_end = is_candidate_end_request(answer)
+    is_ambiguous = not is_end and is_ambiguous_end_request(answer)
+    is_abuse = not is_end and not is_ambiguous and is_abusive_language(answer)
+    is_boundary = not is_end and not is_ambiguous and not is_abuse and is_personal_or_unrelated_request(answer)
+    is_refusal = not is_end and not is_ambiguous and not is_abuse and not is_boundary and is_candidate_refusal(answer)
+    is_clarification = not is_end and not is_ambiguous and not is_abuse and not is_boundary and not is_refusal and is_clarification_request(answer)
+    is_off_topic = not is_end and not is_ambiguous and not is_abuse and not is_boundary and not is_refusal and not is_clarification and is_off_topic_answer(answer)
+    is_non_substantive = is_end or is_ambiguous or is_abuse or is_boundary or is_refusal or is_clarification or is_off_topic
+
+    if not state.candidate_introduction and not is_non_substantive:
         state.candidate_introduction = answer
 
-    # If warning or end condition already reached, analyze this final valid answer before stopping question generation
+    refused_question = ""
+    if is_end:
+        print(f"[Agent] Candidate interview ending intent detected: '{answer[:80]}'")
+    elif is_ambiguous:
+        print(f"[Agent] Ambiguous candidate ending intent detected: '{answer[:80]}'. Asking clarification.")
+    elif is_abuse:
+        state.abusive_language_count += 1
+        print(f"[Agent] Abusive language detected (count={state.abusive_language_count}). Issuing professional warning.")
+    elif is_boundary:
+        print("[Agent] Candidate personal/unrelated topic request detected. Setting professional boundary.")
+    elif is_refusal:
+        refused_question = get_last_interviewer_question(state)
+        if refused_question and refused_question not in state.refused_questions:
+            state.refused_questions.append(refused_question)
+        print(f"[Agent] Candidate refusal detected. Refused question: '{refused_question[:60]}'. Bypassing behavioral penalty.")
+    elif is_off_topic:
+        is_repeated_off_topic_turn = is_repeated_off_topic(state, answer)
+        state.off_topic_count += 1
+        print(f"[Agent] Off-topic answer detected (count={state.off_topic_count}, repeated={is_repeated_off_topic_turn}). Redirecting to interview topic.")
+
+    branch_name = (
+        "end" if is_end
+        else "ambiguous_end" if is_ambiguous
+        else "abuse" if is_abuse
+        else "boundary" if is_boundary
+        else "refusal" if is_refusal
+        else "clarification" if is_clarification
+        else "off_topic" if is_off_topic
+        else "substantive"
+    )
+    llm_generator_called = not (is_end or is_ambiguous or is_clarification or is_off_topic)
+    print(f"[Turn Routing] Candidate answer: '{answer[:80]}'")
+    print(
+        f"[Turn Routing] Selected branch: {branch_name} | is_off_topic={is_off_topic} "
+        f"(count={state.off_topic_count}) | LLM question generator called={llm_generator_called}"
+    )
+
+    # 1. CANDIDATE EXPLICIT ENDING INTENT
+    if is_end:
+        # Check if candidate used abusive language in this turn
+        has_abusive_words = is_abusive_language(answer)
+        if has_abusive_words:
+            state.abusive_language_count += 1
+            print("[Agent] Candidate requested to end using rude/abusive wording. Honoring end request calmly and professionally.")
+            closing_resp = "I understand. We will conclude the interview here. Thank you for your time."
+        else:
+            closing_resp = CANDIDATE_END_CLOSING_MESSAGE
+
+        if not any(item.get("role") == "candidate" and item.get("text") == answer for item in state.transcript):
+            state.add_transcript("candidate", answer)
+
+        # Notify UI of candidate-initiated intentional conclusion
+        await send_event_fn(
+            ctx,
+            "assessment_closing",
+            {
+                "reason": "candidate_requested_end",
+            },
+        )
+
+        # Speak concise closing response without insulting back
+        await speak_fn(closing_resp, "Candidate-requested interview conclusion")
+        state.add_transcript("interviewer", closing_resp)
+
+        # Set manual_end_event to stop the interview loop and proceed directly to final assessment
+        manual_end_event.set()
+        return False
+
+    # 2. AMBIGUOUS ENDING REQUEST (ask single polite clarification)
+    if is_ambiguous and not disconnect_event.is_set() and not manual_end_event.is_set():
+        if not any(item.get("role") == "candidate" and item.get("text") == answer for item in state.transcript):
+            state.add_transcript("candidate", answer)
+        await send_event_fn(
+            ctx,
+            "interview_question",
+            {
+                "question": AMBIGUOUS_END_CLARIFICATION_MESSAGE,
+                "question_number": state.questions_asked,
+            },
+        )
+        spoke_ok = await speak_fn(AMBIGUOUS_END_CLARIFICATION_MESSAGE, "Ambiguous end clarification")
+        if spoke_ok:
+            state.add_transcript("interviewer", AMBIGUOUS_END_CLARIFICATION_MESSAGE)
+        return True
+
     if (
         warning_sent
         or remaining_seconds <= WARNING_SECONDS
@@ -1421,21 +2396,74 @@ async def process_interview_turn(
     ):
         if warning_sent:
             print("Candidate finished current response after warning.")
-        if not disconnect_event.is_set():
-            await drain_and_analyze_pending_answers(
-                state,
-                user_answer_queue,
-                analyzed_answers,
-                extra_answers=[answer],
-                analyze_fn=analyze_fn,
-            )
+        if not disconnect_event.is_set() and not manual_end_event.is_set():
+            if is_abuse:
+                await speak_fn(
+                    ABUSE_WARNING_FIRST_PREFIX if state.abusive_language_count <= 1 else ABUSE_WARNING_REPEATED_PREFIX,
+                    "Abusive language warning",
+                )
+            elif is_boundary:
+                await speak_fn(
+                    PROFESSIONAL_BOUNDARY_PREFIX,
+                    "Professional boundary reminder",
+                )
+            elif is_refusal:
+                await speak_fn(
+                    "I understand, that is completely fine.",
+                    "Refusal acknowledgment",
+                )
+            elif is_off_topic:
+                prefix = OFF_TOPIC_FIRST_PREFIX if state.off_topic_count <= 1 else OFF_TOPIC_REPEATED_PREFIX
+                await speak_fn(
+                    prefix,
+                    "Off-topic redirection",
+                )
+            else:
+                await drain_and_analyze_pending_answers(
+                    state,
+                    user_answer_queue,
+                    analyzed_answers,
+                    extra_answers=[answer],
+                    analyze_fn=analyze_fn,
+                )
         return False
+
+    # Handle clarification request immediately (repeat the current question politely)
+    if is_clarification and not disconnect_event.is_set() and not manual_end_event.is_set():
+        last_q = get_last_interviewer_question(state)
+        clean_q = strip_refusal_prefix(last_q) or "Could you introduce yourself and tell me about your background?"
+        clarification_resp = f"Certainly. {clean_q}"
+        await send_event_fn(
+            ctx,
+            "interview_question",
+            {
+                "question": clarification_resp,
+                "question_number": state.questions_asked,
+            },
+        )
+        spoke_ok = await speak_fn(clarification_resp, "Clarification repeat")
+        if spoke_ok:
+            state.add_transcript("interviewer", clarification_resp.strip())
+        return True
+
+    # If paused before analyzing or generating question, wait for resume
+    if is_paused_fn and is_paused_fn():
+        if resume_event is not None:
+            await resume_event.wait()
+            if (
+                state.completed
+                or getattr(state, "is_finalized", False)
+                or manual_end_event.is_set()
+                or timer_finished_event.is_set()
+                or disconnect_event.is_set()
+            ):
+                return False
 
     question_transcript = format_transcript(state)
     question_evidence = format_evidence(state)
 
     ans_key = answer.lower()
-    should_analyze_primary = ans_key not in analyzed_answers
+    should_analyze_primary = ans_key not in analyzed_answers and not is_non_substantive
     if should_analyze_primary:
         analyzed_answers.add(ans_key)
 
@@ -1447,20 +2475,73 @@ async def process_interview_turn(
     else:
         analysis_task = asyncio.create_task(asyncio.sleep(0))
 
-    question_task = asyncio.create_task(
-        generate_question_fn(
-            state,
-            remaining_seconds,
-            current_answer=answer,
-            transcript=question_transcript,
-            evidence=question_evidence,
+    if is_off_topic:
+        print("[Turn Routing] Off-topic branch active: bypassing LLM question generator and using direct spoken redirect.")
+        # Immediate off-topic redirection: do not hallucinate about movies or stay silent
+        if not is_repeated_off_topic_turn and state.off_topic_count <= 1:
+            last_q = get_last_interviewer_question(state)
+            clean_last_q = strip_refusal_prefix(last_q)
+            if (
+                clean_last_q
+                and "introduce yourself" not in clean_last_q.lower()
+                and not is_unrelated_entertainment_question(clean_last_q)
+            ):
+                redirect_q = clean_last_q
+            else:
+                redirect_q = "Could you tell me briefly about your professional background, your role, and the projects or technologies you work with?"
+            off_topic_question = f"{OFF_TOPIC_FIRST_PREFIX} {redirect_q}"
+        else:
+            # Repeated off-topic: pivot to an unasked safe behavioral fallback to prevent looping
+            fallback_q = get_next_redirect_question(state)
+            off_topic_question = f"{OFF_TOPIC_REPEATED_PREFIX} {fallback_q}"
+        question_task = asyncio.create_task(asyncio.sleep(0, result=off_topic_question))
+    else:
+        print("[Turn Routing] Substantive/contextual branch active: invoking LLM question generator.")
+        try:
+            import inspect
+            sig = inspect.signature(generate_question_fn)
+            has_kwargs = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values())
+            accepts_refusal = "is_refusal" in sig.parameters or has_kwargs
+        except Exception:
+            accepts_refusal = True
+
+        gen_kwargs = {
+            "current_answer": answer,
+            "transcript": question_transcript,
+            "evidence": question_evidence,
+        }
+        if accepts_refusal:
+            gen_kwargs["is_refusal"] = is_refusal
+            gen_kwargs["refused_question"] = refused_question
+
+        question_task = asyncio.create_task(
+            generate_question_fn(
+                state,
+                remaining_seconds,
+                **gen_kwargs,
+            )
         )
-    )
 
     _, question = await asyncio.gather(analysis_task, question_task)
     elapsed = time.perf_counter() - start_time
     print(f"DEBUG: analysis + question generation took {elapsed:.2f} seconds")
-    print("Candidate answer analyzed.")
+    if is_abuse:
+        print("Candidate abusive language handled; skipped behavioral penalty.")
+    elif is_boundary:
+        print("Candidate personal/unrelated topic handled; skipped behavioral penalty.")
+    elif is_refusal:
+        print("Candidate refusal acknowledged; skipped behavioral penalty.")
+    elif is_off_topic:
+        print("Candidate off-topic answer handled; redirected immediately.")
+    else:
+        print("Candidate answer analyzed.")
+
+    if is_abuse and question:
+        question = format_abuse_warning_response(question, state.abusive_language_count)
+    elif is_boundary and question:
+        question = format_boundary_response(question)
+    elif is_refusal and question:
+        question = format_refusal_response(question)
 
     # Any additional speech turn that completed while LLM was generating belongs to the
     # current question, NOT the next question that hasn't been asked yet.
@@ -1472,6 +2553,19 @@ async def process_interview_turn(
             analyze_fn=analyze_fn,
         )
 
+    # If paused before asking the new question, wait until resumed
+    if is_paused_fn and is_paused_fn():
+        if resume_event is not None:
+            await resume_event.wait()
+            if (
+                state.completed
+                or getattr(state, "is_finalized", False)
+                or manual_end_event.is_set()
+                or timer_finished_event.is_set()
+                or disconnect_event.is_set()
+            ):
+                return False
+
     if (
         not question
         or warning_sent
@@ -1479,6 +2573,32 @@ async def process_interview_turn(
         or timer_finished_event.is_set()
         or disconnect_event.is_set()
     ):
+        if not question and not disconnect_event.is_set() and not manual_end_event.is_set():
+            if is_abuse:
+                await speak_fn(
+                    ABUSE_WARNING_FIRST_PREFIX if state.abusive_language_count <= 1 else ABUSE_WARNING_REPEATED_PREFIX,
+                    "Abusive language warning",
+                )
+            elif is_boundary:
+                await speak_fn(
+                    PROFESSIONAL_BOUNDARY_PREFIX,
+                    "Professional boundary reminder",
+                )
+            elif is_refusal:
+                await speak_fn(
+                    "I understand, that is completely fine.",
+                    "Refusal acknowledgment",
+                )
+            elif is_off_topic:
+                prefix = OFF_TOPIC_FIRST_PREFIX if state.off_topic_count <= 1 else OFF_TOPIC_REPEATED_PREFIX
+                await speak_fn(
+                    prefix,
+                    "Off-topic redirection",
+                )
+            else:
+                safe_fallback = get_next_redirect_question(state)
+                await speak_fn(safe_fallback, "Non-silent safe fallback")
+                state.add_transcript("interviewer", safe_fallback)
         return False
 
     state.questions_asked += 1
@@ -1501,6 +2621,11 @@ async def process_interview_turn(
         question,
         f"Adaptive question #{state.questions_asked}",
     )
+    if spoke_ok:
+        last_q = get_last_interviewer_question(state)
+        if last_q != question.strip():
+            state.add_transcript("interviewer", question.strip())
+
     if (
         not spoke_ok
         or manual_end_event.is_set()
@@ -1518,9 +2643,13 @@ async def process_interview_turn(
 
 def prewarm(proc: JobProcess):
     """Prewarm the Silero VAD model during worker startup to prevent runtime event-loop blocks."""
-    print("[Agent Worker] Prewarming Silero VAD (sample_rate=16000 Hz)...")
+    print("[Agent Worker] Prewarming Silero VAD (sample_rate=16000 Hz, min_silence=0.8s)...")
     try:
-        proc.userdata["vad"] = silero.VAD.load(sample_rate=16000)
+        proc.userdata["vad"] = silero.VAD.load(
+            sample_rate=16000,
+            min_silence_duration=0.8,
+            activation_threshold=0.5,
+        )
         print("[Agent Worker] Silero VAD prewarmed successfully.")
     except Exception as error:
         print("[Agent Worker] Silero VAD prewarm warning:", repr(error))
@@ -1564,6 +2693,23 @@ async def entrypoint(
         ctx.room.name,
     )
 
+    # Listen for audio/video track publication and subscription events
+    @ctx.room.on("track_published")
+    def on_track_published(publication, participant_obj):
+        kind_name = getattr(publication.kind, "name", str(publication.kind))
+        print(
+            f"[Agent Audio Track] Participant {participant_obj.identity} published track: "
+            f"sid={publication.sid}, kind={kind_name}"
+        )
+
+    @ctx.room.on("track_subscribed")
+    def on_track_subscribed(track, publication, participant_obj):
+        kind_name = getattr(track.kind, "name", str(track.kind))
+        print(
+            f"[Agent Audio Track] Subscribed to track from {participant_obj.identity}: "
+            f"sid={track.sid}, kind={kind_name}"
+        )
+
     # --------------------------------------------------------
     # WAIT FOR CANDIDATE
     # --------------------------------------------------------
@@ -1597,7 +2743,26 @@ async def entrypoint(
         asyncio.Event()
     )
 
+    is_paused = False
+    resume_event = asyncio.Event()
+    resume_event.set()
+    pause_event = asyncio.Event()
+
+    def _is_paused():
+        return is_paused
+
     warning_sent = False
+
+    accumulated_active_seconds = 0.0
+    last_tick_time = time.monotonic()
+
+    def get_remaining_seconds() -> int:
+        nonlocal accumulated_active_seconds, last_tick_time
+        now = time.monotonic()
+        active = accumulated_active_seconds
+        if not is_paused:
+            active += (now - last_tick_time)
+        return max(0, int(ASSESSMENT_DURATION_SECONDS - active))
 
     # --------------------------------------------------------
     # USER ANSWER QUEUE & TRACKING
@@ -1632,13 +2797,14 @@ async def entrypoint(
             candidate_disconnected.set()
 
     # --------------------------------------------------------
-    # FRONTEND DATA
+    # FRONTEND DATA (ROOM-SCOPED & VALIDATED)
     # --------------------------------------------------------
 
     @ctx.room.on(
         "data_received"
     )
     def on_data_received(packet):
+        nonlocal is_paused, accumulated_active_seconds, last_tick_time
 
         try:
 
@@ -1651,16 +2817,74 @@ async def entrypoint(
             )
 
             print(
-                "Browser data:",
+                f"[Agent Data] Room '{ctx.room.name}' received data:",
                 payload,
             )
 
-            if (
-                payload.get("type")
-                == "end_assessment"
-            ):
+            # Room-scoped validation: prevent cross-room message confusion
+            packet_room = payload.get("room")
+            if packet_room and packet_room != ctx.room.name:
+                print(
+                    f"[Agent Data] Ignored packet intended for room '{packet_room}' in room '{ctx.room.name}'"
+                )
+                return
 
+            msg_type = payload.get("type")
+
+            if msg_type == "end_assessment":
                 manual_end_requested.set()
+
+            elif msg_type == "pause_interview":
+                if not is_paused:
+                    now = time.monotonic()
+                    accumulated_active_seconds += (now - last_tick_time)
+                    last_tick_time = now
+                    is_paused = True
+                    state.is_paused = True
+                    resume_event.clear()
+                    pause_event.set()
+                    frozen_remaining = get_remaining_seconds()
+                    print(
+                        f"[Agent Data] Interview paused in room '{ctx.room.name}'. "
+                        f"Remaining time frozen at: {frozen_remaining}s"
+                    )
+                    # Immediately halt active TTS speech
+                    if hasattr(session, "interrupt"):
+                        try:
+                            session.interrupt(force=True)
+                        except Exception:
+                            pass
+                    asyncio.create_task(
+                        send_ui_event(
+                            ctx,
+                            "interview_paused",
+                            {
+                                "remaining_seconds": frozen_remaining,
+                            },
+                        )
+                    )
+
+            elif msg_type == "resume_interview":
+                if is_paused:
+                    last_tick_time = time.monotonic()
+                    is_paused = False
+                    state.is_paused = False
+                    pause_event.clear()
+                    resume_event.set()
+                    current_remaining = get_remaining_seconds()
+                    print(
+                        f"[Agent Data] Interview resumed in room '{ctx.room.name}'. "
+                        f"Remaining time: {current_remaining}s"
+                    )
+                    asyncio.create_task(
+                        send_ui_event(
+                            ctx,
+                            "interview_resumed",
+                            {
+                                "remaining_seconds": current_remaining,
+                            },
+                        )
+                    )
 
         except Exception as error:
 
@@ -1676,12 +2900,17 @@ async def entrypoint(
     vad = ctx.proc.userdata.get("vad") if hasattr(ctx, "proc") and hasattr(ctx.proc, "userdata") else None
     if vad is None:
         print(
-            "[Agent] [Stage 3/5] Loading Silero VAD in background worker thread (sample_rate=16000 Hz)..."
+            "[Agent] [Stage 3/5] Loading Silero VAD in background worker thread (sample_rate=16000 Hz, min_silence=0.8s)..."
         )
-        vad = await asyncio.to_thread(silero.VAD.load, sample_rate=16000)
+        vad = await asyncio.to_thread(
+            silero.VAD.load,
+            sample_rate=16000,
+            min_silence_duration=0.8,
+            activation_threshold=0.5,
+        )
     else:
         print(
-            "[Agent] [Stage 3/5] Using prewarmed Silero VAD (sample_rate=16000 Hz)."
+            "[Agent] [Stage 3/5] Using prewarmed Silero VAD (sample_rate=16000 Hz, min_silence=0.8s)."
         )
 
     print(
@@ -1703,14 +2932,31 @@ async def entrypoint(
             stage_label=stage_label,
             manual_end_event=manual_end_requested,
             disconnect_event=candidate_disconnected,
+            pause_event=pause_event,
+            resume_event=resume_event,
+            is_paused_fn=_is_paused,
             set_speaking_state=_set_speaking_state if track_speaking_state else None,
         )
 
     async def handle_completed_candidate_turn(answer_text: str):
         if is_agent_speaking:
-            print(f"[Agent] Ignoring speech detected while interviewer was speaking (acoustic echo): {answer_text[:50]}")
-            return
+            active_q = get_last_interviewer_question(state)
+            clean_t = re.sub(r"[^\w\s]", "", (answer_text or "").lower()).strip()
+            clean_q = re.sub(r"[^\w\s]", "", active_q.lower()).strip()
+            if clean_t and clean_t in clean_q and len(clean_t.split()) >= 2:
+                print(f"[Agent Audio] Ignoring speech detected while interviewer was speaking (confirmed acoustic echo): {answer_text[:50]}")
+                return
+            print(f"[Agent Audio] Candidate speech detected during playback (not an echo): {answer_text[:50]}")
+
         answer_clean = (answer_text or "").strip()
+        accumulated_segments = " ".join(s for s in uncommitted_final_segments if s).strip()
+        if accumulated_segments and len(accumulated_segments.split()) > len(answer_clean.split()):
+            print(
+                f"[Agent Audio] Consolidating turn using accumulated final segments "
+                f"({len(accumulated_segments.split())} words vs {len(answer_clean.split())} words)"
+            )
+            answer_clean = accumulated_segments
+
         if not answer_clean:
             return
         uncommitted_final_segments.clear()
@@ -1719,7 +2965,13 @@ async def entrypoint(
             return
         processed_transcripts.add(answer_key)
         state.add_transcript("candidate", answer_clean)
-        if not state.candidate_introduction:
+        if not state.candidate_introduction and not (
+            is_abusive_language(answer_clean)
+            or is_personal_or_unrelated_request(answer_clean)
+            or is_candidate_refusal(answer_clean)
+            or is_clarification_request(answer_clean)
+            or is_off_topic_answer(answer_clean)
+        ):
             state.candidate_introduction = answer_clean
         await send_ui_event(
             ctx,
@@ -1753,8 +3005,8 @@ async def entrypoint(
 
         turn_handling={
             "endpointing": {
-                "min_delay": 1.2,
-                "max_delay": 3.0,
+                "min_delay": 2.2,
+                "max_delay": 5.0,
             },
             "interruption": {
                 "enabled": False,
@@ -1812,6 +3064,7 @@ async def entrypoint(
                 send_ui_event_fn=lambda event_type, data: asyncio.create_task(
                     send_ui_event(ctx, event_type, data)
                 ),
+                active_question=get_last_interviewer_question(state),
             )
 
         except Exception as error:
@@ -1895,6 +3148,10 @@ async def entrypoint(
         agent=BehavioralInterviewAgent(
             on_turn_completed_callback=handle_completed_candidate_turn
         ),
+        room_options=room_io.RoomOptions(
+            participant_identity=participant.identity,
+            video_input=False,
+        ),
     )
 
     published_tracks = [
@@ -1949,6 +3206,9 @@ async def entrypoint(
         "Stage 5/5 Opening speech",
     )
 
+    if not any(item.get("text") == opening_question for item in state.transcript):
+        state.add_transcript("interviewer", opening_question)
+
     # --------------------------------------------------------
     # ASSESSMENT CLOCK
     # --------------------------------------------------------
@@ -1962,97 +3222,81 @@ async def entrypoint(
     )
 
     async def assessment_clock():
+        nonlocal warning_sent, accumulated_active_seconds, last_tick_time
+        last_tick_time = time.monotonic()
 
-        nonlocal warning_sent
+        while accumulated_active_seconds < ASSESSMENT_DURATION_SECONDS:
+            if (
+                candidate_disconnected.is_set()
+                or manual_end_requested.is_set()
+            ):
+                return
 
-        warning_at = (
-            assessment_start_time
-            + WARNING_DELAY_SECONDS
-        )
+            await asyncio.sleep(0.5)
 
-        remaining = (
-            warning_at
-            - time.monotonic()
-        )
+            now = time.monotonic()
+            delta = now - last_tick_time
+            last_tick_time = now
 
-        if remaining > 0:
+            if not is_paused:
+                accumulated_active_seconds += delta
 
-            await asyncio.sleep(
-                remaining
-            )
+            rem = ASSESSMENT_DURATION_SECONDS - accumulated_active_seconds
 
-        if (
-            candidate_disconnected.is_set()
-            or manual_end_requested.is_set()
-        ):
-            return
+            if not warning_sent and rem <= WARNING_SECONDS:
+                warning_sent = True
 
-        warning_sent = True
+                print(
+                    f"{WARNING_SECONDS} seconds remaining."
+                )
 
-        print(
-            f"{WARNING_SECONDS} seconds remaining."
-        )
+                await send_ui_event(
+                    ctx,
+                    "assessment_warning",
+                    {
+                        "seconds_remaining": max(1, int(rem)),
+                    },
+                )
 
-        await send_ui_event(
-            ctx,
-            "assessment_warning",
-            {
-                "seconds_remaining":
-                    WARNING_SECONDS,
-            },
-        )
+                # Wait briefly if the candidate is actively speaking so the warning does not
+                # interrupt or discard their active answer.
+                while (
+                    not candidate_disconnected.is_set()
+                    and not manual_end_requested.is_set()
+                    and not is_paused
+                    and (ASSESSMENT_DURATION_SECONDS - accumulated_active_seconds) > 3.0
+                    and (
+                        getattr(session, "user_state", None) == "speaking"
+                        or bool(uncommitted_final_segments)
+                    )
+                ):
+                    await asyncio.sleep(0.2)
 
-        # Wait briefly if the candidate is actively speaking so the warning does not
-        # interrupt or discard their active answer.
-        while (
-            not candidate_disconnected.is_set()
-            and not manual_end_requested.is_set()
-            and time.monotonic() < deadline_at - 3.0
-            and (
-                getattr(session, "user_state", None) == "speaking"
-                or bool(uncommitted_final_segments)
-            )
-        ):
-            await asyncio.sleep(0.2)
+                if (
+                    not candidate_disconnected.is_set()
+                    and not manual_end_requested.is_set()
+                    and not is_paused
+                    and (ASSESSMENT_DURATION_SECONDS - accumulated_active_seconds) > 2.0
+                ):
+                    warning_message = (
+                        "Thank you for sharing your responses. "
+                        f"We have about {WARNING_SECONDS} seconds remaining in the assessment. "
+                        "Please finish your current response. "
+                        "I won't start another question. "
+                        "Once you're finished, we'll conclude the interview. "
+                        "Thank you for your time."
+                    )
 
-        if (
-            not candidate_disconnected.is_set()
-            and not manual_end_requested.is_set()
-            and time.monotonic() < deadline_at - 2.0
-        ):
-            warning_message = (
-                "Thank you for sharing your responses. "
-                f"We have about {WARNING_SECONDS} seconds remaining in the assessment. "
-                "Please finish your current response. "
-                "I won't start another question. "
-                "Once you're finished, we'll conclude the interview. "
-                "Thank you for your time."
-            )
-
-            # Do not set is_agent_speaking=True during warning so a candidate finishing
-            # their response is never ignored.
-            await speak_safely(
-                warning_message,
-                "Assessment warning",
-                track_speaking_state=False,
-            )
-
-        final_wait = (
-            deadline_at
-            - time.monotonic()
-        )
-
-        if final_wait > 0:
-
-            await asyncio.sleep(
-                final_wait
-            )
+                    # Do not set is_agent_speaking=True during warning so a candidate finishing
+                    # their response is never ignored.
+                    await speak_safely(
+                        warning_message,
+                        "Assessment warning",
+                        track_speaking_state=False,
+                    )
 
         timer_finished.set()
-
-        print(
-            "Assessment time reached zero."
-        )
+        print("Assessment time reached zero.")
 
     clock_task = asyncio.create_task(
         assessment_clock()
@@ -2076,8 +3320,19 @@ async def entrypoint(
             ):
                 break
 
+            if is_paused:
+                print("[Agent] Session paused. Waiting for resume...")
+                await resume_event.wait()
+                if (
+                    candidate_disconnected.is_set()
+                    or manual_end_requested.is_set()
+                    or timer_finished.is_set()
+                ):
+                    break
+                print("[Agent] Session resumed.")
+
             # ----------------------------------------------
-            # WAIT FOR CANDIDATE ANSWER
+            # WAIT FOR CANDIDATE ANSWER OR EVENTS
             # ----------------------------------------------
 
             answer_task = asyncio.create_task(
@@ -2096,12 +3351,17 @@ async def entrypoint(
                 timer_finished.wait()
             )
 
+            pause_task = asyncio.create_task(
+                pause_event.wait()
+            )
+
             done, pending = await asyncio.wait(
                 {
                     answer_task,
                     disconnect_task,
                     manual_task,
                     timer_task,
+                    pause_task,
                 },
                 return_when=asyncio.FIRST_COMPLETED,
             )
@@ -2120,6 +3380,34 @@ async def entrypoint(
                     *pending_event_tasks,
                     return_exceptions=True,
                 )
+
+            if pause_task in done:
+                # Pause occurred while waiting for candidate answer
+                if answer_task in done:
+                    try:
+                        ans_val = answer_task.result()
+                        if isinstance(ans_val, str) and ans_val.strip():
+                            user_answer_queue.put_nowait(ans_val.strip())
+                    except Exception:
+                        pass
+                else:
+                    answer_task.cancel()
+                    try:
+                        ans_val = await answer_task
+                        if isinstance(ans_val, str) and ans_val.strip():
+                            user_answer_queue.put_nowait(ans_val.strip())
+                    except (asyncio.CancelledError, Exception):
+                        pass
+                answer_task = None
+                print("[Agent] Waiting for resume after pause...")
+                await resume_event.wait()
+                if (
+                    candidate_disconnected.is_set()
+                    or manual_end_requested.is_set()
+                    or timer_finished.is_set()
+                ):
+                    break
+                continue
 
             answer = None
             if answer_task in done:
@@ -2151,17 +3439,46 @@ async def entrypoint(
 
             answer = answer.strip()
 
+            # Turn consolidation debounce: if the candidate answer is short (< 4 words)
+            # or the candidate is still actively speaking, wait up to 1.2s for additional speech segments
+            # to consolidate instead of cutting off thoughts prematurely.
+            consolidated_answer = answer
+            try:
+                while not user_answer_queue.empty():
+                    next_chunk = user_answer_queue.get_nowait()
+                    if next_chunk and next_chunk.strip():
+                        if not consolidated_answer.lower().endswith(next_chunk.strip().lower()):
+                            consolidated_answer = f"{consolidated_answer} {next_chunk.strip()}"
+
+                if len(consolidated_answer.split()) < 4 or getattr(session, "user_state", None) == "speaking":
+                    try:
+                        next_chunk = await asyncio.wait_for(user_answer_queue.get(), timeout=1.2)
+                        if next_chunk and next_chunk.strip():
+                            if not consolidated_answer.lower().endswith(next_chunk.strip().lower()):
+                                consolidated_answer = f"{consolidated_answer} {next_chunk.strip()}"
+                    except asyncio.TimeoutError:
+                        pass
+            except Exception as e:
+                print(f"[Agent Debounce] Debounce consolidation note: {e}")
+
+            answer = consolidated_answer.strip()
+            if not state.candidate_introduction or len(state.candidate_introduction.split()) < len(answer.split()):
+                if not (
+                    is_abusive_language(answer)
+                    or is_personal_or_unrelated_request(answer)
+                    or is_candidate_refusal(answer)
+                    or is_clarification_request(answer)
+                    or is_off_topic_answer(answer)
+                ):
+                    state.candidate_introduction = answer
+
             print()
             print("============================================")
             print("CANDIDATE ANSWER RECEIVED")
             print(answer)
             print("============================================")
 
-            elapsed = time.monotonic() - assessment_start_time
-            remaining_seconds = max(
-                1,
-                int(ASSESSMENT_DURATION_SECONDS - elapsed),
-            )
+            remaining_seconds = get_remaining_seconds()
 
             should_continue = await process_interview_turn(
                 ctx=ctx,
@@ -2175,6 +3492,8 @@ async def entrypoint(
                 timer_finished_event=timer_finished,
                 disconnect_event=candidate_disconnected,
                 speak_fn=speak_safely,
+                is_paused_fn=_is_paused,
+                resume_event=resume_event,
             )
             if not should_continue:
                 break
@@ -2398,4 +3717,4 @@ if __name__ == "__main__":
             initialize_process_timeout=60.0,
             job_executor_type=JobExecutorType.THREAD,
         )
-    )
+    )

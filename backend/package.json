@@ -4,8 +4,8 @@
   "description": "",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js",
-    "test": "node test.js"
+    "start": "node --use-system-ca server.js",
+    "test": "node --use-system-ca test.js"
   },
   "keywords": [],
   "author": "",

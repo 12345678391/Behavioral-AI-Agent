@@ -274,11 +274,20 @@ export async function joinRoom(
 
       try {
         await room.localParticipant.setMicrophoneEnabled(
-          true
+          true,
+          {
+            echoCancellation: true,
+            noiseSuppression: true,
+            autoGainControl: true,
+          }
         );
 
+        const micTrackPub = Array.from(
+          room.localParticipant.trackPublications.values()
+        ).find((pub) => pub.kind === Track.Kind.Audio);
+
         console.log(
-          "[LiveKit] Microphone publication completed successfully."
+          `[LiveKit Microphone] Candidate mic published successfully. sid=${micTrackPub?.trackSid || "active"}, muted=${micTrackPub?.isMuted || false}`
         );
       } catch (error) {
         const isCancelled =
@@ -297,6 +306,26 @@ export async function joinRoom(
 
           if (onMicrophoneError) {
             onMicrophoneError(error);
+          }
+        }
+      }
+
+      if (typeof room.localParticipant?.setCameraEnabled === "function") {
+        try {
+          console.log("[LiveKit] Candidate camera publication started...");
+          await room.localParticipant.setCameraEnabled(true);
+          console.log("[LiveKit] Candidate camera publication completed successfully.");
+        } catch (camError) {
+          const isCancelled =
+            camError?.message?.includes("Cancelled publication") ||
+            room.state === "disconnected";
+          if (isCancelled) {
+            console.log("[LiveKit] Camera publication cancelled.");
+          } else {
+            console.warn(
+              "[LiveKit] Camera publication notice (room recording will proceed with audio-only if camera is unavailable):",
+              camError?.message || camError
+            );
           }
         }
       }
@@ -382,4 +411,44 @@ export async function joinRoom(
   }
 
   return room;
+}
+
+export async function pauseRoomAudio(room) {
+  if (room?.localParticipant && typeof room.localParticipant.setMicrophoneEnabled === "function") {
+    try {
+      await room.localParticipant.setMicrophoneEnabled(false);
+      console.log("[LiveKit Audio] Local participant microphone disabled on pause.");
+    } catch (e) {
+      console.warn("[LiveKit Audio] Error muting microphone during pause:", e);
+    }
+  }
+
+  const elements = document.querySelectorAll("[data-livekit-track-sid]");
+  elements.forEach((el) => {
+    try {
+      el.pause();
+    } catch (e) {
+      console.warn("[LiveKit Audio] Error pausing audio element:", e);
+    }
+  });
+}
+
+export async function resumeRoomAudio(room) {
+  if (room?.localParticipant && typeof room.localParticipant.setMicrophoneEnabled === "function") {
+    try {
+      await room.localParticipant.setMicrophoneEnabled(true);
+      console.log("[LiveKit Audio] Local participant microphone re-enabled on resume.");
+    } catch (e) {
+      console.warn("[LiveKit Audio] Error unmuting microphone during resume:", e);
+    }
+  }
+
+  const elements = document.querySelectorAll("[data-livekit-track-sid]");
+  elements.forEach((el) => {
+    try {
+      el.play().catch(() => {});
+    } catch (e) {
+      console.warn("[LiveKit Audio] Error resuming audio element playout:", e);
+    }
+  });
 }

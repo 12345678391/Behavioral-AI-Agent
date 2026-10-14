@@ -359,6 +359,186 @@ const server = app.listen(0, async () => {
       failures++;
     }
 
+    // ============================================================
+    // RECORDING INTEGRATION TESTS
+    // ============================================================
+    const recording = require("./recording");
+
+    // Test 23: Invalid room rejected with 400 on recording endpoints
+    const badStartRes = await fetch(`http://localhost:${port}/api/recording/start`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ room: "bad room!@#" }),
+    });
+    const badStopRes = await fetch(`http://localhost:${port}/api/recording/stop`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ room: "bad room!@#" }),
+    });
+    const badStatusRes = await fetch(`http://localhost:${port}/api/recording/status?room=bad%20room!`);
+
+    if (badStartRes.status === 400 && badStopRes.status === 400 && badStatusRes.status === 400) {
+      console.log("PASS: Invalid room rejected with 400 across all recording endpoints");
+    } else {
+      console.error("FAIL: Invalid room validation failed", badStartRes.status, badStopRes.status, badStatusRes.status);
+      failures++;
+    }
+
+    // Test 24: Recording start handles missing storage credentials gracefully
+    recording.resetRecordingSessionsForTest();
+    const noStorageRes = await fetch(`http://localhost:${port}/api/recording/start`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ room: "test-room-no-storage" }),
+    });
+    const noStorageData = await noStorageRes.json();
+    if (noStorageData.status === "failed" && noStorageData.error && noStorageData.error.includes("storage")) {
+      console.log("PASS: Recording start handles missing storage configuration gracefully");
+    } else {
+      console.error("FAIL: Missing storage handling test failed", noStorageData);
+      failures++;
+    }
+
+    // Test 25: Mock Egress client start, stop, and status retrieval
+    const mockClient = {
+      startRoomCompositeEgress: async (room, output, opts) => {
+        return { egressId: "egress-test-abc", status: 1 };
+      },
+      stopEgress: async (egressId) => {
+        return {
+          egressId,
+          status: 3, // EGRESS_COMPLETE
+          fileResults: [{ location: "https://my-bucket.s3.us-east-1.amazonaws.com/recordings/test.mp4" }],
+        };
+      },
+      listEgress: async (req) => {
+        return [{
+          egressId: "egress-test-abc",
+          status: 3,
+          fileResults: [{ location: "https://my-bucket.s3.us-east-1.amazonaws.com/recordings/test.mp4" }],
+        }];
+      },
+    };
+
+    process.env.S3_KEY_ID = "test-key";
+    process.env.S3_KEY_SECRET = "test-secret-never-expose";
+    process.env.S3_BUCKET = "my-bucket";
+    process.env.S3_REGION = "us-east-1";
+
+    recording.setEgressClientForTest(mockClient);
+
+    const testRoom = "test-room-rec-123";
+    const startRes = await fetch(`http://localhost:${port}/api/recording/start`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ room: testRoom }),
+    });
+    const startData = await startRes.json();
+
+    if (startData.success === true && startData.status === "active" && startData.egressId === "egress-test-abc") {
+      console.log("PASS: Server-side recording start succeeds with mock EgressClient");
+    } else {
+      console.error("FAIL: Recording start with mock client failed", startData);
+      failures++;
+    }
+
+    // Test 26: Secrets are NEVER exposed in responses or state
+    const serializedStart = JSON.stringify(startData);
+    if (!serializedStart.includes("test-secret-never-expose") && !serializedStart.includes("mock_secret")) {
+      console.log("PASS: LiveKit credentials and storage secrets are strictly preserved server-side");
+    } else {
+      console.error("FAIL: Secret exposure detected in startData", serializedStart);
+      failures++;
+    }
+
+    // Test 27: Recording stop and status query
+    const stopRes = await fetch(`http://localhost:${port}/api/recording/stop`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ room: testRoom }),
+    });
+    const stopData = await stopRes.json();
+
+    const statusRes = await fetch(`http://localhost:${port}/api/recording/status?room=${testRoom}`);
+    const statusData = await statusRes.json();
+
+    if (
+      statusData.success === true &&
+      statusData.status === "completed" &&
+      statusData.videoUrl === "https://my-bucket.s3.us-east-1.amazonaws.com/recordings/test.mp4"
+    ) {
+      console.log("PASS: Recording status returns completed with verified playback URL:", statusData.videoUrl);
+    } else {
+      console.error("FAIL: Recording status query failed", { stopData, statusData });
+      failures++;
+    }
+
+    // Test 28: Verify web/server.cjs (port 3001 target) mounts recording & token endpoints at both / and /api
+    const { app: webApp } = require("../web/server.cjs");
+    const webServer = webApp.listen(0);
+    const webPort = webServer.address().port;
+
+    const webHealth = await fetch(`http://localhost:${webPort}/health`);
+    const webHealthData = await webHealth.json();
+    const webTokenRoot = await fetch(`http://localhost:${webPort}/token?identity=web-root-test`);
+    const webTokenApi = await fetch(`http://localhost:${webPort}/api/token?identity=web-api-test`);
+    const webRecStartRoot = await fetch(`http://localhost:${webPort}/recording/start`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ room: "web-test-room" }),
+    });
+    const webRecStartApi = await fetch(`http://localhost:${webPort}/api/recording/start`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ room: "web-test-room-2" }),
+    });
+
+    if (
+      webHealth.status === 200 &&
+      webHealthData.status === "ok" &&
+      webTokenRoot.status === 200 &&
+      webTokenApi.status === 200 &&
+      webRecStartRoot.status === 200 &&
+      webRecStartApi.status === 200
+    ) {
+      console.log("PASS: web/server.cjs successfully mounts token and recording routes at / and /api");
+    } else {
+      console.error("FAIL: web/server.cjs route verification failed", {
+        health: webHealth.status,
+        tokenRoot: webTokenRoot.status,
+        tokenApi: webTokenApi.status,
+        recRoot: webRecStartRoot.status,
+        recApi: webRecStartApi.status,
+      });
+      failures++;
+    }
+
+    await new Promise((resolve) => webServer.close(resolve));
+
+    // Test 29: LiveKit Egress without valid egressId fails without fabricating fake ID
+    const failingClient = {
+      startRoomCompositeEgress: async () => ({ egressId: null }),
+    };
+    recording.setEgressClientForTest(failingClient);
+    const failRes = await fetch(`http://localhost:${port}/api/recording/start`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ room: "test-room-no-fake-id" }),
+    });
+    const failData = await failRes.json();
+    if (failData.success === false && failData.status === "failed" && !failData.egressId) {
+      console.log("PASS: Egress start fails safely without generating fabricated egress ID");
+    } else {
+      console.error("FAIL: Egress start should have rejected missing egressId", failData);
+      failures++;
+    }
+
+    // Clean up test env vars and reset client
+    delete process.env.S3_KEY_ID;
+    delete process.env.S3_KEY_SECRET;
+    delete process.env.S3_BUCKET;
+    recording.resetRecordingSessionsForTest();
+
   } catch (err) {
     console.error("Test execution error:", err);
     failures++;

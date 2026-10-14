@@ -7,19 +7,7 @@ const API_BASE_URL = (
     : "http://localhost:3001")
 ).replace(/\/+$/, "");
 
-async function requestJson(url, fallbackMessage) {
-  let response;
-
-  try {
-    response = await fetch(url);
-  } catch (networkError) {
-    throw new Error(
-      `Failed to connect to backend at ${url}. ${
-        networkError.message || ""
-      }`
-    );
-  }
-
+async function parseResponse(response, fallbackMessage) {
   if (!response.ok) {
     let message = `${fallbackMessage} (HTTP ${response.status}).`;
     let responseBody = null;
@@ -43,6 +31,42 @@ async function requestJson(url, fallbackMessage) {
   return response.json();
 }
 
+async function fetchWithFallback(endpointPath, options, fallbackMessage) {
+  const baseUrl = requireApiBaseUrl();
+  const normalizedPath = endpointPath.startsWith("/") ? endpointPath : `/${endpointPath}`;
+  const primaryUrl = `${baseUrl}${normalizedPath}`;
+
+  let response;
+  try {
+    response = await fetch(primaryUrl, options);
+  } catch (networkError) {
+    throw new Error(
+      `Failed to connect to backend at ${primaryUrl}. ${
+        networkError.message || ""
+      }`
+    );
+  }
+
+  // If 404 and baseUrl does not already contain /api and path does not start with /api, try /api prefix
+  if (
+    response.status === 404 &&
+    !baseUrl.endsWith("/api") &&
+    !normalizedPath.startsWith("/api/")
+  ) {
+    const fallbackUrl = `${baseUrl}/api${normalizedPath}`;
+    try {
+      const fallbackResponse = await fetch(fallbackUrl, options);
+      if (fallbackResponse.status !== 404) {
+        return parseResponse(fallbackResponse, fallbackMessage);
+      }
+    } catch {
+      // Ignore network errors on fallback and proceed with primary response
+    }
+  }
+
+  return parseResponse(response, fallbackMessage);
+}
+
 function requireApiBaseUrl() {
   if (!API_BASE_URL) {
     throw new Error(
@@ -54,7 +78,6 @@ function requireApiBaseUrl() {
 }
 
 export async function getToken(identity = "candidate", room) {
-  const baseUrl = requireApiBaseUrl();
   const params = new URLSearchParams();
 
   if (identity) {
@@ -66,11 +89,9 @@ export async function getToken(identity = "candidate", room) {
   }
 
   const queryString = params.toString();
-  const url = `${baseUrl}/token${
-    queryString ? `?${queryString}` : ""
-  }`;
+  const path = `/token${queryString ? `?${queryString}` : ""}`;
 
-  return requestJson(url, "Failed to get LiveKit token");
+  return fetchWithFallback(path, undefined, "Failed to get LiveKit token");
 }
 
 export async function getAssessmentResult(assessmentId) {
@@ -78,10 +99,53 @@ export async function getAssessmentResult(assessmentId) {
     throw new Error("Assessment ID is required.");
   }
 
-  const baseUrl = requireApiBaseUrl();
-  const url = `${baseUrl}/assessment-result?assessmentId=${encodeURIComponent(
+  const path = `/assessment-result?assessmentId=${encodeURIComponent(
     assessmentId
   )}`;
 
-  return requestJson(url, "Assessment result is not ready yet");
+  return fetchWithFallback(path, undefined, "Assessment result is not ready yet");
+}
+
+export async function startRecording(room) {
+  if (!room) {
+    throw new Error("Room name is required to start recording.");
+  }
+
+  return fetchWithFallback(
+    "/recording/start",
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ room }),
+    },
+    "Failed to start recording"
+  );
+}
+
+export async function stopRecording(room) {
+  if (!room) {
+    throw new Error("Room name is required to stop recording.");
+  }
+
+  return fetchWithFallback(
+    "/recording/stop",
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ room }),
+    },
+    "Failed to stop recording"
+  );
+}
+
+export async function getRecordingStatus(room) {
+  if (!room) {
+    throw new Error("Room name is required to check recording status.");
+  }
+
+  return fetchWithFallback(
+    `/recording/status?room=${encodeURIComponent(room)}`,
+    undefined,
+    "Recording status is not available yet"
+  );
 }

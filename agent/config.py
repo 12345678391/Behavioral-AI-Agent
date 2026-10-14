@@ -58,8 +58,9 @@ Leadership
 Problem Solving
 
 Base the analysis only on evidence present in the candidate's responses.
-Do not invent evidence.
+Do not invent evidence or assume qualifications not stated in the transcript.
 Do not make hiring decisions.
+If the candidate politely declined or requested to skip a question, do not treat the refusal itself as negative evidence.
 
 Keep the written assessment concise and professional.
 """

@@ -1,12 +1,13 @@
 const express = require("express");
-const { AccessToken } = require("livekit-server-sdk");
 const cors = require("cors");
-const fs = require("fs");
 const path = require("path");
 require("dotenv").config({ path: path.join(__dirname, ".env") });
 require("dotenv").config({ path: path.join(__dirname, "..", ".env") });
 
+const routes = require("../backend/routes");
+
 const app = express();
+const PORT = process.env.PORT || 3001;
 
 const DEFAULT_ALLOWED_ORIGINS = [
   "https://behavioral-ai-agent-src.vercel.app",
@@ -75,8 +76,11 @@ const corsOptions = {
 };
 
 app.use(cors(corsOptions));
-
 app.use(express.json());
+
+// Mount shared routes at both /api and / for compatibility with all frontend configs
+app.use("/api", routes);
+app.use("/", routes);
 
 // ---------------------------------------------------------
 // HEALTH CHECK
@@ -84,128 +88,27 @@ app.use(express.json());
 app.get(["/health", "/api/health"], (req, res) => {
   res.json({
     status: "ok",
-    message: "Token + Assessment API running on http://localhost:3001",
+    message: `Token + Assessment + Recording API running on http://localhost:${PORT}`,
   });
 });
 
-// ---------------------------------------------------------
-// LIVEKIT TOKEN
-// ---------------------------------------------------------
-app.get(["/token", "/api/token"], async (req, res) => {
-  try {
-    const rawRoom = req.query.room;
-    const room =
-      rawRoom ||
-      `behavior-room-${Date.now()}-${Math.random().toString(36).substring(2, 8)}`;
-
-    // Create a unique participant identity for each request.
-    const identity = req.query.identity || `web-user-${Date.now()}`;
-
-    const apiKey = (process.env.LIVEKIT_API_KEY || "")
-      .trim()
-      .replace(/\r?\n/g, "")
-      .replace(/^["']|["']$/g, "");
-    const apiSecret = (process.env.LIVEKIT_API_SECRET || "")
-      .trim()
-      .replace(/\r?\n/g, "")
-      .replace(/^["']|["']$/g, "");
-
-    const token = new AccessToken(
-      apiKey,
-      apiSecret,
-      {
-        identity,
-      }
-    );
-
-    token.addGrant({
-      roomJoin: true,
-      room,
-      canPublish: true,
-      canSubscribe: true,
-    });
-
-    // Wake up the Python agent service on Render in the background if asleep on free tier
-    const agentUrl = process.env.AGENT_URL || "https://behavioral-agent.onrender.com";
-    if (agentUrl && typeof fetch === "function") {
-      fetch(`${agentUrl.replace(/\/+$/, "")}/health`).catch(() => {});
-    }
-
-    res.json({
-      token: await token.toJwt(),
-      room,
-      serverUrl: process.env.LIVEKIT_URL,
-    });
-
-  } catch (error) {
-    console.error("Token generation failed:", error);
-
-    res.status(500).json({
-      error: "Failed to generate LiveKit token",
-    });
+// Error handler for CORS and general errors
+app.use((err, req, res, next) => {
+  if (err && err.message === "CORS request blocked by policy.") {
+    return res.status(403).json({ error: "CORS request blocked by policy." });
   }
+  next(err);
 });
-
-
-// ---------------------------------------------------------
-// ASSESSMENT RESULT
-// ---------------------------------------------------------
-
-app.get(["/assessment-result", "/api/assessment-result"], (req, res) => {
-  try {
-    const assessmentId = req.query.assessmentId;
-    let resultPath;
-
-    if (assessmentId) {
-      const safeId = assessmentId.replace(/[^a-zA-Z0-9_-]/g, "_");
-      resultPath = path.join(
-        __dirname,
-        "..",
-        "agent",
-        "assessments",
-        `${safeId}.json`
-      );
-    } else {
-      resultPath = path.join(
-        __dirname,
-        "..",
-        "agent",
-        "assessment_result.json"
-      );
-    }
-
-    if (!fs.existsSync(resultPath)) {
-      return res.status(404).json({
-        error: "Assessment result not found",
-      });
-    }
-
-    const result = fs.readFileSync(
-      resultPath,
-      "utf-8"
-    );
-
-    res.json(JSON.parse(result));
-
-  } catch (error) {
-    console.error(
-      "Failed to read assessment result:",
-      error
-    );
-
-    res.status(500).json({
-      error: "Failed to read assessment result",
-    });
-  }
-});
-
 
 // ---------------------------------------------------------
 // SERVER
 // ---------------------------------------------------------
+if (require.main === module) {
+  app.listen(PORT, () => {
+    console.log(
+      `Token + Assessment + Recording API running on http://localhost:${PORT}`
+    );
+  });
+}
 
-app.listen(3001, () => {
-  console.log(
-    "Token + Assessment API running on http://localhost:3001"
-  );
-});
+module.exports = { app, isOriginAllowed };

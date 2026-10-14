@@ -1,6 +1,13 @@
-import { useEffect, useState, useRef } from "react";
-import { getToken, getAssessmentResult } from "./api";
-import { joinRoom } from "./LiveKitRoom";
+import { useEffect, useState, useRef, useCallback } from "react";
+import {
+  getToken,
+  getAssessmentResult,
+  startRecording,
+  stopRecording,
+  getRecordingStatus,
+} from "./api";
+import { joinRoom, pauseRoomAudio, resumeRoomAudio } from "./LiveKitRoom";
+import CameraPreview from "./CameraPreview";
 import {
   INTERVIEW_DURATION_SECONDS,
   WARNING_SECONDS,
@@ -60,6 +67,11 @@ function App() {
   const [isConnecting, setIsConnecting] = useState(false);
   const [retryingReport, setRetryingReport] = useState(false);
 
+  const [isPaused, setIsPaused] = useState(false);
+  const isPausedRef = useRef(false);
+  const [isTransitioning, setIsTransitioning] = useState(false);
+  const isTransitioningRef = useRef(false);
+
   const [connected, setConnected] =
     useState(false);
 
@@ -91,6 +103,103 @@ function App() {
 
   const [audioBlocked, setAudioBlocked] =
     useState(false);
+
+  const [recordingStatus, setRecordingStatus] = useState("idle"); // 'idle' | 'starting' | 'active' | 'finalizing' | 'completed' | 'failed' | 'unavailable'
+  const [recordingVideoUrl, setRecordingVideoUrl] = useState(null);
+  const [recordingError, setRecordingError] = useState("");
+  const recordingPollingRef = useRef(null);
+  const recordingStartedRoomRef = useRef(null);
+  const recordingStoppedRoomRef = useRef(null);
+
+  const clearRecordingPolling = useCallback(() => {
+    if (recordingPollingRef.current) {
+      clearInterval(recordingPollingRef.current);
+      recordingPollingRef.current = null;
+    }
+  }, []);
+
+  const checkRecordingStatus = useCallback(async (roomName) => {
+    if (!roomName) return;
+    try {
+      const res = await getRecordingStatus(roomName);
+      if (!isMountedRef.current) return;
+      if (res && res.status) {
+        setRecordingStatus(res.status);
+        if (res.videoUrl) {
+          setRecordingVideoUrl(res.videoUrl);
+        }
+        if (res.error) {
+          setRecordingError(res.error);
+        }
+        if (
+          res.status === "completed" ||
+          res.status === "failed" ||
+          res.status === "unavailable"
+        ) {
+          clearRecordingPolling();
+        }
+      }
+    } catch (err) {
+      // Non-fatal status polling notice
+    }
+  }, [clearRecordingPolling]);
+
+  const pollRecordingUntilFinalized = useCallback(
+    (roomName, maxAttempts = 40, intervalMs = 2500) => {
+      if (!roomName) return;
+      clearRecordingPolling();
+
+      let attempts = 0;
+      checkRecordingStatus(roomName);
+
+      recordingPollingRef.current = setInterval(async () => {
+        attempts++;
+        if (!isMountedRef.current || attempts >= maxAttempts) {
+          clearRecordingPolling();
+          return;
+        }
+        await checkRecordingStatus(roomName);
+      }, intervalMs);
+    },
+    [clearRecordingPolling, checkRecordingStatus]
+  );
+
+  const safeStartRecording = useCallback(async (roomName) => {
+    if (!roomName || typeof startRecording !== "function") return;
+    if (recordingStartedRoomRef.current === roomName) return;
+    recordingStartedRoomRef.current = roomName;
+    try {
+      setRecordingStatus("starting");
+      const res = await startRecording(roomName);
+      if (!isMountedRef.current) return;
+      if (res && res.status) {
+        setRecordingStatus(res.status);
+        if (res.error) setRecordingError(res.error);
+      }
+    } catch (err) {
+      if (!isMountedRef.current) return;
+      console.warn("[App] Recording start notice:", err?.message || err);
+      setRecordingStatus("failed");
+      setRecordingError(err?.message || "Could not start recording.");
+    }
+  }, []);
+
+  const safeStopRecording = useCallback(async (roomName) => {
+    if (!roomName || typeof stopRecording !== "function") return;
+    if (recordingStoppedRoomRef.current === roomName) return;
+    recordingStoppedRoomRef.current = roomName;
+    try {
+      const res = await stopRecording(roomName);
+      if (!isMountedRef.current) return;
+      if (res && res.status) {
+        setRecordingStatus(res.status);
+        if (res.videoUrl) setRecordingVideoUrl(res.videoUrl);
+        if (res.error) setRecordingError(res.error);
+      }
+    } catch (err) {
+      // Non-fatal stop recording notice
+    }
+  }, []);
 
   // Synchronously prime the Web Audio pipeline during a user gesture
   function unlockBrowserAudio() {
@@ -156,6 +265,7 @@ function App() {
     isMountedRef.current = true;
     return () => {
       isMountedRef.current = false;
+      clearRecordingPolling();
       if (retryTimerRef.current) {
         clearTimeout(retryTimerRef.current);
         retryTimerRef.current = null;
@@ -170,7 +280,7 @@ function App() {
         roomRef.current = null;
       }
     };
-  }, []);
+  }, [clearRecordingPolling]);
 
   // ==========================================================
   // LIVEKIT EVENTS
@@ -198,6 +308,36 @@ function App() {
         setTimeLeft(
           eventData.duration_seconds
         );
+      }
+
+      return;
+    }
+
+    // --------------------------------------------------------
+    // INTERVIEW PAUSED / RESUMED (AGENT SYNC)
+    // --------------------------------------------------------
+
+    if (type === "interview_paused") {
+      isPausedRef.current = true;
+      setIsPaused(true);
+      isTransitioningRef.current = false;
+      setIsTransitioning(false);
+
+      if (typeof eventData.remaining_seconds === "number") {
+        setTimeLeft(eventData.remaining_seconds);
+      }
+
+      return;
+    }
+
+    if (type === "interview_resumed") {
+      isPausedRef.current = false;
+      setIsPaused(false);
+      isTransitioningRef.current = false;
+      setIsTransitioning(false);
+
+      if (typeof eventData.remaining_seconds === "number") {
+        setTimeLeft(eventData.remaining_seconds);
       }
 
       return;
@@ -262,15 +402,33 @@ function App() {
             return updated.filter((item, idx) => idx === existingIndex || !item.isInterim);
           }
 
-          // Deduplication: prevent duplicate final message if identical candidate message was just added
+          // Merge or update if previous message is already a candidate answer in the active turn
           const lastItem = previous[previous.length - 1];
           if (
             lastItem &&
             lastItem.role === "candidate" &&
-            lastItem.text === answer &&
             !lastItem.isInterim
           ) {
-            return previous;
+            if (lastItem.text.toLowerCase() === answer.toLowerCase()) {
+              return previous;
+            }
+            if (answer.toLowerCase().startsWith(lastItem.text.toLowerCase())) {
+              const updated = [...previous];
+              updated[updated.length - 1] = {
+                ...lastItem,
+                text: answer,
+              };
+              return updated;
+            }
+            if (lastItem.text.toLowerCase().includes(answer.toLowerCase())) {
+              return previous;
+            }
+            const updated = [...previous];
+            updated[updated.length - 1] = {
+              ...lastItem,
+              text: `${lastItem.text} ${answer}`.trim(),
+            };
+            return updated;
           }
 
           return [
@@ -446,6 +604,18 @@ function App() {
         setErrorMessage("");
         assessmentResultRef.current = finalData;
         setAssessmentResult(finalData);
+
+        if (finalData.recording) {
+          if (finalData.recording.status) {
+            setRecordingStatus(finalData.recording.status);
+          }
+          if (finalData.recording.videoUrl) {
+            setRecordingVideoUrl(finalData.recording.videoUrl);
+          }
+          if (finalData.recording.error) {
+            setRecordingError(finalData.recording.error);
+          }
+        }
       } else {
         console.warn("[App] Received incomplete final_result payload:", finalData);
         assessmentResultRef.current = null;
@@ -461,6 +631,11 @@ function App() {
       setAssessmentFinished(true);
       setConnected(false);
       setEnding(false);
+
+      if (currentRoomNameRef.current) {
+        safeStopRecording(currentRoomNameRef.current);
+        pollRecordingUntilFinalized(currentRoomNameRef.current);
+      }
 
       const activeRoom = roomRef.current || room;
       if (activeRoom) {
@@ -511,6 +686,17 @@ function App() {
             if (isMountedRef.current) {
               setAssessmentResult(fallbackData);
               setErrorMessage("");
+              if (fallbackData.recording) {
+                if (fallbackData.recording.status) {
+                  setRecordingStatus(fallbackData.recording.status);
+                }
+                if (fallbackData.recording.videoUrl) {
+                  setRecordingVideoUrl(fallbackData.recording.videoUrl);
+                }
+                if (fallbackData.recording.error) {
+                  setRecordingError(fallbackData.recording.error);
+                }
+              }
             }
             return true;
           }
@@ -572,6 +758,18 @@ function App() {
       assessmentResultRef.current = null;
       currentRoomNameRef.current = "";
 
+      setIsPaused(false);
+      isPausedRef.current = false;
+      setIsTransitioning(false);
+      isTransitioningRef.current = false;
+
+      clearRecordingPolling();
+      recordingStartedRoomRef.current = null;
+      recordingStoppedRoomRef.current = null;
+      setRecordingStatus("idle");
+      setRecordingVideoUrl(null);
+      setRecordingError("");
+
       setAssessmentFinished(false);
       setAssessmentResult(null);
 
@@ -603,12 +801,21 @@ function App() {
             );
 
             setConnected(true);
+
+            if (currentRoomNameRef.current) {
+              safeStartRecording(currentRoomNameRef.current);
+            }
           },
           (reason) => {
             console.log(
               "[App] Assessment room disconnected. Reason:",
               reason
             );
+
+            if (currentRoomNameRef.current) {
+              safeStopRecording(currentRoomNameRef.current);
+              pollRecordingUntilFinalized(currentRoomNameRef.current);
+            }
 
             roomRef.current = null;
             setConnected(false);
@@ -694,6 +901,84 @@ function App() {
   }
 
   // ==========================================================
+  // PAUSE / RESUME ASSESSMENT
+  // ==========================================================
+
+  const togglePauseResume = useCallback(async () => {
+    if (
+      isTransitioningRef.current ||
+      endingRef.current ||
+      assessmentFinishedRef.current
+    ) {
+      console.warn("[App] Pause/Resume action ignored: state transition in progress or assessment ended.");
+      return;
+    }
+
+    const activeRoom = roomRef.current || room;
+    if (!activeRoom) {
+      console.warn("[App] Pause/Resume action ignored: no active room present.");
+      return;
+    }
+
+    const targetPaused = !isPausedRef.current;
+    isTransitioningRef.current = true;
+    setIsTransitioning(true);
+
+    try {
+      if (targetPaused) {
+        // --- PAUSE INTERVIEW ---
+        isPausedRef.current = true;
+        setIsPaused(true);
+
+        await pauseRoomAudio(activeRoom);
+
+        try {
+          const payload = new TextEncoder().encode(
+            JSON.stringify({
+              type: "pause_interview",
+              room: currentRoomNameRef.current,
+            })
+          );
+          await activeRoom.localParticipant.publishData(payload, {
+            reliable: true,
+            topic: "behavioral-ui",
+          });
+          console.log("[App] Published pause_interview request to agent.");
+        } catch (pubErr) {
+          console.warn("[App] Error publishing pause_interview:", pubErr);
+        }
+      } else {
+        // --- RESUME INTERVIEW ---
+        isPausedRef.current = false;
+        setIsPaused(false);
+
+        await resumeRoomAudio(activeRoom);
+
+        try {
+          const payload = new TextEncoder().encode(
+            JSON.stringify({
+              type: "resume_interview",
+              room: currentRoomNameRef.current,
+            })
+          );
+          await activeRoom.localParticipant.publishData(payload, {
+            reliable: true,
+            topic: "behavioral-ui",
+          });
+          console.log("[App] Published resume_interview request to agent.");
+        } catch (pubErr) {
+          console.warn("[App] Error publishing resume_interview:", pubErr);
+        }
+      }
+    } catch (err) {
+      console.error("[App] Failed to toggle pause/resume:", err);
+    } finally {
+      isTransitioningRef.current = false;
+      setIsTransitioning(false);
+    }
+  }, [room]);
+
+  // ==========================================================
   // END ASSESSMENT
   // ==========================================================
 
@@ -757,11 +1042,7 @@ function App() {
   // ==========================================================
 
   useEffect(() => {
-    if (!connected) {
-      return;
-    }
-
-    if (assessmentFinished) {
+    if (!connected || assessmentFinished || isPaused) {
       return;
     }
 
@@ -785,6 +1066,7 @@ function App() {
   }, [
     connected,
     assessmentFinished,
+    isPaused,
   ]);
 
   // ==========================================================
@@ -794,7 +1076,8 @@ function App() {
   useEffect(() => {
     if (
       !connected ||
-      assessmentFinished
+      assessmentFinished ||
+      isPaused
     ) {
       return;
     }
@@ -807,6 +1090,7 @@ function App() {
     timeLeft,
     connected,
     assessmentFinished,
+    isPaused,
   ]);
 
   // ==========================================================
@@ -1263,6 +1547,146 @@ function App() {
 
           </section>
 
+          {/* INTERVIEW RECORDING & PLAYBACK */}
+          <section
+            className="mt-8 rounded-3xl border border-slate-800 bg-slate-900 p-8"
+            data-testid="recording-playback-section"
+          >
+            <div className="flex flex-col gap-2 md:flex-row md:items-center md:justify-between">
+              <div>
+                <p className="text-sm uppercase tracking-widest text-indigo-400 font-semibold">
+                  Session Archive
+                </p>
+                <h3 className="mt-1 text-2xl font-bold flex items-center gap-2">
+                  <span aria-hidden="true">🎬</span> Interview Video Recording
+                </h3>
+              </div>
+
+              <div className="flex items-center gap-2">
+                <span
+                  data-testid="recording-status-badge"
+                  className={`rounded-full px-3 py-1 text-xs font-semibold ${
+                    recordingStatus === "completed"
+                      ? "border border-green-500/20 bg-green-500/10 text-green-400"
+                      : recordingStatus === "finalizing" ||
+                        recordingStatus === "active" ||
+                        recordingStatus === "starting"
+                      ? "border border-indigo-500/20 bg-indigo-500/10 text-indigo-300 animate-pulse"
+                      : "border border-slate-700 bg-slate-800 text-slate-400"
+                  }`}
+                >
+                  {recordingStatus === "completed"
+                    ? "Recording Available"
+                    : recordingStatus === "finalizing"
+                    ? "Finalizing Recording..."
+                    : recordingStatus === "active" || recordingStatus === "starting"
+                    ? "Processing..."
+                    : "Recording Unavailable"}
+                </span>
+              </div>
+            </div>
+
+            <p className="mt-3 text-sm text-slate-400">
+              Review the synchronized camera and audio recording of your behavioral assessment.
+            </p>
+
+            <div className="mt-6">
+              {recordingStatus === "completed" && recordingVideoUrl ? (
+                <div className="space-y-4" data-testid="recording-player-container">
+                  <div className="overflow-hidden rounded-2xl border border-slate-800 bg-black aspect-video flex items-center justify-center">
+                    <video
+                      controls
+                      playsInline
+                      src={recordingVideoUrl}
+                      data-testid="recording-video-player"
+                      className="w-full h-full object-contain"
+                    >
+                      Your browser does not support the video tag.
+                    </video>
+                  </div>
+
+                  <div className="flex flex-wrap items-center justify-between gap-3 pt-2">
+                    <p className="text-xs text-slate-400">
+                      Recorded via LiveKit Room Composite Egress.
+                    </p>
+
+                    <a
+                      href={recordingVideoUrl}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      data-testid="recording-download-link"
+                      className="inline-flex items-center gap-2 rounded-xl border border-indigo-500/30 bg-indigo-500/10 px-4 py-2 text-xs font-semibold text-indigo-300 transition hover:bg-indigo-500/20"
+                    >
+                      <span aria-hidden="true">⬇️</span> Download Recording (.mp4)
+                    </a>
+                  </div>
+                </div>
+              ) : recordingStatus === "finalizing" ||
+                recordingStatus === "active" ||
+                recordingStatus === "starting" ? (
+                <div
+                  className="flex flex-col items-center justify-center rounded-2xl border border-dashed border-slate-800 bg-slate-950/60 p-10 text-center"
+                  data-testid="recording-finalizing-container"
+                >
+                  <div className="h-10 w-10 animate-spin rounded-full border-2 border-indigo-500 border-t-transparent" />
+                  <h4 className="mt-4 text-base font-semibold text-slate-200">
+                    Finalizing Interview Recording...
+                  </h4>
+                  <p className="mt-2 max-w-md text-xs text-slate-400">
+                    The video stream is currently being encoded and uploaded to storage. This usually takes a few moments.
+                  </p>
+
+                  <button
+                    type="button"
+                    onClick={() => {
+                      const roomName =
+                        currentRoomNameRef.current ||
+                        assessmentResult?.assessment_id;
+                      if (roomName) checkRecordingStatus(roomName);
+                    }}
+                    data-testid="check-recording-status-btn"
+                    className="mt-5 rounded-lg border border-slate-700 bg-slate-800 px-4 py-2 text-xs font-medium text-slate-200 transition hover:bg-slate-700 hover:text-white"
+                  >
+                    Check Status Now
+                  </button>
+                </div>
+              ) : (
+                <div
+                  className="rounded-2xl border border-slate-800 bg-slate-950/40 p-6 text-center"
+                  data-testid="recording-unavailable-container"
+                >
+                  <span className="text-3xl mb-2 inline-block" aria-hidden="true">
+                    📹
+                  </span>
+                  <h4 className="text-base font-semibold text-slate-300">
+                    Recording Unavailable
+                  </h4>
+                  <p className="mt-2 max-w-lg mx-auto text-xs text-slate-400 leading-relaxed">
+                    {recordingError ||
+                      assessmentResult?.recording?.error ||
+                      "No interview video recording is available for this session. Cloud storage or LiveKit Egress may not be configured."}
+                  </p>
+
+                  {(currentRoomNameRef.current || assessmentResult?.assessment_id) && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        const roomName =
+                          currentRoomNameRef.current ||
+                          assessmentResult?.assessment_id;
+                        if (roomName) checkRecordingStatus(roomName);
+                      }}
+                      data-testid="retry-recording-status-btn"
+                      className="mt-4 rounded-lg border border-slate-700 bg-slate-800 px-3 py-1.5 text-xs font-semibold text-slate-300 transition hover:bg-slate-700 hover:text-white"
+                    >
+                      Refresh Recording Status
+                    </button>
+                  )}
+                </div>
+              )}
+            </div>
+          </section>
+
           <div className="mt-10 flex justify-center">
 
             <button
@@ -1313,14 +1737,23 @@ function App() {
               </span>
             )}
             <div
-              className={`rounded-full px-4 py-2 text-sm ${
-                connected
-                  ? "bg-green-500/10 text-green-400"
+              data-testid="interview-status-badge"
+              className={`rounded-full px-4 py-2 text-sm font-semibold ${
+                assessmentFinished
+                  ? "bg-indigo-500/10 text-indigo-400 border border-indigo-500/20"
+                  : isPaused
+                  ? "bg-amber-500/10 text-amber-400 border border-amber-500/20"
+                  : connected
+                  ? "bg-green-500/10 text-green-400 border border-green-500/20"
                   : "bg-slate-800 text-slate-400"
               }`}
             >
-              {connected
-                ? "Assessment Active"
+              {assessmentFinished
+                ? "Completed"
+                : isPaused
+                ? "Paused"
+                : connected
+                ? "Assessment Active (Running)"
                 : "Ready"}
             </div>
           </div>
@@ -1465,6 +1898,34 @@ function App() {
                   </div>
                 )}
 
+                {isPaused && (
+                  <div
+                    data-testid="paused-banner"
+                    className="mt-6 flex flex-wrap items-center justify-between gap-4 rounded-2xl border border-amber-500/30 bg-amber-500/10 p-5 text-amber-200"
+                  >
+                    <div className="flex items-center gap-3">
+                      <span className="text-2xl" aria-hidden="true">⏸️</span>
+                      <div>
+                        <p className="text-sm font-semibold text-amber-300">
+                          Interview is currently paused
+                        </p>
+                        <p className="mt-0.5 text-xs text-amber-300/80">
+                          Countdown timer and AI question progression are frozen. Your microphone is muted.
+                        </p>
+                      </div>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={togglePauseResume}
+                      disabled={isTransitioning}
+                      data-testid="banner-resume-button"
+                      className="rounded-xl bg-amber-500 px-5 py-2.5 text-sm font-semibold text-slate-950 transition hover:bg-amber-400 disabled:opacity-50"
+                    >
+                      {isTransitioning ? "Resuming..." : "▶️ Resume Interview"}
+                    </button>
+                  </div>
+                )}
+
                 {/* CURRENT QUESTION */}
 
                 <div className="mt-8 rounded-2xl border border-indigo-500/20 bg-indigo-500/5 p-7">
@@ -1536,13 +1997,35 @@ function App() {
 
                 </div>
 
-                {/* END */}
+                {/* ACTIONS: PAUSE / RESUME & END */}
 
-                <div className="mt-8 flex justify-center">
+                <div className="mt-8 flex flex-wrap items-center justify-center gap-4">
 
                   <button
+                    type="button"
+                    onClick={togglePauseResume}
+                    disabled={isTransitioning || ending || assessmentFinished}
+                    data-testid="pause-resume-button"
+                    className={`rounded-xl px-7 py-3 font-semibold transition ${
+                      isPaused
+                        ? "bg-amber-500 hover:bg-amber-400 text-slate-950 font-bold shadow-lg shadow-amber-500/20"
+                        : "bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700"
+                    } disabled:opacity-50 disabled:cursor-not-allowed`}
+                  >
+                    {isTransitioning
+                      ? isPaused
+                        ? "Resuming..."
+                        : "Pausing..."
+                      : isPaused
+                      ? "▶️ Resume Interview"
+                      : "⏸️ Pause / Mute"}
+                  </button>
+
+                  <button
+                    type="button"
                     onClick={endAssessment}
-                    disabled={ending}
+                    disabled={ending || assessmentFinished}
+                    data-testid="end-assessment-button"
                     className="rounded-xl bg-red-500 px-7 py-3 font-semibold hover:bg-red-600 disabled:opacity-50"
                   >
                     {ending
@@ -1559,6 +2042,8 @@ function App() {
             {/* SIDEBAR */}
 
             <aside className="space-y-6">
+
+              <CameraPreview isActive={connected && !assessmentFinished && !ending} />
 
               <div className="rounded-3xl border border-slate-800 bg-slate-900 p-6">
 

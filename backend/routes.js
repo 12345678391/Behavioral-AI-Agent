@@ -3,6 +3,12 @@ const path = require("path");
 const fs = require("fs");
 const crypto = require("crypto");
 const createToken = require("./livekit");
+const {
+  startRecording,
+  stopRecording,
+  getRecordingStatus,
+  getRecordingSession,
+} = require("./recording");
 
 const router = express.Router();
 
@@ -226,6 +232,22 @@ router.post("/assessment-result", express.json({ limit: "2mb" }), (req, res) => 
 
     const safeId = assessmentId.replace(/[^a-zA-Z0-9_-]/g, "_");
 
+    // Link recording session if one was started for this assessment
+    const recSession = getRecordingSession(safeId);
+    if (recSession) {
+      resultData.recording = {
+        status: recSession.status,
+        videoUrl: recSession.videoUrl,
+        error: recSession.error,
+      };
+    } else if (!resultData.recording) {
+      resultData.recording = {
+        status: "unavailable",
+        videoUrl: null,
+        error: "No recording was started for this session.",
+      };
+    }
+
     // Cache in bounded memory map for immediate retrieval
     setCachedAssessmentResult(safeId, resultData);
 
@@ -259,6 +281,35 @@ router.post("/assessment-result", express.json({ limit: "2mb" }), (req, res) => 
   }
 });
 
+function syncRecordingToAssessment(roomName, recData) {
+  if (!roomName || !recData) return;
+  const safeId = roomName.replace(/[^a-zA-Z0-9_-]/g, "_");
+  const cachedEntry = assessmentResultsCache.get(safeId);
+  if (cachedEntry && cachedEntry.data) {
+    cachedEntry.data.recording = {
+      status: recData.status,
+      videoUrl: recData.videoUrl,
+      error: recData.error,
+    };
+  }
+  try {
+    const assessmentsDir = path.join(__dirname, "..", "agent", "assessments");
+    const resultPath = path.join(assessmentsDir, `${safeId}.json`);
+    if (fs.existsSync(resultPath)) {
+      const content = fs.readFileSync(resultPath, "utf-8");
+      const parsed = JSON.parse(content);
+      parsed.recording = {
+        status: recData.status,
+        videoUrl: recData.videoUrl,
+        error: recData.error,
+      };
+      fs.writeFileSync(resultPath, JSON.stringify(parsed, null, 2), "utf-8");
+    }
+  } catch (e) {
+    // Non-fatal disk sync
+  }
+}
+
 // ============================================================
 // ASSESSMENT RESULT RETRIEVAL
 // ============================================================
@@ -279,10 +330,18 @@ router.get("/assessment-result", (req, res) => {
     }
 
     const safeId = assessmentId.replace(/[^a-zA-Z0-9_-]/g, "_");
+    const liveRec = getRecordingSession(safeId);
 
     // 1. Check bounded in-memory cache first (handles cross-container sync while process is live)
     const cached = getCachedAssessmentResult(safeId);
     if (cached && isValidCompletedResult(cached)) {
+      if (liveRec) {
+        cached.recording = {
+          status: liveRec.status,
+          videoUrl: liveRec.videoUrl,
+          error: liveRec.error,
+        };
+      }
       return res.json(cached);
     }
 
@@ -311,11 +370,94 @@ router.get("/assessment-result", (req, res) => {
       });
     }
 
+    if (liveRec) {
+      parsed.recording = {
+        status: liveRec.status,
+        videoUrl: liveRec.videoUrl,
+        error: liveRec.error,
+      };
+    }
+
     res.json(parsed);
   } catch (error) {
     console.error("Failed to read assessment result:", error.message || error);
     res.status(500).json({
       error: "Failed to read assessment result.",
+    });
+  }
+});
+
+// ============================================================
+// INTERVIEW RECORDING ENDPOINTS
+// ============================================================
+router.post("/recording/start", express.json(), async (req, res) => {
+  try {
+    const room = req.body?.room;
+    if (!room || !isValidAssessmentId(room)) {
+      return res.status(400).json({
+        error: "Valid room name is required to start recording.",
+      });
+    }
+
+    const result = await startRecording(room);
+    syncRecordingToAssessment(room, result);
+    res.json(result);
+  } catch (error) {
+    console.error("Recording start endpoint error:", error.message || error);
+    res.status(500).json({
+      success: false,
+      status: "failed",
+      error: "Failed to start recording.",
+    });
+  }
+});
+
+router.post("/recording/stop", express.json(), async (req, res) => {
+  try {
+    const room = req.body?.room;
+    if (!room || !isValidAssessmentId(room)) {
+      return res.status(400).json({
+        error: "Valid room name is required to stop recording.",
+      });
+    }
+
+    const session = await stopRecording(room);
+    syncRecordingToAssessment(room, session);
+    res.json({
+      success: true,
+      room,
+      status: session.status,
+      videoUrl: session.videoUrl,
+      error: session.error,
+    });
+  } catch (error) {
+    console.error("Recording stop endpoint error:", error.message || error);
+    res.status(500).json({
+      success: false,
+      status: "failed",
+      error: "Failed to stop recording.",
+    });
+  }
+});
+
+router.get("/recording/status", async (req, res) => {
+  try {
+    const room = req.query.room;
+    if (!room || !isValidAssessmentId(room)) {
+      return res.status(400).json({
+        error: "Valid room name is required to get recording status.",
+      });
+    }
+
+    const statusResult = await getRecordingStatus(room);
+    syncRecordingToAssessment(room, statusResult);
+    res.json(statusResult);
+  } catch (error) {
+    console.error("Recording status endpoint error:", error.message || error);
+    res.status(500).json({
+      success: false,
+      status: "failed",
+      error: "Failed to retrieve recording status.",
     });
   }
 });

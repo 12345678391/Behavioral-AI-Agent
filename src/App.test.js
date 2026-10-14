@@ -6,10 +6,19 @@ import * as livekitRoom from './LiveKitRoom';
 jest.mock('./api', () => ({
   getToken: jest.fn(),
   getAssessmentResult: jest.fn(),
+  startRecording: jest.fn().mockResolvedValue({ success: true, status: 'active' }),
+  stopRecording: jest.fn().mockResolvedValue({ success: true, status: 'finalizing' }),
+  getRecordingStatus: jest.fn().mockResolvedValue({
+    success: true,
+    status: 'completed',
+    videoUrl: 'https://storage.example.com/interview.mp4',
+  }),
 }));
 
 jest.mock('./LiveKitRoom', () => ({
   joinRoom: jest.fn(),
+  pauseRoomAudio: jest.fn().mockResolvedValue(),
+  resumeRoomAudio: jest.fn().mockResolvedValue(),
 }));
 
 describe('Behavioral AI Agent App', () => {
@@ -879,6 +888,401 @@ describe('Behavioral AI Agent App', () => {
 
     expect(screen.getByText('I was in the middle of saying...')).toBeInTheDocument();
     expect(screen.queryByText(/speaking\.\.\./i)).not.toBeInTheDocument();
+  });
+
+  test('recording lifecycle: starts recording on connect, stops on end, and displays completed playback video', async () => {
+    let capturedOnData = null;
+    const mockRoom = {
+      name: 'room-recording-complete',
+      disconnect: jest.fn(),
+      localParticipant: {
+        publishData: jest.fn().mockResolvedValue(true),
+      },
+    };
+
+    api.getToken.mockResolvedValueOnce({
+      token: 'mock-rec-token',
+      serverUrl: 'wss://test.livekit.cloud',
+      room: 'room-recording-complete',
+    });
+
+    api.startRecording.mockResolvedValueOnce({
+      success: true,
+      status: 'active',
+      egressId: 'egress-123',
+    });
+
+    api.stopRecording.mockResolvedValueOnce({
+      success: true,
+      status: 'finalizing',
+    });
+
+    api.getRecordingStatus.mockResolvedValueOnce({
+      success: true,
+      room: 'room-recording-complete',
+      status: 'completed',
+      videoUrl: 'https://storage.example.com/interviews/room-recording-complete.mp4',
+    });
+
+    livekitRoom.joinRoom.mockImplementation((token, url, onData, onConnected) => {
+      capturedOnData = onData;
+      if (onConnected) onConnected();
+      return Promise.resolve(mockRoom);
+    });
+
+    render(<App />);
+
+    // Start assessment
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: /Start Assessment/i }));
+    });
+
+    expect(api.startRecording).toHaveBeenCalledWith('room-recording-complete');
+
+    // Deliver completed final assessment result
+    await act(async () => {
+      capturedOnData({
+        type: 'final_result',
+        data: {
+          assessment_id: 'room-recording-complete',
+          completed: true,
+          recording: {
+            status: 'completed',
+            videoUrl: 'https://storage.example.com/interviews/room-recording-complete.mp4',
+          },
+          final_analysis: {
+            overall_score: 88,
+            scores: { communication: 90, teamwork: 86 },
+            strengths: ['Great communication skills.'],
+            areas_for_improvement: ['Continue honing problem solving.'],
+            behavioral_summary: 'Overall strong behavioral performance.',
+          },
+        },
+      });
+    });
+
+    expect(screen.getByTestId('recording-playback-section')).toBeInTheDocument();
+    expect(screen.getByTestId('recording-video-player')).toBeInTheDocument();
+    expect(screen.getByTestId('recording-video-player')).toHaveAttribute(
+      'src',
+      'https://storage.example.com/interviews/room-recording-complete.mp4'
+    );
+    expect(screen.getByTestId('recording-download-link')).toHaveAttribute(
+      'href',
+      'https://storage.example.com/interviews/room-recording-complete.mp4'
+    );
+    expect(screen.getByText(/Recording Available/i)).toBeInTheDocument();
+  });
+
+  test('recording UI: displays finalizing state with spinner when video is encoding', async () => {
+    let capturedOnData = null;
+    const mockRoom = {
+      name: 'room-recording-finalizing',
+      disconnect: jest.fn(),
+      localParticipant: { publishData: jest.fn().mockResolvedValue(true) },
+    };
+
+    api.getToken.mockResolvedValueOnce({
+      token: 'mock-rec-token',
+      serverUrl: 'wss://test.livekit.cloud',
+      room: 'room-recording-finalizing',
+    });
+
+    api.startRecording.mockResolvedValueOnce({ success: true, status: 'active' });
+    api.stopRecording.mockResolvedValueOnce({ success: true, status: 'finalizing' });
+    api.getRecordingStatus.mockResolvedValueOnce({
+      success: true,
+      room: 'room-recording-finalizing',
+      status: 'finalizing',
+      videoUrl: null,
+    });
+
+    livekitRoom.joinRoom.mockImplementation((token, url, onData, onConnected) => {
+      capturedOnData = onData;
+      if (onConnected) onConnected();
+      return Promise.resolve(mockRoom);
+    });
+
+    render(<App />);
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: /Start Assessment/i }));
+    });
+
+    await act(async () => {
+      capturedOnData({
+        type: 'final_result',
+        data: {
+          assessment_id: 'room-recording-finalizing',
+          completed: true,
+          recording: {
+            status: 'finalizing',
+            videoUrl: null,
+          },
+          final_analysis: {
+            overall_score: 85,
+            scores: { communication: 85 },
+            strengths: ['Solid answers'],
+            areas_for_improvement: ['None'],
+            behavioral_summary: 'Good performance.',
+          },
+        },
+      });
+    });
+
+    expect(screen.getByTestId('recording-playback-section')).toBeInTheDocument();
+    expect(screen.getByTestId('recording-finalizing-container')).toBeInTheDocument();
+    expect(screen.getByText(/Finalizing Interview Recording\.\.\./i)).toBeInTheDocument();
+    expect(screen.queryByTestId('recording-video-player')).not.toBeInTheDocument();
+  });
+
+  test('recording UI: displays clear unavailable state when storage is not configured without fake URL', async () => {
+    let capturedOnData = null;
+    const mockRoom = {
+      name: 'room-recording-unavailable',
+      disconnect: jest.fn(),
+      localParticipant: { publishData: jest.fn().mockResolvedValue(true) },
+    };
+
+    api.getToken.mockResolvedValueOnce({
+      token: 'mock-rec-token',
+      serverUrl: 'wss://test.livekit.cloud',
+      room: 'room-recording-unavailable',
+    });
+
+    api.startRecording.mockResolvedValueOnce({
+      success: false,
+      status: 'failed',
+      error: 'Recording storage destination is not configured.',
+    });
+
+    livekitRoom.joinRoom.mockImplementation((token, url, onData, onConnected) => {
+      capturedOnData = onData;
+      if (onConnected) onConnected();
+      return Promise.resolve(mockRoom);
+    });
+
+    render(<App />);
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: /Start Assessment/i }));
+    });
+
+    await act(async () => {
+      capturedOnData({
+        type: 'final_result',
+        data: {
+          assessment_id: 'room-recording-unavailable',
+          completed: true,
+          recording: {
+            status: 'unavailable',
+            videoUrl: null,
+            error: 'No storage destination configured (S3/Azure/GCP).',
+          },
+          final_analysis: {
+            overall_score: 92,
+            scores: { communication: 92 },
+            strengths: ['Excellent clarity'],
+            areas_for_improvement: ['None'],
+            behavioral_summary: 'Excellent performance.',
+          },
+        },
+      });
+    });
+
+    expect(screen.getByTestId('recording-playback-section')).toBeInTheDocument();
+    expect(screen.getByTestId('recording-unavailable-container')).toBeInTheDocument();
+    expect(screen.getAllByText(/Recording Unavailable/i).length).toBeGreaterThan(0);
+    expect(screen.getByText('No storage destination configured (S3/Azure/GCP).')).toBeInTheDocument();
+    expect(screen.queryByTestId('recording-video-player')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('recording-download-link')).not.toBeInTheDocument();
+  });
+
+  test('pause/resume: clicking Pause freezes timer, shows Paused badge/banner, and dispatches pause_interview', async () => {
+    jest.useFakeTimers();
+    let capturedOnData = null;
+    const mockPublishData = jest.fn().mockResolvedValue(true);
+    const mockRoom = {
+      name: 'room-pause-test',
+      disconnect: jest.fn(),
+      localParticipant: { publishData: mockPublishData },
+    };
+
+    api.getToken.mockResolvedValueOnce({
+      token: 'mock-pause-token',
+      serverUrl: 'wss://test.livekit.cloud',
+      room: 'room-pause-test',
+    });
+
+    livekitRoom.joinRoom.mockImplementation((token, url, onData, onConnected) => {
+      capturedOnData = onData;
+      if (onConnected) onConnected();
+      return Promise.resolve(mockRoom);
+    });
+
+    render(<App />);
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: /Start Assessment/i }));
+    });
+
+    const badge = screen.getByTestId('interview-status-badge');
+    expect(badge).toHaveTextContent('Assessment Active (Running)');
+    const pauseBtn = screen.getByTestId('pause-resume-button');
+    expect(pauseBtn).toHaveTextContent(/Pause \/ Mute/i);
+
+    act(() => {
+      jest.advanceTimersByTime(5000);
+    });
+
+    await act(async () => {
+      fireEvent.click(pauseBtn);
+    });
+
+    expect(badge).toHaveTextContent('Paused');
+    expect(pauseBtn).toHaveTextContent(/Resume Interview/i);
+    expect(screen.getByTestId('paused-banner')).toBeInTheDocument();
+    expect(livekitRoom.pauseRoomAudio).toHaveBeenCalledWith(mockRoom);
+
+    expect(mockPublishData).toHaveBeenCalledTimes(1);
+    const sentPayload = JSON.parse(new TextDecoder().decode(mockPublishData.mock.calls[0][0]));
+    expect(sentPayload).toEqual({ type: 'pause_interview', room: 'room-pause-test' });
+    expect(mockPublishData.mock.calls[0][1]).toEqual({ reliable: true, topic: 'behavioral-ui' });
+
+    const timeBeforeAdvance = screen.getByText(/\d+:\d+/).textContent;
+
+    act(() => {
+      jest.advanceTimersByTime(10000);
+    });
+
+    const timeAfterAdvance = screen.getByText(/\d+:\d+/).textContent;
+    expect(timeAfterAdvance).toBe(timeBeforeAdvance);
+
+    await act(async () => {
+      fireEvent.click(pauseBtn);
+    });
+
+    expect(badge).toHaveTextContent('Assessment Active (Running)');
+    expect(pauseBtn).toHaveTextContent(/Pause \/ Mute/i);
+    expect(screen.queryByTestId('paused-banner')).not.toBeInTheDocument();
+    expect(livekitRoom.resumeRoomAudio).toHaveBeenCalledWith(mockRoom);
+
+    act(() => {
+      jest.advanceTimersByTime(3000);
+    });
+
+    const timeAfterResume = screen.getByText(/\d+:\d+/).textContent;
+    expect(timeAfterResume).not.toBe(timeBeforeAdvance);
+
+    jest.useRealTimers();
+  });
+
+  test('pause/resume: preserves current question and transcript across pause and resume', async () => {
+    let capturedOnData = null;
+    const mockRoom = {
+      name: 'room-preserve-test',
+      disconnect: jest.fn(),
+      localParticipant: { publishData: jest.fn().mockResolvedValue(true) },
+    };
+
+    api.getToken.mockResolvedValueOnce({
+      token: 'mock-token',
+      serverUrl: 'wss://test.livekit.cloud',
+      room: 'room-preserve-test',
+    });
+
+    livekitRoom.joinRoom.mockImplementation((token, url, onData, onConnected) => {
+      capturedOnData = onData;
+      if (onConnected) onConnected();
+      return Promise.resolve(mockRoom);
+    });
+
+    render(<App />);
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: /Start Assessment/i }));
+    });
+
+    await act(async () => {
+      capturedOnData({
+        type: 'interview_question',
+        data: { question: 'Tell me about a challenging technical design decision.' },
+      });
+      capturedOnData({
+        type: 'candidate_answer',
+        data: { answer: 'I decided to use distributed event queues to decouple ingestion.' },
+      });
+    });
+
+    expect(screen.getAllByText('Tell me about a challenging technical design decision.').length).toBe(2);
+    expect(screen.getByText('I decided to use distributed event queues to decouple ingestion.')).toBeInTheDocument();
+
+    const pauseBtn = screen.getByTestId('pause-resume-button');
+
+    await act(async () => {
+      fireEvent.click(pauseBtn);
+    });
+
+    expect(screen.getAllByText('Tell me about a challenging technical design decision.').length).toBe(2);
+    expect(screen.getByText('I decided to use distributed event queues to decouple ingestion.')).toBeInTheDocument();
+
+    await act(async () => {
+      fireEvent.click(pauseBtn);
+    });
+
+    expect(screen.getAllByText('Tell me about a challenging technical design decision.').length).toBe(2);
+    expect(screen.getByText('I decided to use distributed event queues to decouple ingestion.')).toBeInTheDocument();
+  });
+
+  test('pause/resume: agent-driven interview_paused and interview_resumed events synchronize UI and timer', async () => {
+    let capturedOnData = null;
+    const mockRoom = {
+      name: 'room-agent-sync',
+      disconnect: jest.fn(),
+      localParticipant: { publishData: jest.fn().mockResolvedValue(true) },
+    };
+
+    api.getToken.mockResolvedValueOnce({
+      token: 'mock-token',
+      serverUrl: 'wss://test.livekit.cloud',
+      room: 'room-agent-sync',
+    });
+
+    livekitRoom.joinRoom.mockImplementation((token, url, onData, onConnected) => {
+      capturedOnData = onData;
+      if (onConnected) onConnected();
+      return Promise.resolve(mockRoom);
+    });
+
+    render(<App />);
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: /Start Assessment/i }));
+    });
+
+    const badge = screen.getByTestId('interview-status-badge');
+    expect(badge).toHaveTextContent('Assessment Active (Running)');
+
+    await act(async () => {
+      capturedOnData({
+        type: 'interview_paused',
+        data: { remaining_seconds: 185 },
+      });
+    });
+
+    expect(badge).toHaveTextContent('Paused');
+    expect(screen.getByTestId('paused-banner')).toBeInTheDocument();
+    expect(screen.getByText('03:05')).toBeInTheDocument();
+
+    await act(async () => {
+      capturedOnData({
+        type: 'interview_resumed',
+        data: { remaining_seconds: 185 },
+      });
+    });
+
+    expect(badge).toHaveTextContent('Assessment Active (Running)');
+    expect(screen.queryByTestId('paused-banner')).not.toBeInTheDocument();
   });
 });
 
