@@ -29,13 +29,18 @@ const server = app.listen(0, async () => {
       failures++;
     }
 
-    // Test 3: Non-existent assessmentId (expect 404)
-    const res3 = await fetch(`http://localhost:${port}/api/assessment-result?assessmentId=test-nonexistent-123`);
+    // Test 3: Non-existent assessmentId with admin sync signature (expect 404) and unauthenticated (expect 401)
+    const routesInitial = require("./routes");
+    const nonexistentSig = routesInitial.computeSyncSignature("test-nonexistent-123", process.env.LIVEKIT_API_SECRET);
+    const res3Unauth = await fetch(`http://localhost:${port}/api/assessment-result?assessmentId=test-nonexistent-123`);
+    const res3 = await fetch(`http://localhost:${port}/api/assessment-result?assessmentId=test-nonexistent-123`, {
+      headers: { "X-Assessment-Signature": nonexistentSig },
+    });
     const data3 = await res3.json();
-    if (res3.status === 404 && data3.error) {
-      console.log("PASS: Nonexistent assessmentId returned 404");
+    if (res3Unauth.status === 401 && res3.status === 404 && data3.error) {
+      console.log("PASS: Nonexistent assessmentId returned 404 for authorized sync and 401 for unauthenticated request");
     } else {
-      console.error("FAIL: Nonexistent assessmentId test", res3.status, data3);
+      console.error("FAIL: Nonexistent assessmentId test", { unauth: res3Unauth.status, auth: res3.status, data3 });
       failures++;
     }
 
@@ -276,7 +281,9 @@ const server = app.listen(0, async () => {
     });
     const postJson = await postRes.json();
 
-    const getRes = await fetch(`http://localhost:${port}/assessment-result?assessmentId=${syncRoomId}`);
+    const getRes = await fetch(`http://localhost:${port}/assessment-result?assessmentId=${syncRoomId}`, {
+      headers: { "X-Assessment-Signature": validSignature },
+    });
     const getJson = await getRes.json();
 
     if (
@@ -451,7 +458,10 @@ const server = app.listen(0, async () => {
       failures++;
     }
 
-    // Test 27: Recording stop and status query
+    // Test 27: Recording stop and status query with capability token authorization
+    const testRecToken = "test-archive-token-rec-1234567890abcdef12345678";
+    routes.registerRoomCapabilityToken(testRoom, testRecToken);
+
     const stopRes = await fetch(`http://localhost:${port}/api/recording/stop`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -459,13 +469,18 @@ const server = app.listen(0, async () => {
     });
     const stopData = await stopRes.json();
 
-    const statusRes = await fetch(`http://localhost:${port}/api/recording/status?room=${testRoom}`);
+    const statusRes = await fetch(`http://localhost:${port}/api/recording/status?room=${testRoom}`, {
+      headers: { Authorization: `Bearer ${testRecToken}` },
+    });
     const statusData = await statusRes.json();
 
     if (
       statusData.success === true &&
       statusData.status === "completed" &&
-      statusData.videoUrl === "https://my-bucket.s3.us-east-1.amazonaws.com/recordings/test.mp4"
+      typeof statusData.videoUrl === "string" &&
+      statusData.videoUrl.startsWith("https://my-bucket.s3.us-east-1.amazonaws.com/recordings/") &&
+      statusData.videoUrl.includes("X-Amz-Algorithm=AWS4-HMAC-SHA256") &&
+      statusData.videoUrl.includes("X-Amz-Signature=")
     ) {
       console.log("PASS: Recording status returns completed with verified playback URL:", statusData.videoUrl);
     } else {
@@ -531,6 +546,546 @@ const server = app.listen(0, async () => {
     } else {
       console.error("FAIL: Egress start should have rejected missing egressId", failData);
       failures++;
+    }
+
+    // ============================================================
+    // CLOUDFLARE R2 RECORDING PLAYBACK URL TESTS
+    // ============================================================
+    const originalR2Env = {
+      RECORDING_BASE_URL: process.env.RECORDING_BASE_URL,
+      S3_PUBLIC_BASE_URL: process.env.S3_PUBLIC_BASE_URL,
+      STORAGE_PUBLIC_URL: process.env.STORAGE_PUBLIC_URL,
+      hasRecordingBaseUrl: Object.prototype.hasOwnProperty.call(process.env, "RECORDING_BASE_URL"),
+      hasS3PublicBaseUrl: Object.prototype.hasOwnProperty.call(process.env, "S3_PUBLIC_BASE_URL"),
+      hasStoragePublicUrl: Object.prototype.hasOwnProperty.call(process.env, "STORAGE_PUBLIC_URL"),
+    };
+
+    function restoreR2Env() {
+      if (originalR2Env.hasRecordingBaseUrl) {
+        process.env.RECORDING_BASE_URL = originalR2Env.RECORDING_BASE_URL;
+      } else {
+        delete process.env.RECORDING_BASE_URL;
+      }
+      if (originalR2Env.hasS3PublicBaseUrl) {
+        process.env.S3_PUBLIC_BASE_URL = originalR2Env.S3_PUBLIC_BASE_URL;
+      } else {
+        delete process.env.S3_PUBLIC_BASE_URL;
+      }
+      if (originalR2Env.hasStoragePublicUrl) {
+        process.env.STORAGE_PUBLIC_URL = originalR2Env.STORAGE_PUBLIC_URL;
+      } else {
+        delete process.env.STORAGE_PUBLIC_URL;
+      }
+    }
+
+    try {
+      // Test 30: Configured public base URL takes priority over private R2 S3 endpoint
+      const r2StorageConfig = {
+        type: "s3",
+        configured: true,
+        bucket: "interview-recordings",
+        region: "auto",
+        endpoint: "https://my-account-id.r2.cloudflarestorage.com",
+      };
+      const r2Filepath = "recordings/candidate-room-123.mp4";
+      const r2PrivateEgressResults = [
+        { location: "https://my-account-id.r2.cloudflarestorage.com/interview-recordings/recordings/candidate-room-123.mp4" }
+      ];
+
+      process.env.RECORDING_BASE_URL = "https://pub-abcdef123456.r2.dev";
+      const r2PublicUrl = recording.computePlaybackUrl(
+        r2StorageConfig,
+        r2Filepath,
+        r2PrivateEgressResults,
+        null
+      );
+
+      if (r2PublicUrl === "https://pub-abcdef123456.r2.dev/recordings/candidate-room-123.mp4") {
+        console.log("PASS: RECORDING_BASE_URL takes priority over private R2 S3 endpoint");
+      } else {
+        console.error("FAIL: RECORDING_BASE_URL priority test failed:", r2PublicUrl);
+        failures++;
+      }
+
+      // Test 31: Environment variable priority hierarchy (RECORDING_BASE_URL > S3_PUBLIC_BASE_URL > STORAGE_PUBLIC_URL)
+      process.env.S3_PUBLIC_BASE_URL = "https://s3-public.example.com";
+      process.env.STORAGE_PUBLIC_URL = "https://storage-public.example.com";
+      const hierarchyUrl1 = recording.computePlaybackUrl(r2StorageConfig, r2Filepath, r2PrivateEgressResults, null);
+
+      delete process.env.RECORDING_BASE_URL;
+      const hierarchyUrl2 = recording.computePlaybackUrl(r2StorageConfig, r2Filepath, r2PrivateEgressResults, null);
+
+      delete process.env.S3_PUBLIC_BASE_URL;
+      const hierarchyUrl3 = recording.computePlaybackUrl(r2StorageConfig, r2Filepath, r2PrivateEgressResults, null);
+
+      if (
+        hierarchyUrl1 === "https://pub-abcdef123456.r2.dev/recordings/candidate-room-123.mp4" &&
+        hierarchyUrl2 === "https://s3-public.example.com/recordings/candidate-room-123.mp4" &&
+        hierarchyUrl3 === "https://storage-public.example.com/recordings/candidate-room-123.mp4"
+      ) {
+        console.log("PASS: Public base URL priority hierarchy respected (RECORDING_BASE_URL > S3_PUBLIC_BASE_URL > STORAGE_PUBLIC_URL)");
+      } else {
+        console.error("FAIL: Public base URL hierarchy test failed", { hierarchyUrl1, hierarchyUrl2, hierarchyUrl3 });
+        failures++;
+      }
+
+      // Test 32: URL formatting handles trailing and leading slashes without duplicate slashes
+      process.env.RECORDING_BASE_URL = "https://recordings.example.com///";
+      const slashCleanUrl = recording.computePlaybackUrl(
+        r2StorageConfig,
+        "///recordings/nested/session-video.mp4",
+        r2PrivateEgressResults,
+        null
+      );
+      if (slashCleanUrl === "https://recordings.example.com/recordings/nested/session-video.mp4") {
+        console.log("PASS: URL formatting normalizes slashes without duplicate slashes");
+      } else {
+        console.error("FAIL: Slash formatting test failed:", slashCleanUrl);
+        failures++;
+      }
+
+      // Test 33: Existing fallback behavior preserved when no public base URL is configured
+      delete process.env.RECORDING_BASE_URL;
+      delete process.env.S3_PUBLIC_BASE_URL;
+      delete process.env.STORAGE_PUBLIC_URL;
+
+      const fallbackWithEgressResult = recording.computePlaybackUrl(
+        r2StorageConfig,
+        r2Filepath,
+        [{ location: "https://my-bucket.s3.us-east-1.amazonaws.com/test.mp4" }],
+        null
+      );
+      const fallbackWithoutEgressResult = recording.computePlaybackUrl(
+        r2StorageConfig,
+        r2Filepath,
+        [],
+        null
+      );
+
+      if (
+        fallbackWithEgressResult === "https://my-bucket.s3.us-east-1.amazonaws.com/test.mp4" &&
+        fallbackWithoutEgressResult === "https://my-account-id.r2.cloudflarestorage.com/interview-recordings/recordings/candidate-room-123.mp4"
+      ) {
+        console.log("PASS: Fallback behavior preserved when no public base URL is configured");
+      } else {
+        console.error("FAIL: Fallback behavior test failed", { fallbackWithEgressResult, fallbackWithoutEgressResult });
+        failures++;
+      }
+    } finally {
+      restoreR2Env();
+    }
+
+    // ============================================================
+    // SECURE PRIVATE CLOUDFLARE R2 RECORDING & CAPABILITY TOKEN TESTS
+    // ============================================================
+    const crypto = require("crypto");
+    const originalSecureEnv = {
+      S3_KEY_ID: process.env.S3_KEY_ID,
+      S3_KEY_SECRET: process.env.S3_KEY_SECRET,
+      S3_BUCKET: process.env.S3_BUCKET,
+      S3_REGION: process.env.S3_REGION,
+      S3_ENDPOINT: process.env.S3_ENDPOINT,
+      RECORDING_BASE_URL: process.env.RECORDING_BASE_URL,
+      S3_PUBLIC_BASE_URL: process.env.S3_PUBLIC_BASE_URL,
+      STORAGE_PUBLIC_URL: process.env.STORAGE_PUBLIC_URL,
+    };
+
+    try {
+      // Set private S3/R2 storage environment
+      process.env.S3_KEY_ID = "mock-r2-access-key-id";
+      process.env.S3_KEY_SECRET = "mock-r2-secret-access-key-12345678";
+      process.env.S3_BUCKET = "interview-recordings";
+      process.env.S3_REGION = "auto";
+      process.env.S3_ENDPOINT = "https://mock-account.r2.cloudflarestorage.com";
+      delete process.env.RECORDING_BASE_URL;
+      delete process.env.S3_PUBLIC_BASE_URL;
+      delete process.env.STORAGE_PUBLIC_URL;
+
+      // Test 34: Token generation returns 256-bit archiveToken and stores only SHA-256 hash
+      const tokenRes = await fetch(`http://localhost:${port}/api/token?identity=candidate-secure-1`);
+      const tokenData = await tokenRes.json();
+      const secureRoom = tokenData.room;
+      const archiveToken = tokenData.archiveToken;
+
+      const registeredAuth = routes.roomAuthRegistry.get(secureRoom);
+      const expectedTokenHash = crypto.createHash("sha256").update(archiveToken).digest("hex");
+
+      if (
+        tokenRes.status === 200 &&
+        typeof archiveToken === "string" &&
+        archiveToken.length === 64 &&
+        registeredAuth &&
+        registeredAuth.archiveTokenHash === expectedTokenHash &&
+        registeredAuth.archiveTokenHash !== archiveToken
+      ) {
+        console.log("PASS: Token generation returns 256-bit archiveToken and stores only its SHA-256 hash");
+      } else {
+        console.error("FAIL: Capability token generation/storage test failed", { tokenData, registeredAuth });
+        failures++;
+      }
+
+      // Simulate completed recording session for secureRoom
+      recording.setRecordingSession(secureRoom, {
+        roomName: secureRoom,
+        status: "completed",
+        egressId: "egress-secure-1",
+        filepath: `recordings/${secureRoom}.mp4`,
+        videoUrl: `https://mock-account.r2.cloudflarestorage.com/interview-recordings/recordings/${secureRoom}.mp4`,
+        error: null,
+        startedAt: Date.now() - 60000,
+        endedAt: Date.now(),
+        storageType: "s3",
+      });
+
+      // Test 35: Protected recording status rejects unauthenticated request with 401
+      const unauthStatusRes = await fetch(`http://localhost:${port}/api/recording/status?room=${secureRoom}`);
+      const unauthStatusData = await unauthStatusRes.json();
+      if (unauthStatusRes.status === 401 && unauthStatusData.status === "failed") {
+        console.log("PASS: Unauthenticated request to protected recording status rejected with 401");
+      } else {
+        console.error("FAIL: Expected 401 for unauthenticated recording status, got", unauthStatusRes.status, unauthStatusData);
+        failures++;
+      }
+
+      // Test 36: Protected recording status rejects invalid/cross-room capability token with 403
+      const badTokenStatusRes = await fetch(`http://localhost:${port}/api/recording/status?room=${secureRoom}`, {
+        headers: { Authorization: "Bearer wrong-or-other-room-token-abcdef123456" },
+      });
+      const badTokenStatusData = await badTokenStatusRes.json();
+      if (badTokenStatusRes.status === 403 && badTokenStatusData.status === "failed") {
+        console.log("PASS: Invalid capability token on recording status rejected with 403");
+      } else {
+        console.error("FAIL: Expected 403 for invalid capability token, got", badTokenStatusRes.status, badTokenStatusData);
+        failures++;
+      }
+
+      // Test 37: Authenticated request returns short-lived pre-signed SigV4 URL
+      const authStatusRes = await fetch(`http://localhost:${port}/api/recording/status?room=${secureRoom}`, {
+        headers: { Authorization: `Bearer ${archiveToken}` },
+      });
+      const authStatusData = await authStatusRes.json();
+      const signedUrl = authStatusData.videoUrl;
+      const parsedSignedUrl = signedUrl ? new URL(signedUrl) : null;
+
+      if (
+        authStatusRes.status === 200 &&
+        authStatusData.status === "completed" &&
+        parsedSignedUrl &&
+        parsedSignedUrl.searchParams.get("X-Amz-Algorithm") === "AWS4-HMAC-SHA256" &&
+        parsedSignedUrl.searchParams.get("X-Amz-Credential")?.startsWith("mock-r2-access-key-id") &&
+        parsedSignedUrl.searchParams.get("X-Amz-Expires") === "900" &&
+        parsedSignedUrl.searchParams.get("X-Amz-Signature")
+      ) {
+        console.log("PASS: Authenticated request returns valid short-lived AWS SigV4 pre-signed URL");
+      } else {
+        console.error("FAIL: SigV4 presigned URL generation test failed", { authStatusData, signedUrl });
+        failures++;
+      }
+
+      // Test 38: Pre-signed URL signs ONLY host to preserve HTML5 video seeking & HTTP Range requests
+      const signedHeaders = parsedSignedUrl?.searchParams.get("X-Amz-SignedHeaders");
+      if (signedHeaders === "host") {
+        console.log("PASS: Pre-signed URL signs only host, preserving HTTP Range requests for video seeking/scrubbing");
+      } else {
+        console.error("FAIL: Signed headers check failed; expected 'host', got:", signedHeaders);
+        failures++;
+      }
+
+      // Test 39: Per-room revocation immediately blocks revoked room (403) while Room B remains accessible
+      const tokenResB = await fetch(`http://localhost:${port}/api/token?identity=candidate-secure-2`);
+      const tokenDataB = await tokenResB.json();
+      const secureRoomB = tokenDataB.room;
+      const archiveTokenB = tokenDataB.archiveToken;
+
+      recording.setRecordingSession(secureRoomB, {
+        roomName: secureRoomB,
+        status: "completed",
+        egressId: "egress-secure-2",
+        filepath: `recordings/${secureRoomB}.mp4`,
+        videoUrl: `https://mock-account.r2.cloudflarestorage.com/interview-recordings/recordings/${secureRoomB}.mp4`,
+        error: null,
+      });
+
+      // Test 39: Per-room revocation strictly requires Admin HMAC signature (fails closed for candidate and anonymous callers)
+      // Anonymous revocation attempt -> expect 401
+      const anonRevoke = await fetch(`http://localhost:${port}/api/recording/revoke`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ room: secureRoom }),
+      });
+
+      // Candidate capability token revocation attempt -> expect 401 (signature required)
+      const candRevoke = await fetch(`http://localhost:${port}/api/recording/revoke`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${archiveToken}`,
+        },
+        body: JSON.stringify({ room: secureRoom }),
+      });
+
+      // Invalid admin signature -> expect 403
+      const badSigRevoke = await fetch(`http://localhost:${port}/api/recording/revoke`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-Admin-Signature": "invalid-deadbeef-signature-0000",
+        },
+        body: JSON.stringify({ room: secureRoom }),
+      });
+
+      // Authorized Admin revocation with valid HMAC-SHA256 signature
+      const adminSig = routes.computeSyncSignature(secureRoom, process.env.LIVEKIT_API_SECRET);
+      const revokeRes = await fetch(`http://localhost:${port}/api/recording/revoke`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-Admin-Signature": adminSig,
+        },
+        body: JSON.stringify({ room: secureRoom }),
+      });
+      const revokeData = await revokeRes.json();
+
+      // Access Room A with valid token (should now fail with 403)
+      const postRevokeStatusResA = await fetch(`http://localhost:${port}/api/recording/status?room=${secureRoom}`, {
+        headers: { Authorization: `Bearer ${archiveToken}` },
+      });
+      const postRevokeStatusDataA = await postRevokeStatusResA.json();
+
+      // Access Room B with valid token (should succeed with 200)
+      const statusResB = await fetch(`http://localhost:${port}/api/recording/status?room=${secureRoomB}`, {
+        headers: { Authorization: `Bearer ${archiveTokenB}` },
+      });
+      const statusDataB = await statusResB.json();
+
+      if (
+        anonRevoke.status === 401 &&
+        candRevoke.status === 401 &&
+        badSigRevoke.status === 403 &&
+        revokeRes.status === 200 &&
+        revokeData.revoked === true &&
+        postRevokeStatusResA.status === 403 &&
+        postRevokeStatusDataA.error?.includes("revoked") &&
+        statusResB.status === 200 &&
+        statusDataB.status === "completed"
+      ) {
+        console.log("PASS: Per-room revocation strictly enforces Admin HMAC signature and blocks revoked session while others remain unaffected");
+      } else {
+        console.error("FAIL: Per-room revocation test failed", {
+          anonStatus: anonRevoke.status,
+          candStatus: candRevoke.status,
+          badSigStatus: badSigRevoke.status,
+          revokeStatus: revokeRes.status,
+          revokeData,
+          postRevokeStatusA: postRevokeStatusResA.status,
+          postRevokeStatusDataA,
+          statusB: statusResB.status,
+        });
+        failures++;
+      }
+
+      // Test 40: Protected assessment-result retrieval enforces capability token and omits archiveTokenHash
+      const secureAssessmentId = `assessment-${Date.now()}`;
+      const secureAssessmentSig = routes.computeSyncSignature(secureAssessmentId, process.env.LIVEKIT_API_SECRET);
+      const secureAssessmentToken = crypto.randomBytes(32).toString("hex");
+      routes.registerRoomCapabilityToken(secureAssessmentId, secureAssessmentToken);
+
+      const postAssessmentRes = await fetch(`http://localhost:${port}/api/assessment-result?assessmentId=${secureAssessmentId}`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-Assessment-Signature": secureAssessmentSig,
+        },
+        body: JSON.stringify({
+          assessment_id: secureAssessmentId,
+          completed: true,
+          final_analysis: {
+            overall_score: 95,
+            scores: { technical: 95 },
+          },
+        }),
+      });
+
+      // Query without token -> 401
+      const unauthAssessRes = await fetch(`http://localhost:${port}/api/assessment-result?assessmentId=${secureAssessmentId}`);
+      // Query with token -> 200 and archiveTokenHash omitted from response
+      const authAssessRes = await fetch(`http://localhost:${port}/api/assessment-result?assessmentId=${secureAssessmentId}`, {
+        headers: { Authorization: `Bearer ${secureAssessmentToken}` },
+      });
+      const authAssessData = await authAssessRes.json();
+
+      if (
+        postAssessmentRes.status === 200 &&
+        unauthAssessRes.status === 401 &&
+        authAssessRes.status === 200 &&
+        authAssessData.final_analysis?.overall_score === 95 &&
+        authAssessData.archiveTokenHash === undefined
+      ) {
+        console.log("PASS: Assessment result retrieval enforces capability token and omits token hash from response");
+      } else {
+        console.error("FAIL: Protected assessment result retrieval test failed", {
+          unauthStatus: unauthAssessRes.status,
+          authStatus: authAssessRes.status,
+          authAssessData,
+        });
+        failures++;
+      }
+
+      // Test 41: Immediate disk persistence and simulated process restart rehydration
+      const restartRoom = `room-restart-${Date.now()}`;
+      const restartIdentity = `candidate-restart-${Date.now()}`;
+      const tokenRestartRes = await fetch(`http://localhost:${port}/api/token?identity=${restartIdentity}&room=${restartRoom}`);
+      const tokenRestartData = await tokenRestartRes.json();
+      const restartToken = tokenRestartData.archiveToken;
+      const expectedRestartHash = crypto.createHash("sha256").update(restartToken).digest("hex");
+
+      const fs = require("fs");
+      const path = require("path");
+      const assessmentsDir = path.join(__dirname, "..", "agent", "assessments");
+      const restartFilePath = path.join(assessmentsDir, `${restartRoom}.json`);
+      const diskFileContentBefore = JSON.parse(fs.readFileSync(restartFilePath, "utf-8"));
+
+      // Simulate process restart: wipe in-memory registries completely
+      routes.roomAuthRegistry.clear();
+      routes.assessmentResultsCache.clear();
+
+      // Verify getRoomAuthRecord rehydrates from disk
+      const rehydratedRecord = routes.getRoomAuthRecord(restartRoom);
+
+      // Set recording session to simulate completed interview on restarted server
+      recording.setRecordingSession(restartRoom, {
+        roomName: restartRoom,
+        status: "completed",
+        egressId: "egress-restart-1",
+        filepath: `recordings/${restartRoom}.mp4`,
+        videoUrl: `https://mock-account.r2.cloudflarestorage.com/interview-recordings/recordings/${restartRoom}.mp4`,
+        error: null,
+      });
+
+      const rehydratedStatusRes = await fetch(`http://localhost:${port}/api/recording/status?room=${restartRoom}`, {
+        headers: { Authorization: `Bearer ${restartToken}` },
+      });
+      const rehydratedStatusData = await rehydratedStatusRes.json();
+
+      if (
+        diskFileContentBefore.archiveTokenHash === expectedRestartHash &&
+        rehydratedRecord &&
+        rehydratedRecord.archiveTokenHash === expectedRestartHash &&
+        rehydratedStatusRes.status === 200 &&
+        rehydratedStatusData.status === "completed"
+      ) {
+        console.log("PASS: Capability token persisted to disk immediately and survives simulated process restart");
+      } else {
+        console.error("FAIL: Immediate disk persistence / restart rehydration test failed", {
+          diskFileContentBefore,
+          rehydratedRecord,
+          rehydratedStatusData,
+        });
+        failures++;
+      }
+
+      // Test 42: Fail-closed access rejects missing authorization records
+      const ghostRoom = `ghost-room-unregistered-${Date.now()}`;
+      const ghostStatusResNoToken = await fetch(`http://localhost:${port}/api/recording/status?room=${ghostRoom}`);
+      const ghostStatusResWithToken = await fetch(`http://localhost:${port}/api/recording/status?room=${ghostRoom}`, {
+        headers: { Authorization: "Bearer some-arbitrary-token-123456" },
+      });
+      const ghostAssessRes = await fetch(`http://localhost:${port}/api/assessment-result?assessmentId=${ghostRoom}`);
+
+      if (
+        ghostStatusResNoToken.status === 401 &&
+        ghostStatusResWithToken.status === 401 &&
+        ghostAssessRes.status === 401
+      ) {
+        console.log("PASS: Fail-closed security verified: missing authorization records strictly rejected with 401");
+      } else {
+        console.error("FAIL: Fail-closed test failed", {
+          noToken: ghostStatusResNoToken.status,
+          withToken: ghostStatusResWithToken.status,
+          assess: ghostAssessRes.status,
+        });
+        failures++;
+      }
+
+      // Test 43: Anti-overwrite on reconnect and full assessment data preservation
+      const preserveRoom = `room-preserve-${Date.now()}`;
+      const preserveToken = crypto.randomBytes(32).toString("hex");
+      const preserveFilePath = path.join(assessmentsDir, `${preserveRoom}.json`);
+
+      // Write full assessment with detailed fields first
+      const fullAssessmentData = {
+        assessment_id: preserveRoom,
+        completed: true,
+        transcript: [
+          { speaker: "interviewer", text: "Welcome to your interview." },
+          { speaker: "candidate", text: "Thank you, glad to be here." },
+        ],
+        final_analysis: {
+          overall_score: 89,
+          scores: { technical: 90, communication: 88 },
+          strengths: ["Strong problem solving"],
+          areas_for_improvement: ["Elaborate on trade-offs"],
+          behavioral_summary: "Great candidate.",
+        },
+        recording: {
+          status: "completed",
+          filepath: `recordings/${preserveRoom}.mp4`,
+          videoUrl: `https://mock-account.r2.cloudflarestorage.com/interview-recordings/recordings/${preserveRoom}.mp4`,
+        },
+      };
+      fs.writeFileSync(preserveFilePath, JSON.stringify(fullAssessmentData, null, 2), "utf-8");
+
+      // Register capability token (persists hash without clobbering existing assessment fields)
+      routes.registerRoomCapabilityToken(preserveRoom, preserveToken);
+
+      // Attempt reconnect without token -> rejected with 401
+      const unauthReconnect = await fetch(`http://localhost:${port}/api/token?room=${preserveRoom}`);
+
+      // Attempt reconnect with wrong token -> rejected with 403
+      const badTokenReconnect = await fetch(`http://localhost:${port}/api/token?room=${preserveRoom}`, {
+        headers: { Authorization: "Bearer wrong-candidate-token-12345" },
+      });
+
+      // Authorized reconnect with correct token -> preserves token and returns fresh LiveKit JWT
+      const goodReconnect = await fetch(`http://localhost:${port}/api/token?room=${preserveRoom}`, {
+        headers: { Authorization: `Bearer ${preserveToken}` },
+      });
+      const goodReconnectData = await goodReconnect.json();
+
+      // Read disk file to ensure transcript, scores, and final_analysis were NOT wiped
+      const diskAfterReconnect = JSON.parse(fs.readFileSync(preserveFilePath, "utf-8"));
+
+      if (
+        unauthReconnect.status === 401 &&
+        badTokenReconnect.status === 403 &&
+        goodReconnect.status === 200 &&
+        goodReconnectData.archiveToken === preserveToken &&
+        goodReconnectData.reconnected === true &&
+        diskAfterReconnect.transcript?.length === 2 &&
+        diskAfterReconnect.final_analysis?.overall_score === 89 &&
+        diskAfterReconnect.recording?.filepath === `recordings/${preserveRoom}.mp4`
+      ) {
+        console.log("PASS: Anti-overwrite protects capability token on reconnect while preserving all existing assessment fields");
+      } else {
+        console.error("FAIL: Anti-overwrite and data preservation test failed", {
+          unauth: unauthReconnect.status,
+          badToken: badTokenReconnect.status,
+          goodStatus: goodReconnect.status,
+          goodData: goodReconnectData,
+          diskAfterReconnect,
+        });
+        failures++;
+      }
+
+    } finally {
+      // Restore original environment
+      for (const [key, val] of Object.entries(originalSecureEnv)) {
+        if (val === undefined) {
+          delete process.env[key];
+        } else {
+          process.env[key] = val;
+        }
+      }
     }
 
     // Clean up test env vars and reset client
