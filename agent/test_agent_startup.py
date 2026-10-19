@@ -3478,6 +3478,7 @@ class TestAgentStartup(unittest.TestCase):
         state.add_transcript("interviewer", prior_q)
         state.asked_questions.append(prior_q)
         state.waiting_for_resume = True
+        state.waiting_for_topic_choice = True
         state.neutral_topic_turns = 1
         initial_asked = state.questions_asked
 
@@ -3530,6 +3531,7 @@ class TestAgentStartup(unittest.TestCase):
         state = AssessmentState()
         state.add_transcript("interviewer", "How do you manage sprint priorities?")
         state.waiting_for_resume = True
+        state.waiting_for_topic_choice = True
         state.neutral_topic_turns = 1
         initial_asked = state.questions_asked
 
@@ -3782,6 +3784,153 @@ class TestAgentStartup(unittest.TestCase):
         self.assertEqual(state.transcript[-1]["role"], "interviewer")
         self.assertEqual(state.transcript[-2]["role"], "candidate")
         self.assertEqual(state.transcript[-2]["text"], valid_answer)
+
+    def test_regression_topic_change_flow_rephrase_or_move_exact_turns(self):
+        """Regression test for exact topic-change conversation flow:
+        Turn 1: Candidate says: 'I want to talk about another topic.'
+                Interviewer offers to rephrase or move to another relevant interview question.
+        Turn 2: Candidate says: 'Move to another question.'
+                Agent routes choice even though reply does not independently match is_topic_pref.
+                Agent moves to next unasked, relevant question, increments questions_asked exactly once,
+                records refused question, and does NOT score choice as a substantive answer.
+        Turn 3: When NOT waiting for topic choice, unrelated answers mentioning 'move to another'
+                are NOT hijacked as a topic choice.
+        """
+        import asyncio
+        from unittest.mock import AsyncMock, MagicMock
+        from agent.agent import (
+            AssessmentState,
+            process_interview_turn,
+            PROFESSIONAL_TOPIC_REQUEST_RESPONSE,
+            is_explicit_topic_change_preference,
+            is_choice_to_move_to_another_question,
+            FALLBACK_BEHAVIORAL_QUESTIONS,
+        )
+
+        # 1. Linguistic verification: 'Move to another question.' does NOT match explicit topic change preference,
+        # but DOES match choice to move to another question.
+        turn1_text = "I want to talk about another topic."
+        turn2_text = "Move to another question."
+        self.assertTrue(is_explicit_topic_change_preference(turn1_text))
+        self.assertFalse(is_explicit_topic_change_preference(turn2_text))
+        self.assertTrue(is_choice_to_move_to_another_question(turn2_text))
+
+        state = AssessmentState()
+        prior_q = "Can you describe a challenging technical problem you solved?"
+        state.add_transcript("interviewer", prior_q)
+        state.asked_questions.append(prior_q)
+        state.questions_asked = 1
+        self.assertFalse(state.waiting_for_topic_choice)
+
+        speak_mock = AsyncMock()
+        analyze_mock = AsyncMock()
+        send_mock = AsyncMock()
+        gen_mock = AsyncMock()
+
+        # --- Turn 1: Candidate requests another topic ---
+        cont1 = asyncio.run(process_interview_turn(
+            ctx=MagicMock(),
+            state=state,
+            answer=turn1_text,
+            remaining_seconds=300,
+            warning_sent=False,
+            user_answer_queue=asyncio.Queue(),
+            analyzed_answers=set(),
+            manual_end_event=asyncio.Event(),
+            timer_finished_event=asyncio.Event(),
+            disconnect_event=asyncio.Event(),
+            speak_fn=speak_mock,
+            analyze_fn=analyze_mock,
+            generate_question_fn=gen_mock,
+            send_event_fn=send_mock,
+        ))
+
+        self.assertTrue(cont1)
+        self.assertTrue(state.waiting_for_topic_choice)
+        self.assertTrue(state.waiting_for_resume)
+        self.assertEqual(state.questions_asked, 1)  # Question count NOT incremented
+        analyze_mock.assert_not_awaited()           # Turn NOT scored as substantive
+        gen_mock.assert_not_awaited()
+        speak_mock.assert_awaited_once()
+        spoken_1 = speak_mock.await_args[0][0]
+        self.assertEqual(spoken_1, PROFESSIONAL_TOPIC_REQUEST_RESPONSE)
+        self.assertIn("Would you like me to rephrase this question, or shall we move to another relevant interview question?", spoken_1)
+
+        # --- Turn 2: Candidate chooses 'Move to another question.' ---
+        speak_mock.reset_mock()
+        analyze_mock.reset_mock()
+        gen_mock.reset_mock()
+
+        cont2 = asyncio.run(process_interview_turn(
+            ctx=MagicMock(),
+            state=state,
+            answer=turn2_text,
+            remaining_seconds=280,
+            warning_sent=False,
+            user_answer_queue=asyncio.Queue(),
+            analyzed_answers=set(),
+            manual_end_event=asyncio.Event(),
+            timer_finished_event=asyncio.Event(),
+            disconnect_event=asyncio.Event(),
+            speak_fn=speak_mock,
+            analyze_fn=analyze_mock,
+            generate_question_fn=gen_mock,
+            send_event_fn=send_mock,
+        ))
+
+        self.assertTrue(cont2)
+        # Verify choice flag is reset
+        self.assertFalse(state.waiting_for_topic_choice)
+        self.assertFalse(state.waiting_for_resume)
+        # Verify question is counted exactly once
+        self.assertEqual(state.questions_asked, 2)
+        # Verify candidate choice is NOT scored as a substantive answer
+        analyze_mock.assert_not_awaited()
+        gen_mock.assert_not_awaited()
+        # Verify previous question recorded as refused
+        self.assertIn(prior_q, state.refused_questions)
+        # Verify spoken response moves to relevant unasked question
+        speak_mock.assert_awaited_once()
+        spoken_2 = speak_mock.await_args[0][0]
+        self.assertTrue(spoken_2.startswith("Certainly. Let's move to another relevant interview question:"))
+        self.assertNotEqual(spoken_2, prior_q)
+        # Verify newly asked question is tracked and distinct
+        self.assertEqual(len(state.asked_questions), 2)
+        new_q = state.asked_questions[1]
+        self.assertIn(new_q, FALLBACK_BEHAVIORAL_QUESTIONS)
+        self.assertIn(new_q, spoken_2)
+
+        # --- Turn 3: When NOT waiting for topic choice, statements are NOT treated as topic choice ---
+        speak_mock.reset_mock()
+        analyze_mock.reset_mock()
+        gen_mock.reset_mock()
+        next_gen_q = "How do you ensure code quality across the team?"
+        gen_mock.return_value = next_gen_q
+
+        self.assertFalse(state.waiting_for_topic_choice)
+        survey_answer = "In my previous project when users clicked move to another question on our survey, we validated all inputs."
+
+        cont3 = asyncio.run(process_interview_turn(
+            ctx=MagicMock(),
+            state=state,
+            answer=survey_answer,
+            remaining_seconds=260,
+            warning_sent=False,
+            user_answer_queue=asyncio.Queue(),
+            analyzed_answers=set(),
+            manual_end_event=asyncio.Event(),
+            timer_finished_event=asyncio.Event(),
+            disconnect_event=asyncio.Event(),
+            speak_fn=speak_mock,
+            analyze_fn=analyze_mock,
+            generate_question_fn=gen_mock,
+            send_event_fn=send_mock,
+        ))
+
+        self.assertTrue(cont3)
+        # Substantive answer was properly analyzed, NOT routed as topic choice
+        analyze_mock.assert_awaited_once_with(state, survey_answer)
+        self.assertEqual(state.questions_asked, 3)
 
 
 if __name__ == "__main__":

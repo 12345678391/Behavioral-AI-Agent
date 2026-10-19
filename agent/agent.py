@@ -234,6 +234,7 @@ class AssessmentState:
     neutral_topic_turns: int = 0
     frustration_count: int = 0
     waiting_for_resume: bool = False
+    waiting_for_topic_choice: bool = False
 
     def add_transcript(
         self,
@@ -344,6 +345,9 @@ class AssessmentState:
 
             "waiting_for_resume":
                 self.waiting_for_resume,
+
+            "waiting_for_topic_choice":
+                self.waiting_for_topic_choice,
         }
 
     @classmethod
@@ -388,6 +392,7 @@ class AssessmentState:
             neutral_topic_turns=int(data.get("neutral_topic_turns", 0)),
             frustration_count=int(data.get("frustration_count", 0)),
             waiting_for_resume=bool(data.get("waiting_for_resume", False)),
+            waiting_for_topic_choice=bool(data.get("waiting_for_topic_choice", False)),
         )
         if evidence_dict:
             state.evidence = evidence_dict
@@ -728,6 +733,7 @@ CHOICE_MOVE_TO_ANOTHER_QUESTION_PATTERNS = [
     r"\b(?:i['’]?d\s+prefer\s+(?:to\s+)?move\s+to|prefer\s+another\s+question|move\s+to\s+another|another\s+relevant\s+question)\b",
     r"\b(?:the\s+)?(?:second\s+option|latter|another\s+question|next\s+one)\b",
     r"\bmove\s+to\s+another\b",
+    r"\b(?:let['’]?s\s+)?move\s+on\b",
 ]
 
 _COMPILED_CHOICE_MOVE = [re.compile(p, re.IGNORECASE) for p in CHOICE_MOVE_TO_ANOTHER_QUESTION_PATTERNS]
@@ -931,6 +937,7 @@ def is_non_introduction_turn(text: str, state: AssessmentState | None = None) ->
         return True
     if state is not None and (
         bool(getattr(state, "waiting_for_resume", False))
+        or bool(getattr(state, "waiting_for_topic_choice", False))
         or bool(getattr(state, "preferred_neutral_topic", ""))
         or getattr(state, "neutral_topic_turns", 0) > 0
     ):
@@ -2591,32 +2598,92 @@ async def process_interview_turn(
     # 2. Ambiguous Ending Request (asks clarification)
     # 3. Candidate Frustration (calm de-escalation, avoids immediately repeating question)
     # 4. Abusive language (issues professional warning, never mirrors abuse)
-    # 5. Topic-change / neutral topic preference (polite acknowledgment, brief neutral engagement)
-    # 6. Boundary request
-    # 7. Question refusal
-    # 8. Clarification request
-    # 9. Off-topic answer
-    # 10. Substantive answer
+    # 5. Topic choice response (when interviewer is waiting for candidate to choose between rephrasing and moving on)
+    # 6. Topic-change / neutral topic preference (polite acknowledgment, brief neutral engagement)
+    # 7. Boundary request
+    # 8. Question refusal
+    # 9. Clarification request
+    # 10. Off-topic answer
+    # 11. Substantive answer
     is_end = is_candidate_end_request(answer)
     is_ambiguous = not is_end and is_ambiguous_end_request(answer)
     is_frustration = not is_end and not is_ambiguous and is_candidate_frustration(answer)
     is_abuse = not is_end and not is_ambiguous and not is_frustration and is_abusive_language(answer)
-    is_waiting_resume = bool(getattr(state, "waiting_for_resume", False)) or state.neutral_topic_turns > 0 or bool(state.preferred_neutral_topic)
-    is_topic_pref = not is_end and not is_ambiguous and not is_frustration and not is_abuse and (
+
+    is_waiting_choice = bool(getattr(state, "waiting_for_topic_choice", False))
+    is_choice_move = (
+        not is_end
+        and not is_ambiguous
+        and not is_frustration
+        and not is_abuse
+        and is_waiting_choice
+        and is_choice_to_move_to_another_question(answer)
+    )
+    is_choice_rephrase = (
+        not is_end
+        and not is_ambiguous
+        and not is_frustration
+        and not is_abuse
+        and not is_choice_move
+        and is_waiting_choice
+        and (
+            any(w in answer.lower() for w in ("rephrase", "repeat the question", "clarify the question"))
+            or is_clarification_request(answer)
+        )
+    )
+    is_choice_resume = (
+        not is_end
+        and not is_ambiguous
+        and not is_frustration
+        and not is_abuse
+        and not is_choice_move
+        and not is_choice_rephrase
+        and is_waiting_choice
+        and is_permission_to_resume(answer)
+    )
+    is_choice_ack = (
+        not is_end
+        and not is_ambiguous
+        and not is_frustration
+        and not is_abuse
+        and not is_choice_move
+        and not is_choice_rephrase
+        and not is_choice_resume
+        and is_waiting_choice
+        and is_bare_acknowledgment(answer)
+    )
+    is_choice_moment = (
+        not is_end
+        and not is_ambiguous
+        and not is_frustration
+        and not is_abuse
+        and not is_choice_move
+        and not is_choice_rephrase
+        and not is_choice_resume
+        and not is_choice_ack
+        and is_waiting_choice
+        and any(w in answer.lower() for w in ("another moment", "a minute", "a moment", "not yet", "give me", "need time", "just a sec"))
+    )
+    is_topic_choice = is_choice_move or is_choice_rephrase or is_choice_resume or is_choice_ack or is_choice_moment
+
+    is_waiting_resume = (not is_waiting_choice) and (
+        bool(getattr(state, "waiting_for_resume", False))
+        or state.neutral_topic_turns > 0
+        or bool(state.preferred_neutral_topic)
+    )
+    is_topic_pref = not is_end and not is_ambiguous and not is_frustration and not is_abuse and not is_topic_choice and (
         is_explicit_topic_change_preference(answer)
         or (is_waiting_resume and (
             is_bare_acknowledgment(answer)
             or is_permission_to_resume(answer)
-            or is_choice_to_move_to_another_question(answer)
-            or any(w in answer.lower() for w in ("another moment", "a minute", "a moment", "not yet", "give me", "need time", "just a sec", "rephrase"))
-            or is_clarification_request(answer)
+            or any(w in answer.lower() for w in ("another moment", "a minute", "a moment", "not yet", "give me", "need time", "just a sec"))
         ))
     )
-    is_boundary = not is_end and not is_ambiguous and not is_frustration and not is_abuse and not is_topic_pref and is_personal_or_unrelated_request(answer)
-    is_refusal = not is_end and not is_ambiguous and not is_frustration and not is_abuse and not is_topic_pref and not is_boundary and is_candidate_refusal(answer)
-    is_clarification = not is_end and not is_ambiguous and not is_frustration and not is_abuse and not is_topic_pref and not is_boundary and not is_refusal and is_clarification_request(answer)
-    is_off_topic = not is_end and not is_ambiguous and not is_frustration and not is_abuse and not is_topic_pref and not is_boundary and not is_refusal and not is_clarification and is_off_topic_answer(answer)
-    is_non_substantive = is_end or is_ambiguous or is_frustration or is_abuse or is_topic_pref or is_boundary or is_refusal or is_clarification or is_off_topic
+    is_boundary = not is_end and not is_ambiguous and not is_frustration and not is_abuse and not is_topic_choice and not is_topic_pref and is_personal_or_unrelated_request(answer)
+    is_refusal = not is_end and not is_ambiguous and not is_frustration and not is_abuse and not is_topic_choice and not is_topic_pref and not is_boundary and is_candidate_refusal(answer)
+    is_clarification = not is_end and not is_ambiguous and not is_frustration and not is_abuse and not is_topic_choice and not is_topic_pref and not is_boundary and not is_refusal and is_clarification_request(answer)
+    is_off_topic = not is_end and not is_ambiguous and not is_frustration and not is_abuse and not is_topic_choice and not is_topic_pref and not is_boundary and not is_refusal and not is_clarification and is_off_topic_answer(answer)
+    is_non_substantive = is_end or is_ambiguous or is_frustration or is_abuse or is_topic_choice or is_topic_pref or is_boundary or is_refusal or is_clarification or is_off_topic
 
     if not any(item.get("role") == "candidate" and item.get("text") == answer for item in state.transcript):
         state.add_transcript("candidate", answer)
@@ -2635,6 +2702,8 @@ async def process_interview_turn(
     elif is_abuse:
         state.abusive_language_count += 1
         print(f"[Agent] Abusive language detected (count={state.abusive_language_count}). Issuing professional warning.")
+    elif is_topic_choice:
+        print(f"[Agent] Candidate topic choice response detected (move={is_choice_move}, rephrase={is_choice_rephrase}, ack={is_choice_ack}): '{answer[:80]}'")
     elif is_topic_pref:
         print(f"[Agent] Candidate neutral topic preference detected: '{answer[:80]}'. Engaging naturally.")
     elif is_boundary:
@@ -2654,6 +2723,7 @@ async def process_interview_turn(
         else "ambiguous_end" if is_ambiguous
         else "frustration" if is_frustration
         else "abuse" if is_abuse
+        else "topic_choice" if is_topic_choice
         else "topic_pref" if is_topic_pref
         else "boundary" if is_boundary
         else "refusal" if is_refusal
@@ -2661,7 +2731,7 @@ async def process_interview_turn(
         else "off_topic" if is_off_topic
         else "substantive"
     )
-    llm_generator_called = not (is_end or is_ambiguous or is_frustration or is_abuse or is_topic_pref or is_clarification or is_off_topic)
+    llm_generator_called = not (is_end or is_ambiguous or is_frustration or is_abuse or is_topic_choice or is_topic_pref or is_clarification or is_off_topic)
     print(f"[Turn Routing] Candidate answer: '{answer[:80]}'")
     print(
         f"[Turn Routing] Selected branch: {branch_name} | is_off_topic={is_off_topic} "
@@ -2735,7 +2805,7 @@ async def process_interview_turn(
                     "I apologize for any frustration. We will conclude our session here.",
                     "Frustration closing",
                 )
-            elif is_topic_pref:
+            elif is_topic_choice or is_topic_pref:
                 await speak_fn(
                     "I understand. We will conclude our session here.",
                     "Topic preference closing",
@@ -2844,17 +2914,14 @@ async def process_interview_turn(
             state.add_transcript("interviewer", abuse_resp)
         return True
 
-    # 5. TOPIC-CHANGE / RESUME HANDLING
-    if is_topic_pref and not disconnect_event.is_set() and not manual_end_event.is_set():
+    # 5. TOPIC CHOICE HANDLING (when waiting for candidate to choose between rephrasing and moving on)
+    if is_topic_choice and not disconnect_event.is_set() and not manual_end_event.is_set():
         if not any(item.get("role") == "candidate" and item.get("text") == answer for item in state.transcript):
             state.add_transcript("candidate", answer)
 
         # 5a. Check if candidate chooses to move to another relevant professional interview question
-        if is_choice_to_move_to_another_question(answer) and (
-            bool(getattr(state, "waiting_for_resume", False))
-            or state.neutral_topic_turns > 0
-            or bool(getattr(state, "preferred_neutral_topic", ""))
-        ):
+        if is_choice_move:
+            state.waiting_for_topic_choice = False
             state.waiting_for_resume = False
             state.preferred_neutral_topic = ""
             state.neutral_topic_turns = 0
@@ -2883,12 +2950,31 @@ async def process_interview_turn(
                 state.add_transcript("interviewer", move_resp)
             return True
 
-        # 5b. Check if candidate clearly agrees to resume assessment (Rule 5)
-        if is_permission_to_resume(answer) and (
-            bool(getattr(state, "waiting_for_resume", False))
-            or state.neutral_topic_turns > 0
-            or bool(getattr(state, "preferred_neutral_topic", ""))
-        ):
+        # 5b. Check if candidate asks to rephrase the question
+        elif is_choice_rephrase:
+            state.waiting_for_topic_choice = False
+            state.waiting_for_resume = False
+            state.preferred_neutral_topic = ""
+            state.neutral_topic_turns = 0
+            last_q = get_last_interviewer_question(state)
+            clean_q = strip_refusal_prefix(last_q) or "Could you introduce yourself and tell me about your background?"
+            rephrase_resp = f"Certainly. To rephrase: {clean_q}"
+            await send_event_fn(
+                ctx,
+                "interview_question",
+                {
+                    "question": rephrase_resp,
+                    "question_number": state.questions_asked,
+                },
+            )
+            spoke_ok = await speak_fn(rephrase_resp, "Rephrased question")
+            if spoke_ok:
+                state.add_transcript("interviewer", rephrase_resp)
+            return True
+
+        # 5c. Check if candidate agrees to resume assessment
+        elif is_choice_resume:
+            state.waiting_for_topic_choice = False
             state.waiting_for_resume = False
             state.preferred_neutral_topic = ""
             state.neutral_topic_turns = 0
@@ -2914,40 +3000,82 @@ async def process_interview_turn(
                 state.add_transcript("interviewer", resume_resp)
             return True
 
-        # 5c. Check if candidate asks to rephrase the question (Rule 4)
-        if any(w in answer.lower() for w in ("rephrase", "repeat the question", "clarify the question")) or is_clarification_request(answer):
+        # 5d. Check if candidate requests a brief moment
+        elif is_choice_moment:
+            state.waiting_for_resume = True
+            topic_resp = "Take all the time you need. Whenever you feel comfortable resuming, just let me know."
+
+        # 5e. Bare acknowledgment like "Okay" (Rule 6: do not treat bare "Okay" as permission to move or resume)
+        else:
+            state.waiting_for_topic_choice = True
+            state.waiting_for_resume = True
+            topic_resp = "Take your time. Please let me know whether you would like me to rephrase the question or move to another relevant interview question."
+
+        await send_event_fn(
+            ctx,
+            "interview_question",
+            {
+                "question": topic_resp,
+                "question_number": state.questions_asked,
+            },
+        )
+        spoke_ok = await speak_fn(topic_resp, "Topic choice response")
+        if spoke_ok:
+            state.add_transcript("interviewer", topic_resp)
+        return True
+
+    # 6. TOPIC-CHANGE / RESUME HANDLING
+    if is_topic_pref and not disconnect_event.is_set() and not manual_end_event.is_set():
+        if not any(item.get("role") == "candidate" and item.get("text") == answer for item in state.transcript):
+            state.add_transcript("candidate", answer)
+
+        # 6a. Check if candidate clearly agrees to resume assessment (Rule 5)
+        if is_permission_to_resume(answer) and (
+            bool(getattr(state, "waiting_for_resume", False))
+            or state.neutral_topic_turns > 0
+            or bool(getattr(state, "preferred_neutral_topic", ""))
+        ):
             state.waiting_for_resume = False
+            state.waiting_for_topic_choice = False
             state.preferred_neutral_topic = ""
             state.neutral_topic_turns = 0
-            last_q = get_last_interviewer_question(state)
-            clean_q = strip_refusal_prefix(last_q) or "Could you introduce yourself and tell me about your background?"
-            rephrase_resp = f"Certainly. To rephrase: {clean_q}"
+            state.repeat_count_for_current_question = 0
+            next_q = get_next_redirect_question(state)
+            if next_q not in state.asked_questions:
+                state.asked_questions.append(next_q)
+            area = get_question_behavioral_area(next_q)
+            if area and area not in state.asked_areas:
+                state.asked_areas.append(area)
+            state.questions_asked += 1
+            resume_resp = f"Thank you. Let's return to the assessment. {next_q}"
             await send_event_fn(
                 ctx,
                 "interview_question",
                 {
-                    "question": rephrase_resp,
+                    "question": resume_resp,
                     "question_number": state.questions_asked,
                 },
             )
-            spoke_ok = await speak_fn(rephrase_resp, "Rephrased question")
+            spoke_ok = await speak_fn(resume_resp, f"Resumed question #{state.questions_asked}")
             if spoke_ok:
-                state.add_transcript("interviewer", rephrase_resp)
+                state.add_transcript("interviewer", resume_resp)
             return True
 
-        # 5d. Check if candidate requests a brief moment (Rule 4)
+        # 6b. Check if candidate requests a brief moment (Rule 4)
         if any(w in answer.lower() for w in ("another moment", "a minute", "a moment", "not yet", "give me", "need time", "just a sec")):
             state.waiting_for_resume = True
             topic_resp = "Take all the time you need. Whenever you feel comfortable resuming, just let me know."
 
-        # 5e. Bare acknowledgment like "Okay" (Rule 5: do not treat bare "Okay" as permission to resume)
+        # 6c. Bare acknowledgment like "Okay" (Rule 5: do not treat bare "Okay" as permission to resume)
         elif is_bare_acknowledgment(answer):
             state.waiting_for_resume = True
+            state.waiting_for_topic_choice = True
             topic_resp = "Take your time. Please let me know whether you would like me to rephrase the question or move to another relevant interview question."
 
-        # 5f. Initial or repeated request to change topic away from professional life (Rule 4)
+        # 6d. Initial or repeated request to change topic away from professional life (Rule 4)
         else:
             state.waiting_for_resume = True
+            state.waiting_for_topic_choice = True
             state.neutral_topic_turns += 1
             if state.neutral_topic_turns <= 1:
                 topic_resp = PROFESSIONAL_TOPIC_REQUEST_RESPONSE
