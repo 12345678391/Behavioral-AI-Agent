@@ -774,13 +774,17 @@ def is_span_reported_speech(text: str, start: int, end: int) -> bool:
 
     # Check quote parity before start
     pre_no_contractions = re.sub(r"\w['’]\w", "", pre)
-    quotes = (
+    double_quotes = (
         pre_no_contractions.count('"')
         + pre_no_contractions.count("“")
         + pre_no_contractions.count("”")
-        + pre_no_contractions.count("'")
     )
-    is_inside_quotes = (quotes % 2 == 1)
+    single_quotes = (
+        pre_no_contractions.count("'")
+        + pre_no_contractions.count("‘")
+        + pre_no_contractions.count("’")
+    )
+    is_inside_quotes = (double_quotes % 2 == 1) or (single_quotes % 2 == 1)
 
     if is_inside_quotes:
         # Match is enclosed in quotation marks. Check if preceding text introduced the quote
@@ -799,7 +803,12 @@ def is_span_reported_speech(text: str, start: int, end: int) -> bool:
     curr_clause = clause_parts[-1] if clause_parts else ""
 
     # If quotes closed inside curr_clause, only inspect after the last closing quote
-    last_quote_pos = max(curr_clause.rfind('"'), curr_clause.rfind('”'), curr_clause.rfind("'"))
+    last_quote_pos = max(
+        curr_clause.rfind('"'),
+        curr_clause.rfind('”'),
+        curr_clause.rfind("'"),
+        curr_clause.rfind("’"),
+    )
     if last_quote_pos >= 0:
         curr_clause = curr_clause[last_quote_pos + 1:]
 

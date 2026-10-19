@@ -4171,6 +4171,7 @@ class TestAgentStartup(unittest.TestCase):
             "There was an incident where a user became verbally abusive and screamed at our team. I followed our company de-escalation protocol.",
             "In dealing with an abusive client who called our staff idiots, I remained professional and defused the conflict.",
             "In my previous position, a customer said you suck and are worthless, so I listened actively to understand their frustration.",
+            "A client said, ‘you are useless,’ to my colleague.",
         ]
         for narrative in workplace_narratives:
             self.assertFalse(is_abusive_language(narrative), f"Workplace narrative falsely flagged as abuse: {narrative}")
@@ -4267,6 +4268,9 @@ class TestAgentStartup(unittest.TestCase):
         quoted_alone = 'A customer said to me: "you are an idiot and you suck", but I de-escalated.'
         self.assertFalse(is_abusive_language(quoted_alone))
 
+        curly_quoted_alone = "A client said, ‘you are useless,’ to my colleague."
+        self.assertFalse(is_abusive_language(curly_quoted_alone))
+
         # Quoted + direct abuse to AI in the same message -> FLAGGED as abuse
         quoted_plus_direct_1 = 'A customer said to me: "you are an idiot", but you are useless.'
         self.assertTrue(is_abusive_language(quoted_plus_direct_1))
@@ -4276,6 +4280,9 @@ class TestAgentStartup(unittest.TestCase):
 
         quoted_plus_direct_3 = 'A client said shut the fuck up to our team, but you are useless.'
         self.assertTrue(is_abusive_language(quoted_plus_direct_3))
+
+        quoted_plus_direct_curly = "A client said, ‘you are useless,’ and you are also an idiot."
+        self.assertTrue(is_abusive_language(quoted_plus_direct_curly))
 
         # 4. Ordinary frustration and disagreement — NOT flagged as abuse
         frustration_and_disagreement = [
