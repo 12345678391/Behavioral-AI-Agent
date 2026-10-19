@@ -462,12 +462,38 @@ const server = app.listen(0, async () => {
     const testRecToken = "test-archive-token-rec-1234567890abcdef12345678";
     routes.registerRoomCapabilityToken(testRoom, testRecToken);
 
-    const stopRes = await fetch(`http://localhost:${port}/api/recording/stop`, {
+    // 1. Unauthenticated request rejected with 401 and cannot stop active recording
+    const unauthStopRes = await fetch(`http://localhost:${port}/api/recording/stop`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ room: testRoom }),
     });
+    const unauthStopData = await unauthStopRes.json();
+    const activeStatusAfterUnauth = recording.getRecordingSession(testRoom)?.status;
+
+    // 2. Invalid-token request rejected with 403 and cannot stop active recording
+    const invalidStopRes = await fetch(`http://localhost:${port}/api/recording/stop`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: "Bearer invalid-capability-token-xyz",
+      },
+      body: JSON.stringify({ room: testRoom }),
+    });
+    const invalidStopData = await invalidStopRes.json();
+    const activeStatusAfterInvalid = recording.getRecordingSession(testRoom)?.status;
+
+    // 3. Authorized request stops recording and returns presigned URL
+    const stopRes = await fetch(`http://localhost:${port}/api/recording/stop`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${testRecToken}`,
+      },
+      body: JSON.stringify({ room: testRoom }),
+    });
     const stopData = await stopRes.json();
+    const completedSession = recording.getRecordingSession(testRoom);
 
     const statusRes = await fetch(`http://localhost:${port}/api/recording/status?room=${testRoom}`, {
       headers: { Authorization: `Bearer ${testRecToken}` },
@@ -475,8 +501,20 @@ const server = app.listen(0, async () => {
     const statusData = await statusRes.json();
 
     if (
+      unauthStopRes.status === 401 &&
+      unauthStopData.success === false &&
+      unauthStopData.videoUrl === null &&
+      activeStatusAfterUnauth === "active" &&
+      invalidStopRes.status === 403 &&
+      invalidStopData.success === false &&
+      invalidStopData.videoUrl === null &&
+      activeStatusAfterInvalid === "active" &&
+      stopRes.status === 200 &&
       stopData.success === true &&
-      stopData.videoUrl === null &&
+      stopData.status === "completed" &&
+      typeof stopData.videoUrl === "string" &&
+      stopData.videoUrl.includes("X-Amz-Signature=") &&
+      completedSession?.status === "completed" &&
       statusData.success === true &&
       statusData.status === "completed" &&
       typeof statusData.videoUrl === "string" &&
@@ -484,9 +522,14 @@ const server = app.listen(0, async () => {
       statusData.videoUrl.includes("X-Amz-Algorithm=AWS4-HMAC-SHA256") &&
       statusData.videoUrl.includes("X-Amz-Signature=")
     ) {
-      console.log("PASS: Recording status returns completed with verified playback URL:", statusData.videoUrl);
+      console.log("PASS: Unauthenticated/invalid stop requests rejected (401/403) without altering active session; authorized request stops recording");
     } else {
-      console.error("FAIL: Recording status query failed", { stopData, statusData });
+      console.error("FAIL: Recording stop authorization test failed", {
+        unauth: { status: unauthStopRes.status, data: unauthStopData },
+        invalid: { status: invalidStopRes.status, data: invalidStopData },
+        stopData,
+        statusData,
+      });
       failures++;
     }
 
@@ -1230,10 +1273,13 @@ const server = app.listen(0, async () => {
       recording.setEgressClientForTest(null);
 
       if (
-        unauthStopData.success === true &&
+        unauthStopRes.status === 401 &&
+        unauthStopData.success === false &&
         unauthStopData.videoUrl === null &&
-        invalidTokenStopData.success === true &&
+        invalidTokenStopRes.status === 403 &&
+        invalidTokenStopData.success === false &&
         invalidTokenStopData.videoUrl === null &&
+        metaStopRes.status === 200 &&
         metaStopData.status === "completed" &&
         metaStopData.videoUrl &&
         metaStopData.videoUrl.includes("X-Amz-Signature=") &&
@@ -1250,6 +1296,74 @@ const server = app.listen(0, async () => {
         console.log("PASS: Recording stop protects videoUrl (null for unauth/invalid, presigned for auth) and normalizes duration to seconds");
       } else {
         console.error("FAIL: Recording metadata preservation test failed", { unauthStopData, invalidTokenStopData, metaStopData, metaStatusData });
+        failures++;
+      }
+
+      // Test 47: Trusted internal / admin signature stop verification
+      const adminRoom = `admin-stop-room-${Date.now()}`;
+      recording.setRecordingSession(adminRoom, {
+        roomName: adminRoom,
+        status: "active",
+        egressId: "egress-admin-789",
+        filepath: `recordings/${adminRoom}.mp4`,
+        videoUrl: null,
+        error: null,
+        startedAt: Date.now() - 30000,
+        endedAt: null,
+        storageType: "s3",
+      });
+
+      const mockAdminEgressClient = {
+        stopEgress: async () => ({
+          status: 3,
+          fileResults: [{ filename: `recordings/${adminRoom}.mp4`, size: 1024n, duration: 60000000000n }],
+        }),
+        listEgress: async () => [],
+      };
+      recording.setEgressClientForTest(mockAdminEgressClient);
+
+      // 1. Invalid admin signature -> rejected with 403, active recording untouched
+      const badAdminStop = await fetch(`http://localhost:${port}/api/recording/stop`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-Admin-Signature": "invalid-deadbeef-signature-0000",
+        },
+        body: JSON.stringify({ room: adminRoom }),
+      });
+      const badAdminStopData = await badAdminStop.json();
+      const adminStatusAfterBad = recording.getRecordingSession(adminRoom)?.status;
+
+      // 2. Valid admin signature -> successfully stops recording
+      const validAdminSig = routes.computeSyncSignature(adminRoom, process.env.LIVEKIT_API_SECRET);
+      const goodAdminStop = await fetch(`http://localhost:${port}/api/recording/stop`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-Admin-Signature": validAdminSig,
+        },
+        body: JSON.stringify({ room: adminRoom }),
+      });
+      const goodAdminStopData = await goodAdminStop.json();
+      const adminStatusAfterGood = recording.getRecordingSession(adminRoom)?.status;
+
+      recording.setEgressClientForTest(null);
+
+      if (
+        badAdminStop.status === 403 &&
+        badAdminStopData.success === false &&
+        badAdminStopData.videoUrl === null &&
+        adminStatusAfterBad === "active" &&
+        goodAdminStop.status === 200 &&
+        goodAdminStopData.success === true &&
+        goodAdminStopData.status === "completed" &&
+        goodAdminStopData.videoUrl &&
+        goodAdminStopData.videoUrl.includes("X-Amz-Signature=") &&
+        adminStatusAfterGood === "completed"
+      ) {
+        console.log("PASS: Trusted internal/admin signature stops active recording, and invalid admin signature is rejected with 403");
+      } else {
+        console.error("FAIL: Admin stop signature test failed", { badAdminStopData, goodAdminStopData });
         failures++;
       }
 

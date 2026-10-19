@@ -786,22 +786,51 @@ router.post("/recording/stop", express.json(), async (req, res) => {
       });
     }
 
+    // 1. Check for trusted internal / admin signature first if provided
+    const adminSig =
+      req.headers["x-assessment-signature"] ||
+      req.headers["x-admin-signature"];
+
+    let isAdminAuth = false;
+    if (adminSig) {
+      if (verifyAdminSignature(room, adminSig)) {
+        isAdminAuth = true;
+      } else {
+        return res.status(403).json({
+          success: false,
+          status: "failed",
+          videoUrl: null,
+          error: "Forbidden: Invalid admin signature.",
+        });
+      }
+    }
+
+    // 2. Validate room capability token for ordinary client requests
+    if (!isAdminAuth) {
+      const providedToken = extractBearerToken(req);
+      const auth = verifyRoomAuthorization(room, providedToken);
+      if (!auth.authorized) {
+        return res.status(auth.status).json({
+          success: false,
+          status: "failed",
+          videoUrl: null,
+          error: auth.error,
+        });
+      }
+    }
+
     const session = await stopRecording(room);
     syncRecordingToAssessment(room, session);
 
     let videoUrl = null;
-    const providedToken = extractBearerToken(req);
-    if (session.status === "completed" && providedToken) {
-      const auth = verifyRoomAuthorization(room, providedToken);
-      if (auth.authenticated) {
-        const storageConfig = getStorageConfig();
-        const filepath = session.filepath || `recordings/${room}.mp4`;
-        if (storageConfig.type === "s3" && storageConfig.configured) {
-          const presigned = generatePresignedPlaybackUrl(storageConfig, filepath, 900);
-          if (presigned) videoUrl = presigned;
-        } else {
-          videoUrl = session.videoUrl;
-        }
+    if (session.status === "completed") {
+      const storageConfig = getStorageConfig();
+      const filepath = session.filepath || `recordings/${room}.mp4`;
+      if (storageConfig.type === "s3" && storageConfig.configured) {
+        const presigned = generatePresignedPlaybackUrl(storageConfig, filepath, 900);
+        if (presigned) videoUrl = presigned;
+      } else {
+        videoUrl = session.videoUrl;
       }
     }
 
