@@ -3332,6 +3332,70 @@ class TestAgentStartup(unittest.TestCase):
         self.assertEqual(state.candidate_introduction, intro_text)
         self.assertTrue(any(item.get("role") == "candidate" and item.get("text") == ans_turn3 for item in state.transcript))
 
+    def test_drain_and_analyze_pending_answers_pre_intro_clarification_and_genuine_intro(self):
+        """Verify a pre-introduction clarification or unrelated response does not populate
+        candidate_introduction in drain_and_analyze_pending_answers, and a genuine introduction is saved.
+        """
+        import asyncio
+        from unittest.mock import AsyncMock
+        from agent.agent import AssessmentState, drain_and_analyze_pending_answers
+
+        state = AssessmentState()
+        user_answer_queue = asyncio.Queue()
+        analyzed_answers = set()
+        analyze_mock = AsyncMock()
+
+        async def run_scenario():
+            # 1. Pre-introduction clarification request does not populate candidate_introduction
+            clarification_turn = "Could you please repeat the question?"
+            await user_answer_queue.put(clarification_turn)
+            await drain_and_analyze_pending_answers(
+                state=state,
+                user_answer_queue=user_answer_queue,
+                analyzed_answers=analyzed_answers,
+                analyze_fn=analyze_mock,
+            )
+            self.assertEqual(state.candidate_introduction, "")
+
+            # 2. Pre-introduction unrelated response does not populate candidate_introduction
+            unrelated_turn = "Can we talk about my personal life?"
+            await user_answer_queue.put(unrelated_turn)
+            await drain_and_analyze_pending_answers(
+                state=state,
+                user_answer_queue=user_answer_queue,
+                analyzed_answers=analyzed_answers,
+                analyze_fn=analyze_mock,
+            )
+            self.assertEqual(state.candidate_introduction, "")
+
+            # 3. Genuine candidate introduction is saved
+            genuine_intro = "I am a backend software engineer with 5 years of experience building distributed systems."
+            await user_answer_queue.put(genuine_intro)
+            await drain_and_analyze_pending_answers(
+                state=state,
+                user_answer_queue=user_answer_queue,
+                analyzed_answers=analyzed_answers,
+                analyze_fn=analyze_mock,
+            )
+            self.assertEqual(state.candidate_introduction, genuine_intro)
+
+            # 4. Subsequent turn preserves genuine introduction without overwriting
+            subsequent_turn = "Can you clarify what the first question is about?"
+            await user_answer_queue.put(subsequent_turn)
+            await drain_and_analyze_pending_answers(
+                state=state,
+                user_answer_queue=user_answer_queue,
+                analyzed_answers=analyzed_answers,
+                analyze_fn=analyze_mock,
+            )
+            self.assertEqual(state.candidate_introduction, genuine_intro)
+
+        asyncio.run(run_scenario())
+        self.assertEqual(
+            state.candidate_introduction,
+            "I am a backend software engineer with 5 years of experience building distributed systems.",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

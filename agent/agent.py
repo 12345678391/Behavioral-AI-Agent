@@ -2350,9 +2350,11 @@ async def drain_and_analyze_pending_answers(
         if ans_key in analyzed_answers:
             continue
         analyzed_answers.add(ans_key)
-        if is_non_introduction_turn(ans_clean, state):
-            continue
-        if state.questions_asked == 0 and not state.candidate_introduction:
+        if (
+            state.questions_asked == 0
+            and not state.candidate_introduction
+            and not is_non_introduction_turn(ans_clean, state)
+        ):
             state.candidate_introduction = ans_clean
         try:
             print(f"[Agent] Analyzing pending candidate response: {ans_clean[:60]}...")
