@@ -489,6 +489,10 @@ def is_meta_interviewer_prompt(text: str) -> bool:
         t.startswith("I understand. This is a professional behavioral interview")
         or t.startswith("I understand your request. This interview is specifically designed")
         or t.startswith("I'm happy to continue when we can communicate respectfully")
+        or t.startswith("I'm happy to continue the professional interview")
+        or t.startswith("I'm here to conduct a professional behavioral interview")
+        or t.startswith("I'm here to conduct a professional interview")
+        or t.startswith("I'm unable to continue the interview while the conversation remains abusive")
         or t.startswith("Take your time.")
         or t.startswith("Take all the time you need.")
         or t.startswith("As a reminder, our interview is dedicated")
@@ -614,13 +618,19 @@ PROFESSIONAL_BOUNDARY_PREFIX = (
 )
 
 ABUSE_WARNING_FIRST_PREFIX = (
-    "I'm here to conduct a professional interview. Please keep our conversation respectful. "
-    "Let's return to the interview question:"
+    "I'm here to conduct a professional behavioral interview. I understand that you may be frustrated, "
+    "but I request that we communicate respectfully. We can continue with the interview when you're ready."
 )
 
 ABUSE_WARNING_REPEATED_PREFIX = (
-    "I'm happy to continue when we can communicate respectfully. "
-    "Would you like to continue the professional interview?"
+    "I'm happy to continue the professional interview, but respectful communication is required. "
+    "Please avoid abusive language so we can communicate respectfully and proceed professionally."
+)
+
+ABUSE_TERMINATION_MESSAGE = (
+    "I'm unable to continue the interview while the conversation remains abusive. "
+    "Since we are unable to communicate respectfully, we will conclude the interview here. "
+    "Thank you for your time."
 )
 
 PROFESSIONAL_TOPIC_REQUEST_RESPONSE = (
@@ -651,8 +661,42 @@ ABUSIVE_LANGUAGE_PATTERNS = [
     r"\b(?:i\s+will|i'm\s+going\s+to|i['’]?ll)\s+(?:kill|hurt|destroy|break|punch|attack|smash)\s+(?:you|this\s+machine)\b",
 ]
 
+WORKPLACE_REPORTED_SPEECH_PATTERNS = [
+    r"\b(?:customer|client|caller|user|coworker|colleague|stakeholder|manager|boss|patient|patron|guest|passenger|employee|vendor)\s+(?:was|became|got|started|kept|were)?\s*(?:abusive|aggressive|hostile|angry|irate|rude|furious|screaming|shouting|yelling)\b",
+    r"\b(?:customer|client|caller|user|coworker|colleague|stakeholder|manager|boss|patient|someone|person|they|he|she)\s+(?:shouted|yelled|screamed|said|told|called|messaged|emailed|complained|interrupted)\b",
+    r"\b(?:called\s+(?:me|us|them|our\s+team|the\s+team|my\s+colleague|a\s+colleague|the\s+staff|an\s+agent)\s+(?:names|abusive|an?\s+\w+))\b",
+    r"\b(?:dealing\s+with|handled?|de-?escalat(?:e|ed|ing)|resolv(?:e|ed|ing))\s+(?:an?\s+)?(?:difficult|abusive|irate|hostile|angry)\s+(?:customer|client|caller|user|situation|incident)\b",
+    r"\b(?:abusive|hostile|aggressive|disrespectful)\s+(?:customer|client|caller|user|behavior|behaviour|language|call|incident)\b",
+]
+
+WORKPLACE_NARRATIVE_FRAME_PATTERNS = [
+    r"\b(?:in|at|during)\s+(?:my|our)\s+(?:previous|past|last|former|prior)\s+(?:role|job|company|position|experience|project|workplace|team)\b",
+    r"\b(?:when\s+i\s+(?:was\s+)?(?:working|worked|was\s+a|was\s+at|led|managed|supported))\b",
+    r"\b(?:at|for)\s+(?:my|our)\s+(?:previous|last|former)\s+(?:company|employer|firm|agency)\b",
+    r"\b(?:there\s+was\s+(?:a|an)\s+(?:incident|situation|time|case|escalation|occasion)\s+(?:where|when|involving))\b",
+    r"\b(?:for\s+example|for\s+instance|in\s+one\s+(?:instance|case|scenario|situation))\b",
+]
+
+WORKPLACE_DEESCALATION_RESOLUTION_PATTERNS = [
+    r"\b(?:de-?escalat(?:ed?|ing)|diffus(?:ed?|ing)|defus(?:ed?|ing))\b",
+    r"\b(?:remained|stayed|kept)\s+(?:calm|professional|composed|patient|objective)\b",
+    r"\b(?:resolv(?:ed?|ing)|handled?|addressed?|settled?)\s+(?:the\s+)?(?:situation|incident|issue|conflict|matter|complaint)\b",
+    r"\b(?:empathiz(?:ed?|ing)|listened?\s+actively|customer\s+service|support\s+ticket)\b",
+    r"\b(?:workplace|company|code\s+of\s+conduct|anti-?harassment|zero\s+tolerance)\s+policy\b",
+]
+
+DIRECT_BOT_ATTACK_PATTERNS = [
+    r"\b(?:you|u)\s+(?:are|'re|r)?\s*(?:a|an)?\s*(?:stupid|dumb|idiot|moron|useless|worthless|terrible|garbage|piece\s+of\s+shit)\s+(?:bot|ai|interviewer|machine|system|agent)\b",
+    r"\b(?:stupid|dumb|idiot|moron)\s+(?:bot|ai|interviewer|system)\b",
+    r"\b(?:shut\s+the\s+fuck\s+up|fuck\s+off|go\s+fuck\s+yourself)\s+(?:you\s+)?(?:bot|ai|interviewer|machine)\b",
+]
+
 _COMPILED_PERSONAL = [re.compile(p, re.IGNORECASE) for p in PERSONAL_OR_UNRELATED_REQUEST_PATTERNS]
 _COMPILED_ABUSE = [re.compile(p, re.IGNORECASE) for p in ABUSIVE_LANGUAGE_PATTERNS]
+_COMPILED_WORKPLACE_REPORTED = [re.compile(p, re.IGNORECASE) for p in WORKPLACE_REPORTED_SPEECH_PATTERNS]
+_COMPILED_WORKPLACE_FRAME = [re.compile(p, re.IGNORECASE) for p in WORKPLACE_NARRATIVE_FRAME_PATTERNS]
+_COMPILED_WORKPLACE_RESOLUTION = [re.compile(p, re.IGNORECASE) for p in WORKPLACE_DEESCALATION_RESOLUTION_PATTERNS]
+_COMPILED_DIRECT_BOT_ATTACK = [re.compile(p, re.IGNORECASE) for p in DIRECT_BOT_ATTACK_PATTERNS]
 
 
 def is_personal_or_unrelated_request(text: str) -> bool:
@@ -668,14 +712,44 @@ def is_personal_or_unrelated_request(text: str) -> bool:
     return any(p.search(cleaned) is not None for p in _COMPILED_PERSONAL)
 
 
+def is_workplace_example_or_narrative_context(text: str) -> bool:
+    """Detect if the candidate is describing a workplace incident, reported speech,
+    or de-escalation example (e.g. dealing with an abusive customer or difficult coworker).
+    """
+    if not text or not isinstance(text, str):
+        return False
+    cleaned = text.strip().lower()
+    has_reported = any(p.search(cleaned) is not None for p in _COMPILED_WORKPLACE_REPORTED)
+    has_frame = any(p.search(cleaned) is not None for p in _COMPILED_WORKPLACE_FRAME)
+    has_resolution = any(p.search(cleaned) is not None for p in _COMPILED_WORKPLACE_RESOLUTION)
+    return (
+        (has_reported and (has_frame or has_resolution))
+        or (has_reported and len(cleaned.split()) >= 8)
+        or (has_frame and has_resolution)
+    )
+
+
+def is_direct_bot_attack(text: str) -> bool:
+    """Detect explicit insults directly targeted at the AI interviewer/bot."""
+    if not text or not isinstance(text, str):
+        return False
+    cleaned = text.strip().lower()
+    return any(p.search(cleaned) is not None for p in _COMPILED_DIRECT_BOT_ATTACK)
+
+
 def is_abusive_language(text: str) -> bool:
     """Conservative, context-aware detection for abusive, hostile, or insulting language directed at the interviewer.
-    Does NOT flag ordinary frustration, technical disagreement, nervousness, or polite refusals.
+    Does NOT flag ordinary frustration, technical disagreement, nervousness, polite refusals,
+    or workplace examples discussing abusive customers/clients/coworkers.
     """
     if not text or not isinstance(text, str):
         return False
     cleaned = text.strip().lower()
     if not cleaned:
+        return False
+    if is_workplace_example_or_narrative_context(cleaned):
+        if is_direct_bot_attack(cleaned):
+            return True
         return False
     return any(p.search(cleaned) is not None for p in _COMPILED_ABUSE)
 
@@ -1121,6 +1195,7 @@ def strip_refusal_prefix(text: str) -> str:
         PROFESSIONAL_BOUNDARY_PREFIX,
         ABUSE_WARNING_FIRST_PREFIX,
         ABUSE_WARNING_REPEATED_PREFIX,
+        ABUSE_TERMINATION_MESSAGE,
         OFF_TOPIC_FIRST_PREFIX,
         OFF_TOPIC_REPEATED_PREFIX,
     )
@@ -2865,10 +2940,7 @@ async def process_interview_turn(
 
         # 4a. Repeated abuse escalation (count >= 3: conclude interview respectfully)
         if state.abusive_language_count >= 3:
-            closing_resp = (
-                "Since we are unable to communicate respectfully, we will conclude the interview here. "
-                "Thank you for your time."
-            )
+            closing_resp = ABUSE_TERMINATION_MESSAGE
             await send_event_fn(
                 ctx,
                 "assessment_closing",

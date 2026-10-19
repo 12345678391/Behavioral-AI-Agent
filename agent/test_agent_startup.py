@@ -3932,6 +3932,287 @@ class TestAgentStartup(unittest.TestCase):
         analyze_mock.assert_awaited_once_with(state, survey_answer)
         self.assertEqual(state.questions_asked, 3)
 
+    def test_regression_professional_abuse_handling_conversation_lifecycle(self):
+        """Regression test covering:
+        1. First abusive message receives a respectful boundary response and redirection.
+        2. Repeated abusive message produces the escalated boundary response.
+        3. Continued abusive message concludes the interview cleanly using the existing mechanism.
+        4. Respectful response after a warning allows the interview to continue normally.
+        7. Abusive messages are not scored as substantive answers or evidence.
+        8. The next valid behavioral question is asked and recorded properly when resuming after a warning.
+        """
+        import asyncio
+        from unittest.mock import AsyncMock, MagicMock
+        from agent.agent import (
+            AssessmentState,
+            process_interview_turn,
+            ABUSE_WARNING_FIRST_PREFIX,
+            ABUSE_WARNING_REPEATED_PREFIX,
+            ABUSE_TERMINATION_MESSAGE,
+            is_abusive_language,
+        )
+
+        state = AssessmentState()
+        q1 = "Can you describe a time you led a high-stakes project under tight deadlines?"
+        state.add_transcript("interviewer", q1)
+        state.asked_questions.append(q1)
+        state.questions_asked = 1
+
+        speak_mock = AsyncMock()
+        analyze_mock = AsyncMock()
+        send_mock = AsyncMock()
+        manual_end_event = asyncio.Event()
+
+        # --- Turn 1 (Item 1 & 7): First abusive message receives respectful boundary and question redirection ---
+        abuse_turn_1 = "You are an idiot bot."
+        self.assertTrue(is_abusive_language(abuse_turn_1))
+
+        cont1 = asyncio.run(process_interview_turn(
+            ctx=MagicMock(),
+            state=state,
+            answer=abuse_turn_1,
+            remaining_seconds=300,
+            warning_sent=False,
+            user_answer_queue=asyncio.Queue(),
+            analyzed_answers=set(),
+            manual_end_event=manual_end_event,
+            timer_finished_event=asyncio.Event(),
+            disconnect_event=asyncio.Event(),
+            speak_fn=speak_mock,
+            analyze_fn=analyze_mock,
+            generate_question_fn=AsyncMock(),
+            send_event_fn=send_mock,
+        ))
+
+        self.assertTrue(cont1)
+        self.assertEqual(state.abusive_language_count, 1)
+        self.assertEqual(state.questions_asked, 1)  # Questions asked not incremented
+        self.assertEqual(state.candidate_introduction, "")  # Not saved as introduction
+        analyze_mock.assert_not_awaited()  # Item 7: Abusive turn NOT scored as substantive answer
+        self.assertFalse(manual_end_event.is_set())
+
+        # Verify boundary response wording & redirect to current question
+        speak_mock.assert_awaited_once()
+        spoken_1 = speak_mock.await_args[0][0]
+        self.assertTrue(spoken_1.startswith(ABUSE_WARNING_FIRST_PREFIX))
+        self.assertIn("communicate respectfully", spoken_1.lower())
+        self.assertIn("continue with the interview when you're ready", spoken_1.lower())
+        self.assertIn(q1, spoken_1)  # Redirects to current question
+        self.assertNotIn("idiot", spoken_1.lower())  # Never insults or retaliates back
+
+        # --- Turn 2 (Item 4 & 8): Respectful response after warning continues interview normally ---
+        speak_mock.reset_mock()
+        analyze_mock.reset_mock()
+        send_mock.reset_mock()
+
+        q2_gen = "How did you manage stakeholder communication during that project?"
+        gen_mock = AsyncMock(return_value=q2_gen)
+
+        respectful_answer = "I apologize for the frustration. In my previous role at Acme Corp, I led our core payments migration."
+        self.assertFalse(is_abusive_language(respectful_answer))
+
+        cont2 = asyncio.run(process_interview_turn(
+            ctx=MagicMock(),
+            state=state,
+            answer=respectful_answer,
+            remaining_seconds=270,
+            warning_sent=False,
+            user_answer_queue=asyncio.Queue(),
+            analyzed_answers=set(),
+            manual_end_event=manual_end_event,
+            timer_finished_event=asyncio.Event(),
+            disconnect_event=asyncio.Event(),
+            speak_fn=speak_mock,
+            analyze_fn=analyze_mock,
+            generate_question_fn=gen_mock,
+            send_event_fn=send_mock,
+        ))
+
+        self.assertTrue(cont2)
+        self.assertEqual(state.abusive_language_count, 1)  # Abuse count not incremented
+        self.assertEqual(state.questions_asked, 2)  # Question count advanced
+        analyze_mock.assert_awaited_once_with(state, respectful_answer)  # Substantive answer analyzed
+        gen_mock.assert_awaited_once()  # Next adaptive question generated
+        speak_mock.assert_awaited_once()
+        spoken_2 = speak_mock.await_args[0][0]
+        self.assertEqual(spoken_2, q2_gen)
+        self.assertEqual(state.asked_questions[-1], q2_gen)  # Recorded in asked_questions
+        self.assertEqual(state.transcript[-2]["role"], "candidate")
+        self.assertEqual(state.transcript[-2]["text"], respectful_answer)
+        self.assertEqual(state.transcript[-1]["role"], "interviewer")
+        self.assertEqual(state.transcript[-1]["text"], q2_gen)
+
+        # --- Turn 3 (Item 2 & 7): Repeated abusive message produces escalated boundary response ---
+        speak_mock.reset_mock()
+        analyze_mock.reset_mock()
+        send_mock.reset_mock()
+        gen_mock.reset_mock()
+
+        abuse_turn_2 = "Shut the fuck up."
+        self.assertTrue(is_abusive_language(abuse_turn_2))
+
+        cont3 = asyncio.run(process_interview_turn(
+            ctx=MagicMock(),
+            state=state,
+            answer=abuse_turn_2,
+            remaining_seconds=240,
+            warning_sent=False,
+            user_answer_queue=asyncio.Queue(),
+            analyzed_answers=set(),
+            manual_end_event=manual_end_event,
+            timer_finished_event=asyncio.Event(),
+            disconnect_event=asyncio.Event(),
+            speak_fn=speak_mock,
+            analyze_fn=analyze_mock,
+            generate_question_fn=gen_mock,
+            send_event_fn=send_mock,
+        ))
+
+        self.assertTrue(cont3)
+        self.assertEqual(state.abusive_language_count, 2)
+        self.assertEqual(state.questions_asked, 2)  # Not incremented
+        analyze_mock.assert_not_awaited()  # Not scored as substantive
+        gen_mock.assert_not_awaited()
+        self.assertFalse(manual_end_event.is_set())  # Does not terminate prematurely
+
+        speak_mock.assert_awaited_once()
+        spoken_3 = speak_mock.await_args[0][0]
+        self.assertEqual(spoken_3, ABUSE_WARNING_REPEATED_PREFIX)
+        self.assertIn("respectful communication is required", spoken_3.lower())
+        self.assertIn("avoid abusive language", spoken_3.lower())
+        self.assertIn("proceed professionally", spoken_3.lower())
+
+        # --- Turn 4 (Item 3 & 7): Continued abuse after warnings cleanly concludes interview ---
+        speak_mock.reset_mock()
+        analyze_mock.reset_mock()
+        send_mock.reset_mock()
+        gen_mock.reset_mock()
+
+        abuse_turn_3 = "Fuck off you bot."
+        self.assertTrue(is_abusive_language(abuse_turn_3))
+
+        cont4 = asyncio.run(process_interview_turn(
+            ctx=MagicMock(),
+            state=state,
+            answer=abuse_turn_3,
+            remaining_seconds=220,
+            warning_sent=False,
+            user_answer_queue=asyncio.Queue(),
+            analyzed_answers=set(),
+            manual_end_event=manual_end_event,
+            timer_finished_event=asyncio.Event(),
+            disconnect_event=asyncio.Event(),
+            speak_fn=speak_mock,
+            analyze_fn=analyze_mock,
+            generate_question_fn=gen_mock,
+            send_event_fn=send_mock,
+        ))
+
+        self.assertFalse(cont4)
+        self.assertEqual(state.abusive_language_count, 3)
+        self.assertEqual(state.questions_asked, 2)
+        analyze_mock.assert_not_awaited()  # Item 7: Abusive turn NOT scored as substantive
+        self.assertTrue(manual_end_event.is_set())  # Session concluded cleanly via project mechanism
+
+        # Emits assessment_closing event with reason repeated_abuse
+        send_mock.assert_awaited_once()
+        self.assertEqual(send_mock.await_args[0][1], "assessment_closing")
+        self.assertEqual(send_mock.await_args[0][2], {"reason": "repeated_abuse"})
+
+        # Concluding remarks spoken respectfully
+        speak_mock.assert_awaited_once()
+        spoken_4 = speak_mock.await_args[0][0]
+        self.assertEqual(spoken_4, ABUSE_TERMINATION_MESSAGE)
+        self.assertIn("unable to continue the interview while the conversation remains abusive", spoken_4.lower())
+        self.assertIn("unable to communicate respectfully", spoken_4.lower())
+        self.assertIn("conclude the interview", spoken_4.lower())
+
+        # Transcript integrity preserved
+        self.assertEqual(state.transcript[-2]["role"], "candidate")
+        self.assertEqual(state.transcript[-2]["text"], abuse_turn_3)
+        self.assertEqual(state.transcript[-1]["role"], "interviewer")
+        self.assertEqual(state.transcript[-1]["text"], ABUSE_TERMINATION_MESSAGE)
+
+    def test_regression_frustration_and_workplace_narratives_not_treated_as_abuse(self):
+        """Regression test covering:
+        5. Ordinary frustration or disagreement is not treated as abuse.
+        6. Quoting or discussing abusive language in a workplace example is not treated as abuse.
+        """
+        import asyncio
+        from unittest.mock import AsyncMock, MagicMock
+        from agent.agent import (
+            AssessmentState,
+            process_interview_turn,
+            is_abusive_language,
+        )
+
+        # 5. Ordinary frustration and technical disagreement
+        frustration_and_disagreement = [
+            "I disagree with this approach.",
+            "I disagree.",
+            "I don't agree with that architectural decision.",
+            "I am frustrated with this process.",
+            "I'm frustrated by the repeated questions.",
+            "I don't understand what you mean.",
+            "Could you explain what you're asking?",
+            "This is a bit confusing to me.",
+            "Are you even listening to me?",
+            "Why do you keep asking the same question?",
+        ]
+        for stmt in frustration_and_disagreement:
+            self.assertFalse(is_abusive_language(stmt), f"Incorrectly flagged as abuse: {stmt}")
+
+        # 6. Quoting or discussing abusive language in a workplace context
+        workplace_narratives = [
+            "A customer became abusive and called our support team names...",
+            "A customer became abusive and called our support team names, but I handled the incident professionally.",
+            "In my previous role, an angry customer shouted you are useless at a colleague, and I stepped in to de-escalate the situation.",
+            "When I worked in customer support, a client told me to shut the fuck up over the phone, but I stayed calm and professional and resolved their billing problem.",
+            "There was an incident where a user became verbally abusive and screamed at our team. I followed our company de-escalation protocol.",
+            "In dealing with an abusive client who called our staff idiots, I remained professional and defused the conflict.",
+            "In my previous position, a customer said you suck and are worthless, so I listened actively to understand their frustration.",
+        ]
+        for narrative in workplace_narratives:
+            self.assertFalse(is_abusive_language(narrative), f"Workplace narrative falsely flagged as abuse: {narrative}")
+
+        # Verify through process_interview_turn that a workplace example is scored as substantive evidence
+        state = AssessmentState()
+        q1 = "Tell me about a difficult interpersonal conflict you resolved at work."
+        state.add_transcript("interviewer", q1)
+        state.asked_questions.append(q1)
+        state.questions_asked = 1
+
+        speak_mock = AsyncMock()
+        analyze_mock = AsyncMock()
+        send_mock = AsyncMock()
+        q2_next = "How do you maintain team morale after difficult customer escalations?"
+        gen_mock = AsyncMock(return_value=q2_next)
+
+        wp_example = "In my previous role, an angry customer shouted you are useless at a colleague, and I stepped in to de-escalate the situation."
+        cont = asyncio.run(process_interview_turn(
+            ctx=MagicMock(),
+            state=state,
+            answer=wp_example,
+            remaining_seconds=300,
+            warning_sent=False,
+            user_answer_queue=asyncio.Queue(),
+            analyzed_answers=set(),
+            manual_end_event=asyncio.Event(),
+            timer_finished_event=asyncio.Event(),
+            disconnect_event=asyncio.Event(),
+            speak_fn=speak_mock,
+            analyze_fn=analyze_mock,
+            generate_question_fn=gen_mock,
+            send_event_fn=send_mock,
+        ))
+
+        self.assertTrue(cont)
+        self.assertEqual(state.abusive_language_count, 0)  # NOT flagged as abuse
+        self.assertEqual(state.questions_asked, 2)  # Advances to next question
+        analyze_mock.assert_awaited_once_with(state, wp_example)  # Evaluated as substantive
+        speak_mock.assert_awaited_once()
+        self.assertEqual(speak_mock.await_args[0][0], q2_next)
+
 
 if __name__ == "__main__":
     unittest.main()
