@@ -655,9 +655,10 @@ ABUSIVE_LANGUAGE_PATTERNS = [
     r"\b(?:fuck|fucking|f\*\*\*)\s+(?:you|off|u)\b",
     r"\b(?:go\s+fuck\s+yourself|go\s+to\s+hell|eat\s+shit)\b",
     r"\b(?:shut\s+the\s+fuck\s+up|stfu)\b",
-    r"\b(?:you\s+are|you're|u\s+r|you)\s+(?:an?\s+)?(?:stupid|idiot|moron|dumbass|dumb\s+(?:bot|ai|interviewer)|worthless|bitch|asshole|bastard|piece\s+of\s+shit|garbage)\b",
+    r"\b(?:you\s+are|you're|u\s+r|you)\s+(?:(?:also|really|just|totally|completely|so|fucking|truly|seriously)\s+)?(?:an?\s+)?(?:stupid|idiot|moron|dumbass|dumb\s+(?:bot|ai|interviewer)|worthless|bitch|asshole|bastard|piece\s+of\s+shit|garbage)\b",
     r"\b(?:stupid|idiot|moron|dumb)\s+(?:bot|ai|interviewer)\b",
-    r"\b(?:you\s+suck|you're\s+useless|you\s+are\s+useless)\b",
+    r"\b(?:you\s+are|you're|u\s+r|you)\s+(?:(?:also|really|just|totally|completely|so|fucking|truly|seriously)\s+)?(?:useless|worthless|garbage|trash)\b",
+    r"\b(?:you|u)\s+(?:(?:also|really|just|totally|completely|so|fucking)\s+)?suck(?:s)?\b",
     r"\b(?:i\s+will|i'm\s+going\s+to|i['’]?ll)\s+(?:kill|hurt|destroy|break|punch|attack|smash)\s+(?:you|this\s+machine)\b",
 ]
 
@@ -719,7 +720,7 @@ _COMPILED_REPORTED_INTRO = re.compile(
 )
 
 _COMPILED_REPORTED_POST = re.compile(
-    r"^[,\s]*(?:at|to|towards)\s+(?:me|us|them|him|her|our\s+team|the\s+team|my\s+colleague|"
+    r"^[,\s'\"“”‘’]*(?:at|to|towards)\s+(?:me|us|them|him|her|our\s+team|the\s+team|my\s+colleague|"
     r"a\s+colleague|the\s+staff|an\s+agent|support|the\s+cashier)\b",
     re.IGNORECASE,
 )
@@ -771,16 +772,7 @@ def is_span_reported_speech(text: str, start: int, end: int) -> bool:
 
     pre = text[:start]
 
-    # Split by strong boundaries: sentence ends or adversative coordinators starting an independent clause to the interviewer
-    clause_parts = re.split(r"[.!?;]|\b(?:but|however|yet)\b", pre)
-    curr_clause = clause_parts[-1] if clause_parts else ""
-
-    # Check if the current clause preceding the match contains a reported speech intro
-    if _COMPILED_REPORTED_INTRO.search(curr_clause):
-        return True
-
-    # Check if inside explicit quotation marks introduced by reported speech
-    # Strip word-internal apostrophes (e.g. you're, don't, I'm) so they don't corrupt quote parity
+    # Check quote parity before start
     pre_no_contractions = re.sub(r"\w['’]\w", "", pre)
     quotes = (
         pre_no_contractions.count('"')
@@ -788,12 +780,32 @@ def is_span_reported_speech(text: str, start: int, end: int) -> bool:
         + pre_no_contractions.count("”")
         + pre_no_contractions.count("'")
     )
-    if quotes % 2 == 1:
+    is_inside_quotes = (quotes % 2 == 1)
+
+    if is_inside_quotes:
+        # Match is enclosed in quotation marks. Check if preceding text introduced the quote
         last_sentence = re.split(r"[.!?]", pre)[-1]
         if _COMPILED_REPORTED_INTRO.search(last_sentence) or any(
             v in last_sentence.lower() for v in ("said", "told", "shouted", "yelled", "screamed", "called")
         ):
             return True
+
+    # If outside quotes, check the immediate clause preceding the match
+    # Clause splitters include sentence ends, adversative conjunctions, or coordinate conjunctions addressing 'you'
+    clause_parts = re.split(
+        r"[.!?;]|\b(?:but|however|yet|though|although)\b|,\s*and\s+(?:you|u)\b|\band\s+(?:you|u)\b",
+        pre,
+    )
+    curr_clause = clause_parts[-1] if clause_parts else ""
+
+    # If quotes closed inside curr_clause, only inspect after the last closing quote
+    last_quote_pos = max(curr_clause.rfind('"'), curr_clause.rfind('”'), curr_clause.rfind("'"))
+    if last_quote_pos >= 0:
+        curr_clause = curr_clause[last_quote_pos + 1:]
+
+    # Check if the current clause preceding the match contains a reported speech intro
+    if _COMPILED_REPORTED_INTRO.search(curr_clause):
+        return True
 
     # Check if immediately after the match there is an attribution or third-party target
     post = text[end:]

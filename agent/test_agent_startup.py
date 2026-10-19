@@ -4229,8 +4229,12 @@ class TestAgentStartup(unittest.TestCase):
             ABUSE_WARNING_FIRST_PREFIX,
         )
 
-        # 1. Genuine workplace example describing an abusive customer — NOT flagged as abuse
+        # 1. Genuine workplace example describing an abusive customer / third party — NOT flagged as abuse
         workplace_narratives = [
+            "A customer told me to shut the fuck up during a call, and I stayed calm.",
+            "My manager called me an idiot, but I handled the feedback professionally.",
+            "A client said, ‘you are useless,’ to my colleague.",
+            "I stayed calm when a caller swore at our support team.",
             "A customer became abusive and called our support team names...",
             "A customer became abusive and called our support team names, but I handled the incident professionally.",
             "In my previous role, an angry customer shouted you are useless at a colleague, and I stepped in to de-escalate the situation.",
@@ -4244,6 +4248,7 @@ class TestAgentStartup(unittest.TestCase):
 
         # 2. Direct abuse aimed at the AI, even when the message also mentions a workplace incident — FLAGGED as abuse
         direct_abuse_with_workplace_context = [
+            "A customer was angry during my last job, but you are an idiot.",
             "In my previous role I handled client escalations, but you are an idiot.",
             "When I worked in customer support, we resolved many issues. Shut the fuck up.",
             "In my last job, a customer was mad. Fuck off you bot.",
@@ -4262,9 +4267,15 @@ class TestAgentStartup(unittest.TestCase):
         quoted_alone = 'A customer said to me: "you are an idiot and you suck", but I de-escalated.'
         self.assertFalse(is_abusive_language(quoted_alone))
 
-        # Quoted + direct abuse to AI -> FLAGGED as abuse
-        quoted_plus_direct = 'A customer said to me: "you are an idiot", but you are useless.'
-        self.assertTrue(is_abusive_language(quoted_plus_direct))
+        # Quoted + direct abuse to AI in the same message -> FLAGGED as abuse
+        quoted_plus_direct_1 = 'A customer said to me: "you are an idiot", but you are useless.'
+        self.assertTrue(is_abusive_language(quoted_plus_direct_1))
+
+        quoted_plus_direct_2 = 'A customer was shouting "you are useless", and you are also an idiot.'
+        self.assertTrue(is_abusive_language(quoted_plus_direct_2))
+
+        quoted_plus_direct_3 = 'A client said shut the fuck up to our team, but you are useless.'
+        self.assertTrue(is_abusive_language(quoted_plus_direct_3))
 
         # 4. Ordinary frustration and disagreement — NOT flagged as abuse
         frustration_and_disagreement = [
