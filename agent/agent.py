@@ -475,12 +475,34 @@ def is_candidate_refusal(text: str) -> bool:
     return any(p.search(cleaned) is not None for p in _COMPILED_REFUSAL_PATTERNS)
 
 
+def is_meta_interviewer_prompt(text: str) -> bool:
+    """Return True if the text is a system boundary or meta redirect rather than an interview question."""
+    if not text:
+        return False
+    t = text.strip()
+    return (
+        t.startswith("I understand. This is a professional behavioral interview")
+        or t.startswith("I understand your request. This interview is specifically designed")
+        or t.startswith("I'm happy to continue when we can communicate respectfully")
+        or t.startswith("Take your time.")
+        or t.startswith("Take all the time you need.")
+        or t.startswith("As a reminder, our interview is dedicated")
+        or t.startswith("As a reminder, our assessment time is dedicated")
+        or t.startswith("As a reminder, professional and respectful")
+        or t.startswith("Please maintain a respectful and professional tone")
+        or t.startswith("I apologize if I've been repetitive")
+        or t.startswith("I apologize for any frustration")
+        or t.startswith("Since we are unable to communicate respectfully")
+        or t.startswith("I understand. We will conclude the interview here.")
+    )
+
+
 def get_last_interviewer_question(state: AssessmentState) -> str:
-    """Return the text of the most recent question asked by the interviewer."""
+    """Return the text of the most recent substantive question asked by the interviewer."""
     for item in reversed(state.transcript):
         if item.get("role") in ("interviewer", "assistant", "agent"):
             text = (item.get("text") or "").strip()
-            if not text:
+            if not text or is_meta_interviewer_prompt(text):
                 continue
             clean = strip_refusal_prefix(text)
             candidate_text = clean if clean else text
@@ -488,10 +510,12 @@ def get_last_interviewer_question(state: AssessmentState) -> str:
                 "tell me", "describe", "explain", "how", "what", "why", "can you", "could you", "please tell", "please share", "share an example"
             )):
                 return text
+    if getattr(state, "asked_questions", None):
+        return state.asked_questions[-1]
     for item in reversed(state.transcript):
         if item.get("role") in ("interviewer", "assistant", "agent"):
             text = (item.get("text") or "").strip()
-            if text:
+            if text and not is_meta_interviewer_prompt(text):
                 return text
     return ""
 
@@ -585,18 +609,18 @@ PROFESSIONAL_BOUNDARY_PREFIX = (
 )
 
 ABUSE_WARNING_FIRST_PREFIX = (
-    "Please maintain a respectful and professional tone during this assessment. "
-    "I invite you to continue our interview respectfully."
+    "I'm here to conduct a professional interview. Please keep our conversation respectful. "
+    "Let's return to the interview question:"
 )
 
 ABUSE_WARNING_REPEATED_PREFIX = (
-    "As a reminder, professional and respectful communication is required throughout this assessment. "
-    "I invite you to continue respectfully."
+    "I'm happy to continue when we can communicate respectfully. "
+    "Would you like to continue the professional interview?"
 )
 
 PROFESSIONAL_TOPIC_REQUEST_RESPONSE = (
-    "I understand your request. This interview is specifically designed to evaluate your professional background and workplace experiences. "
-    "I can rephrase the current question for you, or give you a brief moment if you need one. Please let me know when you feel ready to continue."
+    "I understand. This is a professional behavioral interview, so I'll keep our discussion focused on your work experience, skills, and workplace behavior. "
+    "Would you like me to rephrase this question, or shall we move to another relevant interview question?"
 )
 
 PERSONAL_OR_UNRELATED_REQUEST_PATTERNS = [
@@ -617,6 +641,7 @@ ABUSIVE_LANGUAGE_PATTERNS = [
     r"\b(?:go\s+fuck\s+yourself|go\s+to\s+hell|eat\s+shit)\b",
     r"\b(?:shut\s+the\s+fuck\s+up|stfu)\b",
     r"\b(?:you\s+are|you're|u\s+r|you)\s+(?:an?\s+)?(?:stupid|idiot|moron|dumbass|dumb\s+(?:bot|ai|interviewer)|worthless|bitch|asshole|bastard|piece\s+of\s+shit|garbage)\b",
+    r"\b(?:stupid|idiot|moron|dumb)\s+(?:bot|ai|interviewer)\b",
     r"\b(?:you\s+suck|you're\s+useless|you\s+are\s+useless)\b",
     r"\b(?:i\s+will|i'm\s+going\s+to|i['’]?ll)\s+(?:kill|hurt|destroy|break|punch|attack|smash)\s+(?:you|this\s+machine)\b",
 ]
@@ -676,8 +701,12 @@ def is_candidate_frustration(text: str) -> bool:
 TOPIC_CHANGE_EXPLICIT_PATTERNS = [
     # Explicit unwillingness to discuss professional/work life and asking for another topic
     r"\b(?:can\s+we|could\s+we|we|let['’]?s|i\s+want\s+to|i['’]?d\s+like\s+to|shall\s+we)?\s*(?:talk|chat|speak|discuss)\s+(?:about\s+)?(?:some|a)?\s*(?:other|different|another)\s+topic\b",
+    r"\b(?:can\s+we|could\s+we|we|let['’]?s|i\s+want\s+to|i['’]?d\s+like\s+to|shall\s+we)?\s*(?:talk|chat|speak|discuss)\s+(?:about\s+)?(?:something\s+else|different\s+things)\b",
+    r"\b(?:can\s+we|could\s+we|let['’]?s|please|i\s+want\s+to|i['’]?d\s+like\s+to)?\s*(?:change|switch)\s+(?:the\s+)?topics?\b",
     r"\b(?:do\s*n['’]?t|do\s+not|would\s+rather\s+not|prefer\s+not\s+to)\s+(?:want\s+to\s+)?(?:talk\s+about|discuss)\s+(?:the\s+)?(?:professional|work|job|career)(?:\s+life)?(?:\s+topic)?\b",
     r"\b(?:change\s+the\s+topic|another\s+topic)\s+(?:because\s+)?(?:i\s+)?(?:do\s*n['’]?t|do\s+not|would\s+rather\s+not)\s+(?:want\s+to\s+)?(?:talk|discuss)\s+(?:about\s+)?(?:professional|work|job)\b",
+    r"\b(?:i\s+)?(?:do\s*n['’]?t|do\s+not)\s+want\s+to\s+answer\s+(?:this|that|the)\s+question\b",
+    r"\blet['’]?s\s+talk\s+about\s+something\s+else\b",
 ]
 
 _COMPILED_TOPIC_CHANGE = [re.compile(p, re.IGNORECASE) for p in TOPIC_CHANGE_EXPLICIT_PATTERNS]
@@ -693,6 +722,27 @@ def is_explicit_topic_change_preference(text: str) -> bool:
     return any(p.search(cleaned) is not None for p in _COMPILED_TOPIC_CHANGE)
 
 
+CHOICE_MOVE_TO_ANOTHER_QUESTION_PATTERNS = [
+    r"\b(?:move\s+(?:on\s+)?to\s+(?:another|a\s+different|the\s+next|a\s+new)|another|a\s+different|next)\s+(?:relevant\s+)?(?:interview\s+)?question\b",
+    r"\b(?:let['’]?s\s+)?(?:move\s+to\s+another|ask\s+another|try\s+another|another\s+question|different\s+question|next\s+question)\b",
+    r"\b(?:i['’]?d\s+prefer\s+(?:to\s+)?move\s+to|prefer\s+another\s+question|move\s+to\s+another|another\s+relevant\s+question)\b",
+    r"\b(?:the\s+)?(?:second\s+option|latter|another\s+question|next\s+one)\b",
+    r"\bmove\s+to\s+another\b",
+]
+
+_COMPILED_CHOICE_MOVE = [re.compile(p, re.IGNORECASE) for p in CHOICE_MOVE_TO_ANOTHER_QUESTION_PATTERNS]
+
+
+def is_choice_to_move_to_another_question(text: str) -> bool:
+    """Detect candidate choice to move to another relevant professional interview question."""
+    if not text or not isinstance(text, str):
+        return False
+    cleaned = text.strip().lower()
+    if not cleaned:
+        return False
+    return any(p.search(cleaned) is not None for p in _COMPILED_CHOICE_MOVE)
+
+
 PERMISSION_TO_RESUME_PATTERNS = [
     r"^(?:yes|sure|okay|ok|fine)[,.\s]+(?:i['’]?m|i\s+am)?\s*ready[.!]?$",
     r"^(?:yes|sure)[,.\s]+(?:let['’]?s|we\s+can)\s+(?:continue|resume|proceed)[.!]?$",
@@ -701,6 +751,8 @@ PERMISSION_TO_RESUME_PATTERNS = [
     r"^ready[.!]?$",
     r"\b(?:we\s+can|let['’]?s)\s+(?:return|continue|resume|get\s+back|proceed)(?:\s+to\s+(?:the\s+)?(?:interview|assessment|questions))?\b",
     r"\b(?:go\s+ahead|we\s+can\s+continue|let['’]?s\s+do\s+it|please\s+continue|please\s+resume)\b",
+    r"^(?:yes|sure|yeah|yep|yes\s+please)[.!]?$",
+    r"\b(?:i\s+)?(?:want\s+to|would\s+like\s+to)\s+continue\b",
 ]
 
 _COMPILED_PERMISSION = [re.compile(p, re.IGNORECASE) for p in PERMISSION_TO_RESUME_PATTERNS]
@@ -888,6 +940,7 @@ def is_non_introduction_turn(text: str, state: AssessmentState | None = None) ->
         or is_explicit_topic_change_preference(cleaned)
         or is_bare_acknowledgment(cleaned)
         or is_permission_to_resume(cleaned)
+        or is_choice_to_move_to_another_question(cleaned)
         or is_clarification_request(cleaned)
         or is_candidate_refusal(cleaned)
         or is_personal_or_unrelated_request(cleaned)
@@ -956,15 +1009,18 @@ def format_boundary_response(question_text: str) -> str:
 
 
 def format_abuse_warning_response(question_text: str, count: int) -> str:
-    """Ensure an abusive turn response begins with calm warning (1st) or firmer reminder (2nd+)."""
-    prefix = ABUSE_WARNING_FIRST_PREFIX if count <= 1 else ABUSE_WARNING_REPEATED_PREFIX
-    q = (question_text or "").strip()
-    if not q:
-        return prefix
-    if q.startswith(prefix):
-        return q
-    q_substantive = strip_refusal_prefix(q)
-    return f"{prefix} {q_substantive}" if q_substantive else prefix
+    """Ensure an abusive turn response begins with calm warning and question redirect (1st) or repeated boundary offer (2nd+)."""
+    if count <= 1:
+        prefix = ABUSE_WARNING_FIRST_PREFIX
+        q = (question_text or "").strip()
+        if not q:
+            return prefix
+        if q.startswith(prefix):
+            return q
+        q_substantive = strip_refusal_prefix(q)
+        return f"{prefix} {q_substantive}" if q_substantive else prefix
+    else:
+        return ABUSE_WARNING_REPEATED_PREFIX
 
 
 def format_refusal_response(question_text: str) -> str:
@@ -2551,6 +2607,7 @@ async def process_interview_turn(
         or (is_waiting_resume and (
             is_bare_acknowledgment(answer)
             or is_permission_to_resume(answer)
+            or is_choice_to_move_to_another_question(answer)
             or any(w in answer.lower() for w in ("another moment", "a minute", "a moment", "not yet", "give me", "need time", "just a sec", "rephrase"))
             or is_clarification_request(answer)
         ))
@@ -2604,7 +2661,7 @@ async def process_interview_turn(
         else "off_topic" if is_off_topic
         else "substantive"
     )
-    llm_generator_called = not (is_end or is_ambiguous or is_frustration or is_topic_pref or is_clarification or is_off_topic)
+    llm_generator_called = not (is_end or is_ambiguous or is_frustration or is_abuse or is_topic_pref or is_clarification or is_off_topic)
     print(f"[Turn Routing] Candidate answer: '{answer[:80]}'")
     print(
         f"[Turn Routing] Selected branch: {branch_name} | is_off_topic={is_off_topic} "
@@ -2731,13 +2788,107 @@ async def process_interview_turn(
             state.add_transcript("interviewer", frustration_resp)
         return True
 
-    # 4. TOPIC-CHANGE / RESUME HANDLING
+    # 4. ABUSIVE LANGUAGE (calm, professional boundary, never insults back, redirects to current question)
+    if is_abuse and not disconnect_event.is_set() and not manual_end_event.is_set():
+        if not any(item.get("role") == "candidate" and item.get("text") == answer for item in state.transcript):
+            state.add_transcript("candidate", answer)
+
+        # 4a. Repeated abuse escalation (count >= 3: conclude interview respectfully)
+        if state.abusive_language_count >= 3:
+            closing_resp = (
+                "Since we are unable to communicate respectfully, we will conclude the interview here. "
+                "Thank you for your time."
+            )
+            await send_event_fn(
+                ctx,
+                "assessment_closing",
+                {
+                    "reason": "repeated_abuse",
+                },
+            )
+            spoke_ok = await speak_fn(closing_resp, "Repeated abuse interview conclusion")
+            if spoke_ok:
+                state.add_transcript("interviewer", closing_resp)
+            manual_end_event.set()
+            return False
+
+        # 4b. Repeated abuse warning (count == 2: offer to continue respectfully or end)
+        elif state.abusive_language_count == 2:
+            abuse_resp = ABUSE_WARNING_REPEATED_PREFIX
+
+        # 4c. First abuse warning (count == 1: professional boundary + redirect to current question)
+        else:
+            last_q = get_last_interviewer_question(state)
+            current_q = strip_refusal_prefix(last_q)
+            if not current_q and generate_question_fn is not None:
+                try:
+                    raw_gen = await generate_question_fn(state, remaining_seconds, current_answer=answer)
+                    if raw_gen:
+                        current_q = strip_refusal_prefix(raw_gen)
+                except Exception:
+                    pass
+            if not current_q:
+                current_q = get_next_redirect_question(state)
+            abuse_resp = f"{ABUSE_WARNING_FIRST_PREFIX} {current_q}"
+
+        await send_event_fn(
+            ctx,
+            "interview_question",
+            {
+                "question": abuse_resp,
+                "question_number": state.questions_asked,
+            },
+        )
+        spoke_ok = await speak_fn(abuse_resp, f"Abuse warning #{state.abusive_language_count}")
+        if spoke_ok:
+            state.add_transcript("interviewer", abuse_resp)
+        return True
+
+    # 5. TOPIC-CHANGE / RESUME HANDLING
     if is_topic_pref and not disconnect_event.is_set() and not manual_end_event.is_set():
         if not any(item.get("role") == "candidate" and item.get("text") == answer for item in state.transcript):
             state.add_transcript("candidate", answer)
 
-        # 4a. Check if candidate clearly agrees to resume assessment (Rule 5)
-        if is_permission_to_resume(answer) and (bool(getattr(state, "waiting_for_resume", False)) or state.neutral_topic_turns > 0 or bool(state.preferred_neutral_topic)):
+        # 5a. Check if candidate chooses to move to another relevant professional interview question
+        if is_choice_to_move_to_another_question(answer) and (
+            bool(getattr(state, "waiting_for_resume", False))
+            or state.neutral_topic_turns > 0
+            or bool(getattr(state, "preferred_neutral_topic", ""))
+        ):
+            state.waiting_for_resume = False
+            state.preferred_neutral_topic = ""
+            state.neutral_topic_turns = 0
+            state.repeat_count_for_current_question = 0
+            last_q = get_last_interviewer_question(state)
+            if last_q and last_q not in state.refused_questions:
+                state.refused_questions.append(last_q)
+            next_q = get_next_redirect_question(state)
+            if next_q not in state.asked_questions:
+                state.asked_questions.append(next_q)
+            area = get_question_behavioral_area(next_q)
+            if area and area not in state.asked_areas:
+                state.asked_areas.append(area)
+            state.questions_asked += 1
+            move_resp = f"Certainly. Let's move to another relevant interview question: {next_q}"
+            await send_event_fn(
+                ctx,
+                "interview_question",
+                {
+                    "question": move_resp,
+                    "question_number": state.questions_asked,
+                },
+            )
+            spoke_ok = await speak_fn(move_resp, f"Moved to question #{state.questions_asked}")
+            if spoke_ok:
+                state.add_transcript("interviewer", move_resp)
+            return True
+
+        # 5b. Check if candidate clearly agrees to resume assessment (Rule 5)
+        if is_permission_to_resume(answer) and (
+            bool(getattr(state, "waiting_for_resume", False))
+            or state.neutral_topic_turns > 0
+            or bool(getattr(state, "preferred_neutral_topic", ""))
+        ):
             state.waiting_for_resume = False
             state.preferred_neutral_topic = ""
             state.neutral_topic_turns = 0
@@ -2763,7 +2914,7 @@ async def process_interview_turn(
                 state.add_transcript("interviewer", resume_resp)
             return True
 
-        # 4b. Check if candidate asks to rephrase the question (Rule 4)
+        # 5c. Check if candidate asks to rephrase the question (Rule 4)
         if any(w in answer.lower() for w in ("rephrase", "repeat the question", "clarify the question")) or is_clarification_request(answer):
             state.waiting_for_resume = False
             state.preferred_neutral_topic = ""
@@ -2784,21 +2935,27 @@ async def process_interview_turn(
                 state.add_transcript("interviewer", rephrase_resp)
             return True
 
-        # 4c. Check if candidate requests a brief moment (Rule 4)
+        # 5d. Check if candidate requests a brief moment (Rule 4)
         if any(w in answer.lower() for w in ("another moment", "a minute", "a moment", "not yet", "give me", "need time", "just a sec")):
             state.waiting_for_resume = True
             topic_resp = "Take all the time you need. Whenever you feel comfortable resuming, just let me know."
 
-        # 4d. Bare acknowledgment like "Okay" (Rule 5: do not treat bare "Okay" as permission to resume)
+        # 5e. Bare acknowledgment like "Okay" (Rule 5: do not treat bare "Okay" as permission to resume)
         elif is_bare_acknowledgment(answer):
             state.waiting_for_resume = True
-            topic_resp = "Take your time. Please let me know when you are ready to continue, or if you would like me to rephrase the question."
+            topic_resp = "Take your time. Please let me know whether you would like me to rephrase the question or move to another relevant interview question."
 
-        # 4e. Initial request to change topic away from professional life (Rule 4)
+        # 5f. Initial or repeated request to change topic away from professional life (Rule 4)
         else:
             state.waiting_for_resume = True
             state.neutral_topic_turns += 1
-            topic_resp = PROFESSIONAL_TOPIC_REQUEST_RESPONSE
+            if state.neutral_topic_turns <= 1:
+                topic_resp = PROFESSIONAL_TOPIC_REQUEST_RESPONSE
+            else:
+                topic_resp = (
+                    "As a reminder, our interview is dedicated to your professional experience. "
+                    "Would you like me to rephrase the current question, or move to another relevant interview question?"
+                )
 
         await send_event_fn(
             ctx,
@@ -2813,7 +2970,7 @@ async def process_interview_turn(
             state.add_transcript("interviewer", topic_resp)
         return True
 
-    # 5. CLARIFICATION REQUEST (repeat current question clearly once, avoid endless loops)
+    # 6. CLARIFICATION REQUEST (repeat current question clearly once, avoid endless loops)
     if is_clarification and not disconnect_event.is_set() and not manual_end_event.is_set():
         state.repeat_count_for_current_question += 1
         last_q = get_last_interviewer_question(state)
