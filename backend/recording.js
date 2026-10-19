@@ -522,7 +522,11 @@ async function stopRecording(roomName) {
                 session.size = Number(fileRes.size);
               }
               if (fileRes.duration !== undefined && fileRes.duration !== null && Number(fileRes.duration) > 0) {
-                session.duration = Number(fileRes.duration);
+                const rawDur = Number(fileRes.duration);
+                // LiveKit Egress protobuf FileInfo.duration is in nanoseconds (int64)
+                const durationSeconds = rawDur > 1e8 ? Math.round(rawDur / 1e9) : Math.round(rawDur);
+                session.duration = durationSeconds;
+                session.duration_seconds = durationSeconds;
               }
             }
             const storageConfig = getStorageConfig();
@@ -580,6 +584,7 @@ async function getRecordingStatus(roomName) {
       ...(session.startedAt ? { startedAt: session.startedAt } : {}),
       ...(session.endedAt ? { endedAt: session.endedAt } : {}),
       ...(session.duration !== undefined ? { duration: session.duration } : {}),
+      ...(session.duration_seconds !== undefined ? { duration_seconds: session.duration_seconds } : {}),
       ...(session.size !== undefined ? { size: session.size } : {}),
     };
   }
@@ -616,7 +621,11 @@ async function getRecordingStatus(roomName) {
                 session.size = Number(fileRes.size);
               }
               if (fileRes.duration !== undefined && fileRes.duration !== null && Number(fileRes.duration) > 0) {
-                session.duration = Number(fileRes.duration);
+                const rawDur = Number(fileRes.duration);
+                // LiveKit Egress protobuf FileInfo.duration is in nanoseconds (int64)
+                const durationSeconds = rawDur > 1e8 ? Math.round(rawDur / 1e9) : Math.round(rawDur);
+                session.duration = durationSeconds;
+                session.duration_seconds = durationSeconds;
               }
             }
             const storageConfig = getStorageConfig();
@@ -649,6 +658,7 @@ async function getRecordingStatus(roomName) {
     ...(session.startedAt ? { startedAt: session.startedAt } : {}),
     ...(session.endedAt ? { endedAt: session.endedAt } : {}),
     ...(session.duration !== undefined ? { duration: session.duration } : {}),
+    ...(session.duration_seconds !== undefined ? { duration_seconds: session.duration_seconds } : {}),
     ...(session.size !== undefined ? { size: session.size } : {}),
   };
 }

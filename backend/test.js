@@ -475,6 +475,8 @@ const server = app.listen(0, async () => {
     const statusData = await statusRes.json();
 
     if (
+      stopData.success === true &&
+      stopData.videoUrl === null &&
       statusData.success === true &&
       statusData.status === "completed" &&
       typeof statusData.videoUrl === "string" &&
@@ -1190,6 +1192,26 @@ const server = app.listen(0, async () => {
       };
       recording.setEgressClientForTest(mockMetaClient);
 
+      // 1. Verify unauthenticated POST /recording/stop returns videoUrl: null
+      const unauthStopRes = await fetch(`http://localhost:${port}/api/recording/stop`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ room: metaRoom }),
+      });
+      const unauthStopData = await unauthStopRes.json();
+
+      // 2. Verify invalid-token POST /recording/stop returns videoUrl: null
+      const invalidTokenStopRes = await fetch(`http://localhost:${port}/api/recording/stop`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: "Bearer invalid-archive-token-99999",
+        },
+        body: JSON.stringify({ room: metaRoom }),
+      });
+      const invalidTokenStopData = await invalidTokenStopRes.json();
+
+      // 3. Verify authenticated POST /recording/stop returns presigned videoUrl and normalized duration
       const metaStopRes = await fetch(`http://localhost:${port}/api/recording/stop`, {
         method: "POST",
         headers: {
@@ -1208,18 +1230,26 @@ const server = app.listen(0, async () => {
       recording.setEgressClientForTest(null);
 
       if (
+        unauthStopData.success === true &&
+        unauthStopData.videoUrl === null &&
+        invalidTokenStopData.success === true &&
+        invalidTokenStopData.videoUrl === null &&
         metaStopData.status === "completed" &&
+        metaStopData.videoUrl &&
+        metaStopData.videoUrl.includes("X-Amz-Signature=") &&
         metaStopData.size === 15485760 &&
-        metaStopData.duration === 185000000000 &&
+        metaStopData.duration === 185 &&
+        metaStopData.duration_seconds === 185 &&
         metaStatusData.status === "completed" &&
         metaStatusData.size === 15485760 &&
-        metaStatusData.duration === 185000000000 &&
+        metaStatusData.duration === 185 &&
+        metaStatusData.duration_seconds === 185 &&
         metaStatusData.videoUrl &&
         metaStatusData.videoUrl.includes("X-Amz-Signature=")
       ) {
-        console.log("PASS: Recording metadata (size, duration, egressId) preserved from LiveKit Egress fileResults");
+        console.log("PASS: Recording stop protects videoUrl (null for unauth/invalid, presigned for auth) and normalizes duration to seconds");
       } else {
-        console.error("FAIL: Recording metadata preservation test failed", { metaStopData, metaStatusData });
+        console.error("FAIL: Recording metadata preservation test failed", { unauthStopData, invalidTokenStopData, metaStopData, metaStatusData });
         failures++;
       }
 

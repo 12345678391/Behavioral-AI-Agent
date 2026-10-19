@@ -574,6 +574,7 @@ function syncRecordingToAssessment(roomName, recData) {
     ...(recData.startedAt ? { startedAt: recData.startedAt } : {}),
     ...(recData.endedAt ? { endedAt: recData.endedAt } : {}),
     ...(recData.duration !== undefined ? { duration: recData.duration } : {}),
+    ...(recData.duration_seconds !== undefined ? { duration_seconds: recData.duration_seconds } : {}),
     ...(recData.size !== undefined ? { size: recData.size } : {}),
   };
   if (cachedEntry && cachedEntry.data) {
@@ -595,6 +596,7 @@ function syncRecordingToAssessment(roomName, recData) {
         ...(recData.startedAt ? { startedAt: recData.startedAt } : {}),
         ...(recData.endedAt ? { endedAt: recData.endedAt } : {}),
         ...(recData.duration !== undefined ? { duration: recData.duration } : {}),
+        ...(recData.duration_seconds !== undefined ? { duration_seconds: recData.duration_seconds } : {}),
         ...(recData.size !== undefined ? { size: recData.size } : {}),
       };
       fs.writeFileSync(resultPath, JSON.stringify(parsed, null, 2), "utf-8");
@@ -725,6 +727,7 @@ router.get("/assessment-result", (req, res) => {
         ...(liveRec.startedAt ? { startedAt: liveRec.startedAt } : {}),
         ...(liveRec.endedAt ? { endedAt: liveRec.endedAt } : {}),
         ...(liveRec.duration !== undefined ? { duration: liveRec.duration } : {}),
+        ...(liveRec.duration_seconds !== undefined ? { duration_seconds: liveRec.duration_seconds } : {}),
         ...(liveRec.size !== undefined ? { size: liveRec.size } : {}),
       };
     } else if (parsed.recording && parsed.recording.status === "completed" && auth.authenticated) {
@@ -786,7 +789,7 @@ router.post("/recording/stop", express.json(), async (req, res) => {
     const session = await stopRecording(room);
     syncRecordingToAssessment(room, session);
 
-    let videoUrl = session.videoUrl;
+    let videoUrl = null;
     const providedToken = extractBearerToken(req);
     if (session.status === "completed" && providedToken) {
       const auth = verifyRoomAuthorization(room, providedToken);
@@ -796,6 +799,8 @@ router.post("/recording/stop", express.json(), async (req, res) => {
         if (storageConfig.type === "s3" && storageConfig.configured) {
           const presigned = generatePresignedPlaybackUrl(storageConfig, filepath, 900);
           if (presigned) videoUrl = presigned;
+        } else {
+          videoUrl = session.videoUrl;
         }
       }
     }
@@ -808,6 +813,7 @@ router.post("/recording/stop", express.json(), async (req, res) => {
       error: session.error,
       ...(session.egressId ? { egressId: session.egressId } : {}),
       ...(session.duration !== undefined ? { duration: session.duration } : {}),
+      ...(session.duration_seconds !== undefined ? { duration_seconds: session.duration_seconds } : {}),
       ...(session.size !== undefined ? { size: session.size } : {}),
     });
   } catch (error) {
