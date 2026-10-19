@@ -698,6 +698,32 @@ _COMPILED_WORKPLACE_FRAME = [re.compile(p, re.IGNORECASE) for p in WORKPLACE_NAR
 _COMPILED_WORKPLACE_RESOLUTION = [re.compile(p, re.IGNORECASE) for p in WORKPLACE_DEESCALATION_RESOLUTION_PATTERNS]
 _COMPILED_DIRECT_BOT_ATTACK = [re.compile(p, re.IGNORECASE) for p in DIRECT_BOT_ATTACK_PATTERNS]
 
+REPORTED_SPEECH_VERBS = (
+    r"(?:said|saying|says|told|telling|tells|shouted|shouting|shouts|yelled|yelling|yells|"
+    r"screamed|screaming|screams|called|calling|calls|cursed|cursing|insulted|insulting|"
+    r"hurled|hurling|wrote|writing|messaged|emailed|threatened|threatening|stating|stated|"
+    r"demanded|demanding|repeated|repeating|cried|crying)"
+)
+
+REPORTED_THIRD_PARTY = (
+    r"(?:customer|client|caller|user|coworker|colleague|stakeholder|manager|boss|patient|"
+    r"patron|guest|passenger|employee|vendor|person|someone|they|he|she|stranger|people|"
+    r"callers|clients|customers|users)"
+)
+
+_COMPILED_REPORTED_INTRO = re.compile(
+    rf"\b{REPORTED_THIRD_PARTY}\s+(?:who\s+was\s+|who\s+became\s+)?(?:was|were|became|got)?\s*"
+    rf"(?:abusive|aggressive|hostile|angry|irate|rude|furious|upset|difficult)?\s*(?:and\s+)?"
+    rf"(?:started|kept|went\s+on\s+to)?\s*(?:verbally\s+)?{REPORTED_SPEECH_VERBS}\b",
+    re.IGNORECASE,
+)
+
+_COMPILED_REPORTED_POST = re.compile(
+    r"^[,\s]*(?:at|to|towards)\s+(?:me|us|them|him|her|our\s+team|the\s+team|my\s+colleague|"
+    r"a\s+colleague|the\s+staff|an\s+agent|support|the\s+cashier)\b",
+    re.IGNORECASE,
+)
+
 
 def is_personal_or_unrelated_request(text: str) -> bool:
     """Detect explicit requests by candidate to switch interview focus to personal life,
@@ -737,21 +763,76 @@ def is_direct_bot_attack(text: str) -> bool:
     return any(p.search(cleaned) is not None for p in _COMPILED_DIRECT_BOT_ATTACK)
 
 
+def is_span_reported_speech(text: str, start: int, end: int) -> bool:
+    """Check whether a specific abusive span in text is reported or quoted speech in a workplace narrative."""
+    match_text = text[start:end]
+    if is_direct_bot_attack(match_text):
+        return False
+
+    pre = text[:start]
+
+    # Split by strong boundaries: sentence ends or adversative coordinators starting an independent clause to the interviewer
+    clause_parts = re.split(r"[.!?;]|\b(?:but|however|yet)\b", pre)
+    curr_clause = clause_parts[-1] if clause_parts else ""
+
+    # Check if the current clause preceding the match contains a reported speech intro
+    if _COMPILED_REPORTED_INTRO.search(curr_clause):
+        return True
+
+    # Check if inside explicit quotation marks introduced by reported speech
+    # Strip word-internal apostrophes (e.g. you're, don't, I'm) so they don't corrupt quote parity
+    pre_no_contractions = re.sub(r"\w['’]\w", "", pre)
+    quotes = (
+        pre_no_contractions.count('"')
+        + pre_no_contractions.count("“")
+        + pre_no_contractions.count("”")
+        + pre_no_contractions.count("'")
+    )
+    if quotes % 2 == 1:
+        last_sentence = re.split(r"[.!?]", pre)[-1]
+        if _COMPILED_REPORTED_INTRO.search(last_sentence) or any(
+            v in last_sentence.lower() for v in ("said", "told", "shouted", "yelled", "screamed", "called")
+        ):
+            return True
+
+    # Check if immediately after the match there is an attribution or third-party target
+    post = text[end:]
+    if _COMPILED_REPORTED_POST.search(post):
+        last_sentence = re.split(r"[.!?]|\b(?:but|however)\b", pre)[-1]
+        if re.search(rf"\b{REPORTED_THIRD_PARTY}\b", last_sentence, re.IGNORECASE):
+            return True
+
+    return False
+
+
 def is_abusive_language(text: str) -> bool:
     """Conservative, context-aware detection for abusive, hostile, or insulting language directed at the interviewer.
     Does NOT flag ordinary frustration, technical disagreement, nervousness, polite refusals,
-    or workplace examples discussing abusive customers/clients/coworkers.
+    or genuine workplace examples where abusive words are reported speech directed at a third party.
+    Ensures direct abuse aimed at the interviewer is detected even when the message contains workplace narrative phrasing.
     """
     if not text or not isinstance(text, str):
         return False
-    cleaned = text.strip().lower()
+    cleaned = text.strip()
     if not cleaned:
         return False
-    if is_workplace_example_or_narrative_context(cleaned):
-        if is_direct_bot_attack(cleaned):
-            return True
+
+    matches = []
+    for p in _COMPILED_ABUSE:
+        for m in p.finditer(cleaned):
+            matches.append((m.start(), m.end(), m.group()))
+
+    # If no abusive patterns matched, cannot be abusive
+    if not matches:
         return False
-    return any(p.search(cleaned) is not None for p in _COMPILED_ABUSE)
+
+    # If any abusive match is NOT reported speech, it is considered direct abuse directed at the AI interviewer
+    for start, end, val in matches:
+        if not is_span_reported_speech(cleaned, start, end):
+            return True
+
+    # Every abusive match was genuine reported speech in a workplace context
+    return False
 
 
 FRUSTRATION_PATTERNS = [

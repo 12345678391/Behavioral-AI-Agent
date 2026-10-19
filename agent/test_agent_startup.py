@@ -4213,6 +4213,113 @@ class TestAgentStartup(unittest.TestCase):
         speak_mock.assert_awaited_once()
         self.assertEqual(speak_mock.await_args[0][0], q2_next)
 
+    def test_regression_workplace_narrative_vs_direct_ai_abuse_precedence(self):
+        """Regression test for abuse-detection precedence:
+        1. Genuine workplace example describing an abusive customer is NOT flagged as abuse.
+        2. Direct abuse aimed at the AI, even when the message also mentions a workplace incident, IS flagged as abuse.
+        3. A workplace example containing quoted abusive language is NOT flagged unless the candidate also directly abuses the AI.
+        4. Ordinary frustration and disagreement is NOT flagged as abuse.
+        """
+        import asyncio
+        from unittest.mock import AsyncMock, MagicMock
+        from agent.agent import (
+            AssessmentState,
+            process_interview_turn,
+            is_abusive_language,
+            ABUSE_WARNING_FIRST_PREFIX,
+        )
+
+        # 1. Genuine workplace example describing an abusive customer — NOT flagged as abuse
+        workplace_narratives = [
+            "A customer became abusive and called our support team names...",
+            "A customer became abusive and called our support team names, but I handled the incident professionally.",
+            "In my previous role, an angry customer shouted you are useless at a colleague, and I stepped in to de-escalate the situation.",
+            "When I worked in customer support, a client told me to shut the fuck up over the phone, but I stayed calm and professional and resolved their billing problem.",
+            'In my previous role, a customer said "you are useless" and I listened actively to understand their issue.',
+            "There was an incident where a user became verbally abusive and screamed you suck at our team. I followed our company de-escalation protocol.",
+            "In dealing with an abusive client who called our staff idiots, I remained professional and defused the conflict.",
+        ]
+        for narrative in workplace_narratives:
+            self.assertFalse(is_abusive_language(narrative), f"Workplace narrative falsely flagged: {narrative}")
+
+        # 2. Direct abuse aimed at the AI, even when the message also mentions a workplace incident — FLAGGED as abuse
+        direct_abuse_with_workplace_context = [
+            "In my previous role I handled client escalations, but you are an idiot.",
+            "When I worked in customer support, we resolved many issues. Shut the fuck up.",
+            "In my last job, a customer was mad. Fuck off you bot.",
+            "I worked in retail where people yelled, but you suck and you're useless.",
+            "At my last company we had escalations. You are a moron.",
+            "In my previous job, people were stressed, but go to hell.",
+            "In my previous role, an angry customer shouted you are useless at a colleague, but you are a stupid idiot.",
+            'When the client told me "shut the fuck up", I stayed calm. But you are useless.',
+            "My manager shouted that I was stupid, but you are a moron.",
+        ]
+        for abusive_msg in direct_abuse_with_workplace_context:
+            self.assertTrue(is_abusive_language(abusive_msg), f"Direct abuse inside workplace context missed: {abusive_msg}")
+
+        # 3. Quoted abusive language alone vs quoted + direct abuse targeting AI
+        # Quoted alone -> NOT abuse
+        quoted_alone = 'A customer said to me: "you are an idiot and you suck", but I de-escalated.'
+        self.assertFalse(is_abusive_language(quoted_alone))
+
+        # Quoted + direct abuse to AI -> FLAGGED as abuse
+        quoted_plus_direct = 'A customer said to me: "you are an idiot", but you are useless.'
+        self.assertTrue(is_abusive_language(quoted_plus_direct))
+
+        # 4. Ordinary frustration and disagreement — NOT flagged as abuse
+        frustration_and_disagreement = [
+            "I disagree with this approach.",
+            "I disagree.",
+            "I don't agree with that architectural decision.",
+            "I am frustrated with this process.",
+            "I'm frustrated by the repeated questions.",
+            "I don't understand what you mean.",
+            "Could you explain what you're asking?",
+            "This is a bit confusing to me.",
+            "Are you even listening to me?",
+            "Why do you keep asking the same question?",
+        ]
+        for stmt in frustration_and_disagreement:
+            self.assertFalse(is_abusive_language(stmt), f"Frustration incorrectly flagged as abuse: {stmt}")
+
+        # 5. Process turn verification: Direct abuse with workplace framing triggers boundary and is NOT analyzed
+        state = AssessmentState()
+        q1 = "Tell me about a difficult incident you managed."
+        state.add_transcript("interviewer", q1)
+        state.asked_questions.append(q1)
+        state.questions_asked = 1
+
+        speak_mock = AsyncMock()
+        analyze_mock = AsyncMock()
+        send_mock = AsyncMock()
+
+        mixed_turn = "In my previous role I handled client escalations, but you are an idiot."
+        cont = asyncio.run(process_interview_turn(
+            ctx=MagicMock(),
+            state=state,
+            answer=mixed_turn,
+            remaining_seconds=300,
+            warning_sent=False,
+            user_answer_queue=asyncio.Queue(),
+            analyzed_answers=set(),
+            manual_end_event=asyncio.Event(),
+            timer_finished_event=asyncio.Event(),
+            disconnect_event=asyncio.Event(),
+            speak_fn=speak_mock,
+            analyze_fn=analyze_mock,
+            generate_question_fn=AsyncMock(),
+            send_event_fn=send_mock,
+        ))
+
+        self.assertTrue(cont)
+        self.assertEqual(state.abusive_language_count, 1)  # Correctly flagged as abuse!
+        self.assertEqual(state.questions_asked, 1)         # Question count not advanced
+        analyze_mock.assert_not_awaited()                  # Not scored as substantive evidence
+        speak_mock.assert_awaited_once()
+        spoken = speak_mock.await_args[0][0]
+        self.assertTrue(spoken.startswith(ABUSE_WARNING_FIRST_PREFIX))
+        self.assertIn(q1, spoken)
+
 
 if __name__ == "__main__":
     unittest.main()
