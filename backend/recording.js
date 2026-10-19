@@ -42,29 +42,44 @@ function getStorageConfig() {
     process.env.S3_KEY_SECRET || process.env.AWS_SECRET_ACCESS_KEY
   );
   const s3Bucket = sanitizeEnvValue(
-    process.env.S3_BUCKET || process.env.AWS_BUCKET
+    process.env.S3_BUCKET || process.env.AWS_BUCKET || process.env.AWS_S3_BUCKET
   );
   const s3Region = sanitizeEnvValue(
-    process.env.S3_REGION || process.env.AWS_REGION || "us-east-1"
+    process.env.S3_REGION || process.env.AWS_REGION || process.env.AWS_DEFAULT_REGION || "us-east-1"
+  );
+  const s3SessionToken = sanitizeEnvValue(
+    process.env.S3_SESSION_TOKEN || process.env.AWS_SESSION_TOKEN
+  );
+  const s3RoleArn = sanitizeEnvValue(
+    process.env.S3_ROLE_ARN || process.env.AWS_ROLE_ARN || process.env.AWS_ASSUME_ROLE_ARN
+  );
+  const s3ExternalId = sanitizeEnvValue(
+    process.env.S3_EXTERNAL_ID || process.env.AWS_ROLE_EXTERNAL_ID || process.env.AWS_EXTERNAL_ID
   );
   const s3Endpoint = sanitizeEnvValue(process.env.S3_ENDPOINT);
   const forcePathStyle = process.env.S3_FORCE_PATH_STYLE === "true";
 
   if (s3Key && s3Secret && s3Bucket) {
+    const s3UploadParams = {
+      accessKey: s3Key,
+      secret: s3Secret,
+      bucket: s3Bucket,
+      region: s3Region,
+      forcePathStyle,
+    };
+    if (s3SessionToken) s3UploadParams.sessionToken = s3SessionToken;
+    if (s3RoleArn) s3UploadParams.assumeRoleArn = s3RoleArn;
+    if (s3ExternalId) s3UploadParams.assumeRoleExternalId = s3ExternalId;
+    if (s3Endpoint) s3UploadParams.endpoint = s3Endpoint;
+
     return {
       type: "s3",
       configured: true,
       bucket: s3Bucket,
       region: s3Region,
       endpoint: s3Endpoint,
-      uploadObject: new S3Upload({
-        accessKey: s3Key,
-        secret: s3Secret,
-        bucket: s3Bucket,
-        region: s3Region,
-        endpoint: s3Endpoint,
-        forcePathStyle,
-      }),
+      sessionToken: s3SessionToken || undefined,
+      uploadObject: new S3Upload(s3UploadParams),
     };
   }
 
@@ -192,10 +207,13 @@ function generatePresignedPlaybackUrl(
     process.env.S3_KEY_SECRET || process.env.AWS_SECRET_ACCESS_KEY
   );
   const bucket = sanitizeEnvValue(
-    storageConfig.bucket || process.env.S3_BUCKET || process.env.AWS_BUCKET
+    storageConfig.bucket || process.env.S3_BUCKET || process.env.AWS_BUCKET || process.env.AWS_S3_BUCKET
   );
   const region = sanitizeEnvValue(
-    storageConfig.region || process.env.S3_REGION || process.env.AWS_REGION || "auto"
+    storageConfig.region || process.env.S3_REGION || process.env.AWS_REGION || process.env.AWS_DEFAULT_REGION || "auto"
+  );
+  const sessionToken = sanitizeEnvValue(
+    storageConfig.sessionToken || process.env.S3_SESSION_TOKEN || process.env.AWS_SESSION_TOKEN
   );
   const rawEndpoint = sanitizeEnvValue(
     storageConfig.endpoint || process.env.S3_ENDPOINT
@@ -241,6 +259,7 @@ function generatePresignedPlaybackUrl(
     `X-Amz-Credential=${encodeURIComponent(`${accessKeyId}/${credentialScope}`)}`,
     `X-Amz-Date=${amzDate}`,
     `X-Amz-Expires=${expiresInSeconds}`,
+    ...(sessionToken ? [`X-Amz-Security-Token=${encodeURIComponent(sessionToken)}`] : []),
     `X-Amz-SignedHeaders=host`,
   ];
   const canonicalQueryString = queryParams.join("&");
@@ -370,6 +389,7 @@ async function startRecording(roomName) {
 
   const timestamp = Date.now();
   const filepath = `recordings/${roomName}-${timestamp}.mp4`;
+  const layout = sanitizeEnvValue(process.env.LIVEKIT_EGRESS_LAYOUT) || "speaker";
 
   try {
     const fileOutput = new EncodedFileOutput({
@@ -383,7 +403,7 @@ async function startRecording(roomName) {
     const info = await client.startRoomCompositeEgress(
       roomName,
       fileOutput,
-      { layout: "speaker" }
+      { layout }
     );
 
     const egressId = info?.egressId;
@@ -493,6 +513,18 @@ async function stopRecording(roomName) {
 
           if (isComplete) {
             session.status = "completed";
+            if (Array.isArray(info.fileResults) && info.fileResults.length > 0) {
+              const fileRes = info.fileResults[0];
+              if (fileRes.filename) {
+                session.filepath = fileRes.filename;
+              }
+              if (fileRes.size !== undefined && fileRes.size !== null && Number(fileRes.size) > 0) {
+                session.size = Number(fileRes.size);
+              }
+              if (fileRes.duration !== undefined && fileRes.duration !== null && Number(fileRes.duration) > 0) {
+                session.duration = Number(fileRes.duration);
+              }
+            }
             const storageConfig = getStorageConfig();
             session.videoUrl = computePlaybackUrl(
               storageConfig,
@@ -541,8 +573,14 @@ async function getRecordingStatus(roomName) {
       success: true,
       room: roomName,
       status: session.status,
+      filepath: session.filepath,
       videoUrl: session.videoUrl,
       error: session.error,
+      ...(session.egressId ? { egressId: session.egressId } : {}),
+      ...(session.startedAt ? { startedAt: session.startedAt } : {}),
+      ...(session.endedAt ? { endedAt: session.endedAt } : {}),
+      ...(session.duration !== undefined ? { duration: session.duration } : {}),
+      ...(session.size !== undefined ? { size: session.size } : {}),
     };
   }
 
@@ -569,6 +607,18 @@ async function getRecordingStatus(roomName) {
 
           if (isComplete) {
             session.status = "completed";
+            if (Array.isArray(info.fileResults) && info.fileResults.length > 0) {
+              const fileRes = info.fileResults[0];
+              if (fileRes.filename) {
+                session.filepath = fileRes.filename;
+              }
+              if (fileRes.size !== undefined && fileRes.size !== null && Number(fileRes.size) > 0) {
+                session.size = Number(fileRes.size);
+              }
+              if (fileRes.duration !== undefined && fileRes.duration !== null && Number(fileRes.duration) > 0) {
+                session.duration = Number(fileRes.duration);
+              }
+            }
             const storageConfig = getStorageConfig();
             session.videoUrl = computePlaybackUrl(
               storageConfig,
@@ -595,6 +645,11 @@ async function getRecordingStatus(roomName) {
     filepath: session.filepath,
     videoUrl: session.videoUrl,
     error: session.error,
+    ...(session.egressId ? { egressId: session.egressId } : {}),
+    ...(session.startedAt ? { startedAt: session.startedAt } : {}),
+    ...(session.endedAt ? { endedAt: session.endedAt } : {}),
+    ...(session.duration !== undefined ? { duration: session.duration } : {}),
+    ...(session.size !== undefined ? { size: session.size } : {}),
   };
 }
 

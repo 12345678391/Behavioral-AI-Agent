@@ -564,13 +564,20 @@ function syncRecordingToAssessment(roomName, recData) {
   if (!roomName || !recData) return;
   const safeId = roomName.replace(/[^a-zA-Z0-9_-]/g, "_");
   const cachedEntry = assessmentResultsCache.get(safeId);
+  const updatedRecording = {
+    ...(cachedEntry?.data?.recording || {}),
+    status: recData.status,
+    videoUrl: recData.videoUrl,
+    filepath: recData.filepath || cachedEntry?.data?.recording?.filepath,
+    error: recData.error,
+    ...(recData.egressId ? { egressId: recData.egressId } : {}),
+    ...(recData.startedAt ? { startedAt: recData.startedAt } : {}),
+    ...(recData.endedAt ? { endedAt: recData.endedAt } : {}),
+    ...(recData.duration !== undefined ? { duration: recData.duration } : {}),
+    ...(recData.size !== undefined ? { size: recData.size } : {}),
+  };
   if (cachedEntry && cachedEntry.data) {
-    cachedEntry.data.recording = {
-      status: recData.status,
-      videoUrl: recData.videoUrl,
-      filepath: recData.filepath,
-      error: recData.error,
-    };
+    cachedEntry.data.recording = updatedRecording;
   }
   try {
     const assessmentsDir = path.join(__dirname, "..", "agent", "assessments");
@@ -579,10 +586,16 @@ function syncRecordingToAssessment(roomName, recData) {
       const content = fs.readFileSync(resultPath, "utf-8");
       const parsed = JSON.parse(content);
       parsed.recording = {
+        ...(parsed.recording || {}),
         status: recData.status,
         videoUrl: recData.videoUrl,
-        filepath: recData.filepath,
+        filepath: recData.filepath || parsed.recording?.filepath,
         error: recData.error,
+        ...(recData.egressId ? { egressId: recData.egressId } : {}),
+        ...(recData.startedAt ? { startedAt: recData.startedAt } : {}),
+        ...(recData.endedAt ? { endedAt: recData.endedAt } : {}),
+        ...(recData.duration !== undefined ? { duration: recData.duration } : {}),
+        ...(recData.size !== undefined ? { size: recData.size } : {}),
       };
       fs.writeFileSync(resultPath, JSON.stringify(parsed, null, 2), "utf-8");
     }
@@ -703,10 +716,16 @@ router.get("/assessment-result", (req, res) => {
         }
       }
       parsed.recording = {
+        ...(parsed.recording || {}),
         status: liveRec.status,
         videoUrl,
-        filepath: liveRec.filepath,
+        filepath: liveRec.filepath || parsed.recording?.filepath,
         error: liveRec.error,
+        ...(liveRec.egressId ? { egressId: liveRec.egressId } : {}),
+        ...(liveRec.startedAt ? { startedAt: liveRec.startedAt } : {}),
+        ...(liveRec.endedAt ? { endedAt: liveRec.endedAt } : {}),
+        ...(liveRec.duration !== undefined ? { duration: liveRec.duration } : {}),
+        ...(liveRec.size !== undefined ? { size: liveRec.size } : {}),
       };
     } else if (parsed.recording && parsed.recording.status === "completed" && auth.authenticated) {
       const storageConfig = getStorageConfig();
@@ -766,12 +785,30 @@ router.post("/recording/stop", express.json(), async (req, res) => {
 
     const session = await stopRecording(room);
     syncRecordingToAssessment(room, session);
+
+    let videoUrl = session.videoUrl;
+    const providedToken = extractBearerToken(req);
+    if (session.status === "completed" && providedToken) {
+      const auth = verifyRoomAuthorization(room, providedToken);
+      if (auth.authenticated) {
+        const storageConfig = getStorageConfig();
+        const filepath = session.filepath || `recordings/${room}.mp4`;
+        if (storageConfig.type === "s3" && storageConfig.configured) {
+          const presigned = generatePresignedPlaybackUrl(storageConfig, filepath, 900);
+          if (presigned) videoUrl = presigned;
+        }
+      }
+    }
+
     res.json({
       success: true,
       room,
       status: session.status,
-      videoUrl: session.videoUrl,
+      videoUrl: videoUrl,
       error: session.error,
+      ...(session.egressId ? { egressId: session.egressId } : {}),
+      ...(session.duration !== undefined ? { duration: session.duration } : {}),
+      ...(session.size !== undefined ? { size: session.size } : {}),
     });
   } catch (error) {
     console.error("Recording stop endpoint error:", error.message || error);

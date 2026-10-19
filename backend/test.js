@@ -1077,6 +1077,152 @@ const server = app.listen(0, async () => {
         failures++;
       }
 
+      // Test 44: AWS S3 standard environment aliases and private bucket configuration
+      const origS3Env = {
+        AWS_ACCESS_KEY_ID: process.env.AWS_ACCESS_KEY_ID,
+        AWS_SECRET_ACCESS_KEY: process.env.AWS_SECRET_ACCESS_KEY,
+        AWS_S3_BUCKET: process.env.AWS_S3_BUCKET,
+        AWS_DEFAULT_REGION: process.env.AWS_DEFAULT_REGION,
+        S3_KEY_ID: process.env.S3_KEY_ID,
+        S3_KEY_SECRET: process.env.S3_KEY_SECRET,
+        S3_BUCKET: process.env.S3_BUCKET,
+        S3_REGION: process.env.S3_REGION,
+        S3_ENDPOINT: process.env.S3_ENDPOINT,
+      };
+
+      try {
+        delete process.env.S3_KEY_ID;
+        delete process.env.S3_KEY_SECRET;
+        delete process.env.S3_BUCKET;
+        delete process.env.S3_REGION;
+        delete process.env.S3_ENDPOINT;
+
+        process.env.AWS_ACCESS_KEY_ID = "AKIA_TEST_PRIVATE_KEY_ID";
+        process.env.AWS_SECRET_ACCESS_KEY = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY";
+        process.env.AWS_S3_BUCKET = "private-interview-recordings";
+        process.env.AWS_DEFAULT_REGION = "us-west-2";
+
+        const awsStorageConfig = recording.getStorageConfig();
+        const awsPresignedUrl = recording.generatePresignedPlaybackUrl(
+          awsStorageConfig,
+          "recordings/interview-session-123.mp4",
+          900,
+          new Date("2026-10-19T10:00:00Z")
+        );
+
+        if (
+          awsStorageConfig.configured === true &&
+          awsStorageConfig.type === "s3" &&
+          awsStorageConfig.bucket === "private-interview-recordings" &&
+          awsStorageConfig.region === "us-west-2" &&
+          awsPresignedUrl &&
+          awsPresignedUrl.startsWith("https://private-interview-recordings.s3.us-west-2.amazonaws.com/recordings/interview-session-123.mp4?") &&
+          awsPresignedUrl.includes("X-Amz-Algorithm=AWS4-HMAC-SHA256") &&
+          awsPresignedUrl.includes("X-Amz-Credential=AKIA_TEST_PRIVATE_KEY_ID%2F20261019%2Fus-west-2%2Fs3%2Faws4_request") &&
+          awsPresignedUrl.includes("X-Amz-Signature=")
+        ) {
+          console.log("PASS: AWS S3 standard environment variables configure secure private S3 storage with valid SigV4 presigned URL");
+        } else {
+          console.error("FAIL: AWS S3 standard environment variables test failed", { awsStorageConfig, awsPresignedUrl });
+          failures++;
+        }
+
+        // Test 45: AWS temporary session credentials (AWS_SESSION_TOKEN) in SigV4 URL
+        process.env.AWS_SESSION_TOKEN = "AQoDYXdzEJr1EXAMPLETOKEN1234567890";
+        const tempAwsStorageConfig = recording.getStorageConfig();
+        const tempPresignedUrl = recording.generatePresignedPlaybackUrl(
+          tempAwsStorageConfig,
+          "recordings/interview-session-123.mp4",
+          900,
+          new Date("2026-10-19T10:00:00Z")
+        );
+
+        if (
+          tempAwsStorageConfig.sessionToken === "AQoDYXdzEJr1EXAMPLETOKEN1234567890" &&
+          tempAwsStorageConfig.uploadObject?.sessionToken === "AQoDYXdzEJr1EXAMPLETOKEN1234567890" &&
+          tempPresignedUrl &&
+          tempPresignedUrl.includes("X-Amz-Security-Token=AQoDYXdzEJr1EXAMPLETOKEN1234567890")
+        ) {
+          console.log("PASS: AWS temporary credentials (sessionToken) supported and included in SigV4 presigned URL");
+        } else {
+          console.error("FAIL: AWS session token test failed", { tempAwsStorageConfig, tempPresignedUrl });
+          failures++;
+        }
+      } finally {
+        delete process.env.AWS_SESSION_TOKEN;
+        for (const [k, v] of Object.entries(origS3Env)) {
+          if (v === undefined) delete process.env[k];
+          else process.env[k] = v;
+        }
+      }
+
+      // Test 46: Recording metadata preservation from LiveKit Egress fileResults
+      const metaRoom = `meta-rec-room-${Date.now()}`;
+      const metaToken = "meta-archive-token-1234567890abcdef12345678";
+      routes.registerRoomCapabilityToken(metaRoom, metaToken);
+
+      recording.setRecordingSession(metaRoom, {
+        roomName: metaRoom,
+        status: "active",
+        egressId: "egress-meta-456",
+        filepath: `recordings/${metaRoom}.mp4`,
+        videoUrl: null,
+        error: null,
+        startedAt: Date.now() - 60000,
+        endedAt: null,
+        storageType: "s3",
+      });
+
+      // Mock EgressClient returning complete status with fileResults metadata
+      const mockMetaClient = {
+        stopEgress: async () => ({
+          status: 3, // EGRESS_COMPLETE
+          fileResults: [
+            {
+              filename: `recordings/${metaRoom}.mp4`,
+              size: 15485760n, // ~14.7 MB BigInt
+              duration: 185000000000n, // 185 seconds in nanoseconds
+              location: `https://private-interview-recordings.s3.us-west-2.amazonaws.com/recordings/${metaRoom}.mp4`,
+            },
+          ],
+        }),
+        listEgress: async () => [],
+      };
+      recording.setEgressClientForTest(mockMetaClient);
+
+      const metaStopRes = await fetch(`http://localhost:${port}/api/recording/stop`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${metaToken}`,
+        },
+        body: JSON.stringify({ room: metaRoom }),
+      });
+      const metaStopData = await metaStopRes.json();
+
+      const metaStatusRes = await fetch(`http://localhost:${port}/api/recording/status?room=${metaRoom}`, {
+        headers: { Authorization: `Bearer ${metaToken}` },
+      });
+      const metaStatusData = await metaStatusRes.json();
+
+      recording.setEgressClientForTest(null);
+
+      if (
+        metaStopData.status === "completed" &&
+        metaStopData.size === 15485760 &&
+        metaStopData.duration === 185000000000 &&
+        metaStatusData.status === "completed" &&
+        metaStatusData.size === 15485760 &&
+        metaStatusData.duration === 185000000000 &&
+        metaStatusData.videoUrl &&
+        metaStatusData.videoUrl.includes("X-Amz-Signature=")
+      ) {
+        console.log("PASS: Recording metadata (size, duration, egressId) preserved from LiveKit Egress fileResults");
+      } else {
+        console.error("FAIL: Recording metadata preservation test failed", { metaStopData, metaStatusData });
+        failures++;
+      }
+
     } finally {
       // Restore original environment
       for (const [key, val] of Object.entries(originalSecureEnv)) {
