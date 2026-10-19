@@ -720,7 +720,7 @@ _COMPILED_REPORTED_INTRO = re.compile(
 )
 
 _COMPILED_REPORTED_POST = re.compile(
-    r"^[,\s'\"“”‘’]*(?:at|to|towards)\s+(?:me|us|them|him|her|our\s+team|the\s+team|my\s+colleague|"
+    r"^[,\s'\"“”‘’\?]*(?:at|to|towards)\s+(?:me|us|them|him|her|our\s+team|the\s+team|my\s+colleague|"
     r"a\s+colleague|the\s+staff|an\s+agent|support|the\s+cashier)\b",
     re.IGNORECASE,
 )
@@ -797,7 +797,7 @@ def is_span_reported_speech(text: str, start: int, end: int) -> bool:
     # If outside quotes, check the immediate clause preceding the match
     # Clause splitters include sentence ends, adversative conjunctions, or coordinate conjunctions addressing 'you'
     clause_parts = re.split(
-        r"[.!?;]|\b(?:but|however|yet|though|although)\b|,\s*and\s+(?:you|u)\b|\band\s+(?:you|u)\b",
+        r"[.!;]|(?<!,)(?<!,\s)\?|\b(?:but|however|yet|though|although)\b|,\s*and\s+(?:you|u)\b|\band\s+(?:you|u)\b",
         pre,
     )
     curr_clause = clause_parts[-1] if clause_parts else ""
