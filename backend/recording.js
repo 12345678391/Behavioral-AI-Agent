@@ -1,3 +1,4 @@
+const crypto = require("crypto");
 const {
   EgressClient,
   EncodedFileOutput,
@@ -107,6 +108,17 @@ function getStorageConfig() {
 }
 
 function computePlaybackUrl(storageConfig, filepath, fileResults, result) {
+  // If a public base URL is configured, it takes priority for browser playback (e.g. Cloudflare R2, CDN)
+  const publicBaseUrl = sanitizeEnvValue(
+    process.env.RECORDING_BASE_URL ||
+    process.env.S3_PUBLIC_BASE_URL ||
+    process.env.STORAGE_PUBLIC_URL
+  );
+
+  if (publicBaseUrl && filepath) {
+    return `${publicBaseUrl.replace(/\/+$/, "")}/${filepath.replace(/^\/+/, "")}`;
+  }
+
   // If fileResults provided a direct HTTP URL, use it directly
   if (Array.isArray(fileResults) && fileResults.length > 0) {
     for (const res of fileResults) {
@@ -124,17 +136,6 @@ function computePlaybackUrl(storageConfig, filepath, fileResults, result) {
     /^https?:\/\//i.test(result.value.location)
   ) {
     return result.value.location;
-  }
-
-  // If a public base URL is configured
-  const publicBaseUrl = sanitizeEnvValue(
-    process.env.RECORDING_BASE_URL ||
-    process.env.S3_PUBLIC_BASE_URL ||
-    process.env.STORAGE_PUBLIC_URL
-  );
-
-  if (publicBaseUrl && filepath) {
-    return `${publicBaseUrl.replace(/\/+$/, "")}/${filepath.replace(/^\/+/, "")}`;
   }
 
   if (!storageConfig || !storageConfig.configured || !filepath) {
@@ -159,6 +160,125 @@ function computePlaybackUrl(storageConfig, filepath, fileResults, result) {
   }
 
   return null;
+}
+
+function getSignatureKey(key, dateStamp, regionName, serviceName) {
+  const kDate = crypto.createHmac("sha256", "AWS4" + key).update(dateStamp).digest();
+  const kRegion = crypto.createHmac("sha256", kDate).update(regionName).digest();
+  const kService = crypto.createHmac("sha256", kRegion).update(serviceName).digest();
+  const kSigning = crypto.createHmac("sha256", kService).update("aws4_request").digest();
+  return kSigning;
+}
+
+function generatePresignedPlaybackUrl(
+  storageConfig,
+  filepath,
+  expiresInSeconds = 900,
+  now = new Date()
+) {
+  if (
+    !storageConfig ||
+    !storageConfig.configured ||
+    storageConfig.type !== "s3" ||
+    !filepath
+  ) {
+    return null;
+  }
+
+  const accessKeyId = sanitizeEnvValue(
+    process.env.S3_KEY_ID || process.env.AWS_ACCESS_KEY_ID
+  );
+  const secretAccessKey = sanitizeEnvValue(
+    process.env.S3_KEY_SECRET || process.env.AWS_SECRET_ACCESS_KEY
+  );
+  const bucket = sanitizeEnvValue(
+    storageConfig.bucket || process.env.S3_BUCKET || process.env.AWS_BUCKET
+  );
+  const region = sanitizeEnvValue(
+    storageConfig.region || process.env.S3_REGION || process.env.AWS_REGION || "auto"
+  );
+  const rawEndpoint = sanitizeEnvValue(
+    storageConfig.endpoint || process.env.S3_ENDPOINT
+  );
+
+  if (!accessKeyId || !secretAccessKey || !bucket) {
+    return null;
+  }
+
+  const cleanFilepath = filepath.replace(/^\/+/, "");
+  let host = "";
+  let protocol = "https:";
+  let canonicalUri = "";
+
+  if (rawEndpoint) {
+    try {
+      const parsedEndpoint = new URL(rawEndpoint);
+      host = parsedEndpoint.host;
+      protocol = parsedEndpoint.protocol;
+      canonicalUri = `/${encodeURIComponent(bucket)}/${cleanFilepath
+        .split("/")
+        .map(encodeURIComponent)
+        .join("/")}`;
+    } catch (_) {
+      return null;
+    }
+  } else {
+    host = `${bucket}.s3.${region}.amazonaws.com`;
+    protocol = "https:";
+    canonicalUri = `/${cleanFilepath
+      .split("/")
+      .map(encodeURIComponent)
+      .join("/")}`;
+  }
+
+  const amzDate = now.toISOString().replace(/[:-]|\.\d{3}/g, "");
+  const dateStamp = amzDate.substring(0, 8);
+  const service = "s3";
+  const credentialScope = `${dateStamp}/${region}/${service}/aws4_request`;
+
+  const queryParams = [
+    `X-Amz-Algorithm=AWS4-HMAC-SHA256`,
+    `X-Amz-Credential=${encodeURIComponent(`${accessKeyId}/${credentialScope}`)}`,
+    `X-Amz-Date=${amzDate}`,
+    `X-Amz-Expires=${expiresInSeconds}`,
+    `X-Amz-SignedHeaders=host`,
+  ];
+  const canonicalQueryString = queryParams.join("&");
+
+  // Only host is signed. The HTTP Range header sent by HTML5 video players
+  // is deliberately excluded to support video seeking, scrubbing, and 206 Partial Content.
+  const canonicalHeaders = `host:${host}\n`;
+  const signedHeaders = "host";
+  const payloadHash = "UNSIGNED-PAYLOAD";
+
+  const canonicalRequest = [
+    "GET",
+    canonicalUri,
+    canonicalQueryString,
+    canonicalHeaders,
+    signedHeaders,
+    payloadHash,
+  ].join("\n");
+
+  const canonicalRequestHash = crypto
+    .createHash("sha256")
+    .update(canonicalRequest, "utf8")
+    .digest("hex");
+
+  const stringToSign = [
+    "AWS4-HMAC-SHA256",
+    amzDate,
+    credentialScope,
+    canonicalRequestHash,
+  ].join("\n");
+
+  const signingKey = getSignatureKey(secretAccessKey, dateStamp, region, service);
+  const signature = crypto
+    .createHmac("sha256", signingKey)
+    .update(stringToSign, "utf8")
+    .digest("hex");
+
+  return `${protocol}//${host}${canonicalUri}?${canonicalQueryString}&X-Amz-Signature=${signature}`;
 }
 
 function getEgressClient() {
@@ -472,6 +592,7 @@ async function getRecordingStatus(roomName) {
     success: true,
     room: roomName,
     status: session.status,
+    filepath: session.filepath,
     videoUrl: session.videoUrl,
     error: session.error,
   };
@@ -488,6 +609,7 @@ function setRecordingSession(roomName, sessionData) {
 module.exports = {
   getStorageConfig,
   computePlaybackUrl,
+  generatePresignedPlaybackUrl,
   startRecording,
   stopRecording,
   getRecordingStatus,

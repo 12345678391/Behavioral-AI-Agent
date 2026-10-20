@@ -110,6 +110,7 @@ function App() {
   const recordingPollingRef = useRef(null);
   const recordingStartedRoomRef = useRef(null);
   const recordingStoppedRoomRef = useRef(null);
+  const archiveTokenRef = useRef("");
 
   const clearRecordingPolling = useCallback(() => {
     if (recordingPollingRef.current) {
@@ -121,7 +122,8 @@ function App() {
   const checkRecordingStatus = useCallback(async (roomName) => {
     if (!roomName) return;
     try {
-      const res = await getRecordingStatus(roomName);
+      const token = archiveTokenRef.current || undefined;
+      const res = await getRecordingStatus(roomName, token);
       if (!isMountedRef.current) return;
       if (res && res.status) {
         setRecordingStatus(res.status);
@@ -263,6 +265,47 @@ function App() {
 
   useEffect(() => {
     isMountedRef.current = true;
+
+    // Check for capability token in URL hash for authorized archive reopening
+    if (typeof window !== "undefined" && window.location?.hash) {
+      try {
+        const hashParams = new URLSearchParams(
+          window.location.hash.replace(/^#/, "")
+        );
+        const hashToken =
+          hashParams.get("archiveToken") ||
+          hashParams.get("token") ||
+          hashParams.get("key");
+        const hashRoom = hashParams.get("room");
+        if (hashToken) {
+          archiveTokenRef.current = hashToken;
+        }
+        if (hashRoom && !currentRoomNameRef.current) {
+          currentRoomNameRef.current = hashRoom;
+        }
+        // Sanitize hash from address bar and history to prevent credential leakage
+        if (hashToken || hashRoom) {
+          window.history.replaceState(
+            null,
+            "",
+            window.location.pathname + window.location.search
+          );
+        }
+        if (hashRoom && hashToken) {
+          setAssessmentFinished(true);
+          fetchReportWithBoundedRetry(hashRoom, 3, 1000);
+          checkRecordingStatus(hashRoom);
+        } else if (hashRoom && !hashToken) {
+          setAssessmentFinished(true);
+          setErrorMessage(
+            "An authorization token is required in the link hash to view this archived session."
+          );
+        }
+      } catch (_) {
+        // Non-fatal hash parse
+      }
+    }
+
     return () => {
       isMountedRef.current = false;
       clearRecordingPolling();
@@ -280,7 +323,7 @@ function App() {
         roomRef.current = null;
       }
     };
-  }, [clearRecordingPolling]);
+  }, [clearRecordingPolling, checkRecordingStatus]);
 
   // ==========================================================
   // LIVEKIT EVENTS
@@ -675,7 +718,8 @@ function App() {
         }
 
         try {
-          const res = await getAssessmentResult(roomName);
+          const token = archiveTokenRef.current || undefined;
+          const res = await getAssessmentResult(roomName, token);
           const fallbackData = res?.data || res;
           if (isValidAssessmentReport(fallbackData)) {
             console.log(
@@ -789,6 +833,9 @@ function App() {
         );
 
       currentRoomNameRef.current = data?.room || "";
+      if (data?.archiveToken) {
+        archiveTokenRef.current = data.archiveToken;
+      }
 
       const newRoom =
         await joinRoom(

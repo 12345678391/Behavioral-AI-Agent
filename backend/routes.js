@@ -4,6 +4,8 @@ const fs = require("fs");
 const crypto = require("crypto");
 const createToken = require("./livekit");
 const {
+  getStorageConfig,
+  generatePresignedPlaybackUrl,
   startRecording,
   stopRecording,
   getRecordingStatus,
@@ -25,6 +27,10 @@ const CACHE_MAX_ENTRIES = 100;
 const CACHE_TTL_MS = 60 * 60 * 1000; // 1 hour
 const assessmentResultsCache = new Map();
 
+// In-memory registry for room capability token hashes and revocation state
+// Map<safeId, { archiveTokenHash: string, revoked: boolean, createdAt: number }>
+const roomAuthRegistry = new Map();
+
 function sanitizeEnvValue(val) {
   if (!val || typeof val !== "string") return "";
   let cleaned = val.trim().replace(/[\r\n]/g, "").trim();
@@ -35,6 +41,239 @@ function sanitizeEnvValue(val) {
     cleaned = cleaned.slice(1, -1).trim();
   }
   return cleaned;
+}
+
+function getAssessmentsDir() {
+  const dir = path.join(__dirname, "..", "agent", "assessments");
+  if (!fs.existsSync(dir)) {
+    fs.mkdirSync(dir, { recursive: true });
+  }
+  return dir;
+}
+
+function persistRoomAuthRecord(safeId, tokenHash, revoked = false) {
+  if (!safeId) return null;
+  const dir = getAssessmentsDir();
+  const filePath = path.join(dir, `${safeId}.json`);
+  let existingData = {};
+
+  if (fs.existsSync(filePath)) {
+    try {
+      const raw = fs.readFileSync(filePath, "utf-8");
+      existingData = JSON.parse(raw);
+    } catch (parseErr) {
+      console.warn(`[Auth] Notice reading existing assessment file for ${safeId}:`, parseErr.message);
+      existingData = {};
+    }
+  }
+
+  // Preserve all existing fields: transcript, scores, final_analysis, recording, etc.
+  const mergedData = {
+    ...existingData,
+    assessment_id: existingData.assessment_id || safeId,
+    completed: existingData.completed !== undefined ? existingData.completed : false,
+    archiveTokenHash: tokenHash !== undefined ? tokenHash : existingData.archiveTokenHash,
+    revoked: Boolean(revoked),
+    updatedAt: Date.now(),
+  };
+
+  // Safe atomic file update: write to unique temp file then renameSync
+  const tempPath = path.join(dir, `${safeId}.${crypto.randomBytes(6).toString("hex")}.tmp`);
+  fs.writeFileSync(tempPath, JSON.stringify(mergedData, null, 2), "utf-8");
+  fs.renameSync(tempPath, filePath);
+
+  return mergedData;
+}
+
+function registerRoomCapabilityToken(roomName, rawToken) {
+  if (!roomName || !rawToken) return null;
+  const safeId = roomName.replace(/[^a-zA-Z0-9_-]/g, "_");
+  const tokenHash = crypto
+    .createHash("sha256")
+    .update(String(rawToken).trim())
+    .digest("hex");
+
+  // Persist hash to disk atomically immediately before returning
+  persistRoomAuthRecord(safeId, tokenHash, false);
+
+  const record = {
+    archiveTokenHash: tokenHash,
+    revoked: false,
+    createdAt: Date.now(),
+  };
+  roomAuthRegistry.set(safeId, record);
+
+  const cached = assessmentResultsCache.get(safeId);
+  if (cached && cached.data) {
+    cached.data.archiveTokenHash = tokenHash;
+    cached.data.revoked = false;
+  }
+
+  return tokenHash;
+}
+
+function getRoomAuthRecord(safeId) {
+  if (!safeId) return null;
+  let record = roomAuthRegistry.get(safeId);
+  if (record && record.archiveTokenHash) {
+    return record;
+  }
+
+  const cached = getCachedAssessmentResult(safeId);
+  if (cached && cached.archiveTokenHash) {
+    record = {
+      archiveTokenHash: cached.archiveTokenHash,
+      revoked: Boolean(cached.revoked),
+      createdAt: cached.createdAt || Date.now(),
+    };
+    roomAuthRegistry.set(safeId, record);
+    return record;
+  }
+
+  try {
+    const assessmentsDir = path.join(__dirname, "..", "agent", "assessments");
+    const resultPath = path.join(assessmentsDir, `${safeId}.json`);
+    if (fs.existsSync(resultPath)) {
+      const parsed = JSON.parse(fs.readFileSync(resultPath, "utf-8"));
+      if (parsed && parsed.archiveTokenHash) {
+        record = {
+          archiveTokenHash: parsed.archiveTokenHash,
+          revoked: Boolean(parsed.revoked),
+          createdAt: parsed.createdAt || Date.now(),
+        };
+        roomAuthRegistry.set(safeId, record);
+        return record;
+      }
+    }
+  } catch (err) {
+    console.warn(`[Auth] Notice reading auth record from disk for ${safeId}:`, err.message);
+  }
+
+  return record || null;
+}
+
+function revokeRoomAuth(roomName) {
+  if (!roomName) return false;
+  const safeId = roomName.replace(/[^a-zA-Z0-9_-]/g, "_");
+  let record = getRoomAuthRecord(safeId) || {
+    archiveTokenHash: null,
+    revoked: true,
+    createdAt: Date.now(),
+  };
+
+  record.revoked = true;
+  roomAuthRegistry.set(safeId, record);
+
+  const cached = assessmentResultsCache.get(safeId);
+  if (cached && cached.data) {
+    cached.data.revoked = true;
+  }
+
+  try {
+    persistRoomAuthRecord(safeId, record.archiveTokenHash, true);
+  } catch (diskErr) {
+    console.warn(`[Auth] Notice writing revocation to disk for ${safeId}:`, diskErr.message);
+  }
+
+  return true;
+}
+
+function extractBearerToken(req) {
+  const authHeader = req.headers["authorization"] || req.headers["Authorization"];
+  if (authHeader && typeof authHeader === "string") {
+    const match = authHeader.match(/^Bearer\s+([A-Za-z0-9._-]+)$/i);
+    if (match) return match[1].trim();
+  }
+  const xToken = req.headers["x-archive-token"];
+  if (xToken && typeof xToken === "string") {
+    return xToken.trim();
+  }
+  return null;
+}
+
+function verifyRoomAuthorization(roomName, providedToken) {
+  if (!roomName) {
+    return {
+      authorized: false,
+      authenticated: false,
+      status: 400,
+      error: "Room name is required.",
+    };
+  }
+
+  const safeId = roomName.replace(/[^a-zA-Z0-9_-]/g, "_");
+  const authRecord = getRoomAuthRecord(safeId);
+
+  // FAIL CLOSED: If no authorization record exists for this room, reject immediately!
+  if (!authRecord || !authRecord.archiveTokenHash) {
+    return {
+      authorized: false,
+      authenticated: false,
+      status: 401,
+      error: "Authorization required: No capability token configured for this session.",
+    };
+  }
+
+  // Check if session has been revoked by administrator
+  if (authRecord.revoked) {
+    return {
+      authorized: false,
+      authenticated: false,
+      status: 403,
+      error: "Access to this interview session has been revoked.",
+    };
+  }
+
+  // Capability token is required
+  if (!providedToken) {
+    return {
+      authorized: false,
+      authenticated: false,
+      status: 401,
+      error: "Authorization required: session capability token is missing.",
+    };
+  }
+
+  // Verify SHA-256 hash in constant time
+  const providedHash = crypto
+    .createHash("sha256")
+    .update(String(providedToken).trim())
+    .digest("hex");
+
+  const expectedBuf = Buffer.from(authRecord.archiveTokenHash, "utf8");
+  const providedBuf = Buffer.from(providedHash, "utf8");
+
+  if (
+    expectedBuf.length !== providedBuf.length ||
+    !crypto.timingSafeEqual(expectedBuf, providedBuf)
+  ) {
+    return {
+      authorized: false,
+      authenticated: false,
+      status: 403,
+      error: "Invalid or unauthorized session capability token.",
+    };
+  }
+
+  return { authorized: true, authenticated: true };
+}
+
+function verifyAdminSignature(roomId, providedSignature) {
+  const secret = getSyncSecret();
+  if (!secret || typeof secret !== "string") {
+    // Fail closed: without a configured server secret, administrative actions are disabled
+    return false;
+  }
+  if (!providedSignature || typeof providedSignature !== "string") {
+    return false;
+  }
+  const expected = computeSyncSignature(roomId, secret);
+  const expectedBuf = Buffer.from(expected, "utf8");
+  const providedBuf = Buffer.from(providedSignature.trim(), "utf8");
+  if (expectedBuf.length !== providedBuf.length) {
+    return false;
+  }
+  return crypto.timingSafeEqual(expectedBuf, providedBuf);
 }
 
 function getSyncSecret() {
@@ -170,8 +409,34 @@ router.get("/token", async (req, res) => {
       }
     }
 
+    let archiveToken = null;
+    let isReconnect = false;
+
+    if (rawRoom) {
+      const safeId = rawRoom.replace(/[^a-zA-Z0-9_-]/g, "_");
+      const existingAuth = getRoomAuthRecord(safeId);
+      if (existingAuth && existingAuth.archiveTokenHash) {
+        // Reconnect / refresh for existing room requires valid capability token
+        const providedToken = extractBearerToken(req);
+        const auth = verifyRoomAuthorization(safeId, providedToken);
+        if (!auth.authorized) {
+          return res.status(auth.status).json({
+            error: `Unauthorized room reconnect: ${auth.error}`,
+          });
+        }
+        archiveToken = providedToken;
+        isReconnect = true;
+      }
+    }
+
     const identity = rawIdentity || `candidate-${Date.now()}`;
     const { token, room } = await createToken(identity, rawRoom);
+
+    if (!isReconnect) {
+      // Generate random 256-bit capability token for this interview room
+      archiveToken = crypto.randomBytes(32).toString("hex");
+      registerRoomCapabilityToken(room, archiveToken);
+    }
 
     // Wake up the Python agent service on Render in the background if asleep on free tier
     const agentUrl = process.env.AGENT_URL || "https://behavioral-agent.onrender.com";
@@ -179,11 +444,16 @@ router.get("/token", async (req, res) => {
       fetch(`${agentUrl.replace(/\/+$/, "")}/health`).catch(() => {});
     }
 
-    res.json({
+    const responsePayload = {
       token,
       room,
       serverUrl: process.env.LIVEKIT_URL,
-    });
+      archiveToken,
+    };
+    if (isReconnect) {
+      responsePayload.reconnected = true;
+    }
+    res.json(responsePayload);
   } catch (error) {
     console.error("Token generation error:", error.message || error);
     res.status(500).json({
@@ -238,14 +508,23 @@ router.post("/assessment-result", express.json({ limit: "2mb" }), (req, res) => 
       resultData.recording = {
         status: recSession.status,
         videoUrl: recSession.videoUrl,
+        filepath: recSession.filepath,
         error: recSession.error,
       };
     } else if (!resultData.recording) {
       resultData.recording = {
         status: "unavailable",
         videoUrl: null,
+        filepath: null,
         error: "No recording was started for this session.",
       };
+    }
+
+    // Include archive capability token hash and revocation state in stored metadata
+    const authRecord = roomAuthRegistry.get(safeId);
+    if (authRecord) {
+      resultData.archiveTokenHash = authRecord.archiveTokenHash;
+      resultData.revoked = authRecord.revoked;
     }
 
     // Cache in bounded memory map for immediate retrieval
@@ -289,6 +568,7 @@ function syncRecordingToAssessment(roomName, recData) {
     cachedEntry.data.recording = {
       status: recData.status,
       videoUrl: recData.videoUrl,
+      filepath: recData.filepath,
       error: recData.error,
     };
   }
@@ -301,6 +581,7 @@ function syncRecordingToAssessment(roomName, recData) {
       parsed.recording = {
         status: recData.status,
         videoUrl: recData.videoUrl,
+        filepath: recData.filepath,
         error: recData.error,
       };
       fs.writeFileSync(resultPath, JSON.stringify(parsed, null, 2), "utf-8");
@@ -330,19 +611,60 @@ router.get("/assessment-result", (req, res) => {
     }
 
     const safeId = assessmentId.replace(/[^a-zA-Z0-9_-]/g, "_");
+
+    // Check for admin/system sync signature first
+    const adminSig =
+      req.headers["x-assessment-signature"] ||
+      req.headers["x-admin-signature"];
+
+    let isAdminAuth = false;
+    if (adminSig) {
+      if (verifyAdminSignature(safeId, adminSig)) {
+        isAdminAuth = true;
+      } else {
+        return res.status(403).json({
+          error: "Forbidden: Invalid admin assessment signature.",
+        });
+      }
+    }
+
+    let auth = { authorized: true, authenticated: true };
+    if (!isAdminAuth) {
+      // Authenticate candidate against capability token
+      const providedToken = extractBearerToken(req);
+      auth = verifyRoomAuthorization(safeId, providedToken);
+      if (!auth.authorized) {
+        return res.status(auth.status).json({
+          error: auth.error,
+        });
+      }
+    }
+
     const liveRec = getRecordingSession(safeId);
 
     // 1. Check bounded in-memory cache first (handles cross-container sync while process is live)
     const cached = getCachedAssessmentResult(safeId);
     if (cached && isValidCompletedResult(cached)) {
       if (liveRec) {
+        let videoUrl = liveRec.videoUrl;
+        if (liveRec.status === "completed" && auth.authenticated) {
+          const storageConfig = getStorageConfig();
+          const filepath = liveRec.filepath || `recordings/${safeId}.mp4`;
+          if (storageConfig.type === "s3" && storageConfig.configured) {
+            const presigned = generatePresignedPlaybackUrl(storageConfig, filepath, 900);
+            if (presigned) videoUrl = presigned;
+          }
+        }
         cached.recording = {
           status: liveRec.status,
-          videoUrl: liveRec.videoUrl,
+          videoUrl,
+          filepath: liveRec.filepath,
           error: liveRec.error,
         };
       }
-      return res.json(cached);
+      const responsePayload = { ...cached };
+      delete responsePayload.archiveTokenHash;
+      return res.json(responsePayload);
     }
 
     // 2. Check local disk
@@ -371,14 +693,35 @@ router.get("/assessment-result", (req, res) => {
     }
 
     if (liveRec) {
+      let videoUrl = liveRec.videoUrl;
+      if (liveRec.status === "completed" && auth.authenticated) {
+        const storageConfig = getStorageConfig();
+        const filepath = liveRec.filepath || `recordings/${safeId}.mp4`;
+        if (storageConfig.type === "s3" && storageConfig.configured) {
+          const presigned = generatePresignedPlaybackUrl(storageConfig, filepath, 900);
+          if (presigned) videoUrl = presigned;
+        }
+      }
       parsed.recording = {
         status: liveRec.status,
-        videoUrl: liveRec.videoUrl,
+        videoUrl,
+        filepath: liveRec.filepath,
         error: liveRec.error,
       };
+    } else if (parsed.recording && parsed.recording.status === "completed" && auth.authenticated) {
+      const storageConfig = getStorageConfig();
+      const filepath = parsed.recording.filepath || `recordings/${safeId}.mp4`;
+      if (storageConfig.type === "s3" && storageConfig.configured) {
+        const presigned = generatePresignedPlaybackUrl(storageConfig, filepath, 900);
+        if (presigned) {
+          parsed.recording.videoUrl = presigned;
+        }
+      }
     }
 
-    res.json(parsed);
+    const responsePayload = { ...parsed };
+    delete responsePayload.archiveTokenHash;
+    res.json(responsePayload);
   } catch (error) {
     console.error("Failed to read assessment result:", error.message || error);
     res.status(500).json({
@@ -421,14 +764,63 @@ router.post("/recording/stop", express.json(), async (req, res) => {
       });
     }
 
+    // 1. Check for trusted internal / admin signature first if provided
+    const adminSig =
+      req.headers["x-assessment-signature"] ||
+      req.headers["x-admin-signature"];
+
+    let isAdminAuth = false;
+    if (adminSig) {
+      if (verifyAdminSignature(room, adminSig)) {
+        isAdminAuth = true;
+      } else {
+        return res.status(403).json({
+          success: false,
+          status: "failed",
+          videoUrl: null,
+          error: "Forbidden: Invalid admin signature.",
+        });
+      }
+    }
+
+    // 2. Validate room capability token for ordinary client requests
+    if (!isAdminAuth) {
+      const providedToken = extractBearerToken(req);
+      const auth = verifyRoomAuthorization(room, providedToken);
+      if (!auth.authorized) {
+        return res.status(auth.status).json({
+          success: false,
+          status: "failed",
+          videoUrl: null,
+          error: auth.error,
+        });
+      }
+    }
+
     const session = await stopRecording(room);
     syncRecordingToAssessment(room, session);
+
+    let videoUrl = null;
+    if (session.status === "completed") {
+      const storageConfig = getStorageConfig();
+      const filepath = session.filepath || `recordings/${room}.mp4`;
+      if (storageConfig.type === "s3" && storageConfig.configured) {
+        const presigned = generatePresignedPlaybackUrl(storageConfig, filepath, 900);
+        if (presigned) videoUrl = presigned;
+      } else {
+        videoUrl = session.videoUrl;
+      }
+    }
+
     res.json({
       success: true,
       room,
       status: session.status,
-      videoUrl: session.videoUrl,
+      videoUrl: videoUrl,
       error: session.error,
+      ...(session.egressId ? { egressId: session.egressId } : {}),
+      ...(session.duration !== undefined ? { duration: session.duration } : {}),
+      ...(session.size !== undefined ? { size: session.size } : {}),
     });
   } catch (error) {
     console.error("Recording stop endpoint error:", error.message || error);
@@ -449,7 +841,31 @@ router.get("/recording/status", async (req, res) => {
       });
     }
 
+    const providedToken = extractBearerToken(req);
+    const auth = verifyRoomAuthorization(room, providedToken);
+    if (!auth.authorized) {
+      return res.status(auth.status).json({
+        success: false,
+        status: "failed",
+        error: auth.error,
+      });
+    }
+
     const statusResult = await getRecordingStatus(room);
+
+    // If authenticated with capability token and status is completed, generate fresh pre-signed GET URL
+    if (statusResult.status === "completed" && auth.authenticated) {
+      const storageConfig = getStorageConfig();
+      const session = getRecordingSession(room);
+      const filepath = session?.filepath || statusResult.filepath || `recordings/${room}.mp4`;
+      if (storageConfig.type === "s3" && storageConfig.configured) {
+        const presigned = generatePresignedPlaybackUrl(storageConfig, filepath, 900);
+        if (presigned) {
+          statusResult.videoUrl = presigned;
+        }
+      }
+    }
+
     syncRecordingToAssessment(room, statusResult);
     res.json(statusResult);
   } catch (error) {
@@ -462,13 +878,65 @@ router.get("/recording/status", async (req, res) => {
   }
 });
 
+router.post("/recording/revoke", express.json(), (req, res) => {
+  try {
+    const room = req.body?.room || req.query.room;
+    if (!room || !isValidAssessmentId(room)) {
+      return res.status(400).json({
+        error: "Valid room name is required to revoke recording access.",
+      });
+    }
+
+    const adminSig =
+      req.headers["x-admin-signature"] ||
+      req.headers["x-assessment-signature"];
+
+    if (!adminSig) {
+      return res.status(401).json({
+        success: false,
+        error: "Unauthorized: Admin signature is required to revoke recording access.",
+      });
+    }
+
+    if (!verifyAdminSignature(room, adminSig)) {
+      return res.status(403).json({
+        success: false,
+        error: "Forbidden: Invalid admin signature or administrative actions not configured.",
+      });
+    }
+
+    revokeRoomAuth(room);
+    res.json({
+      success: true,
+      room,
+      revoked: true,
+      message: `Recording access for room ${room} has been revoked.`,
+    });
+  } catch (error) {
+    console.error("Recording revoke endpoint error:", error.message || error);
+    res.status(500).json({
+      success: false,
+      error: "Failed to revoke recording access.",
+    });
+  }
+});
+
 router.assessmentResultsCache = assessmentResultsCache;
 router.CACHE_MAX_ENTRIES = CACHE_MAX_ENTRIES;
 router.CACHE_TTL_MS = CACHE_TTL_MS;
 router.computeSyncSignature = computeSyncSignature;
+router.verifySyncSignature = verifySyncSignature;
+router.verifyAdminSignature = verifyAdminSignature;
 router.isValidCompletedResult = isValidCompletedResult;
 router.pruneAssessmentCache = pruneAssessmentCache;
 router.setCachedAssessmentResult = setCachedAssessmentResult;
 router.getCachedAssessmentResult = getCachedAssessmentResult;
+router.registerRoomCapabilityToken = registerRoomCapabilityToken;
+router.verifyRoomAuthorization = verifyRoomAuthorization;
+router.revokeRoomAuth = revokeRoomAuth;
+router.extractBearerToken = extractBearerToken;
+router.roomAuthRegistry = roomAuthRegistry;
+router.getRoomAuthRecord = getRoomAuthRecord;
+router.persistRoomAuthRecord = persistRoomAuthRecord;
 
 module.exports = router;

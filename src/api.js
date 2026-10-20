@@ -94,7 +94,7 @@ export async function getToken(identity = "candidate", room) {
   return fetchWithFallback(path, undefined, "Failed to get LiveKit token");
 }
 
-export async function getAssessmentResult(assessmentId) {
+export async function getAssessmentResult(assessmentId, token) {
   if (!assessmentId) {
     throw new Error("Assessment ID is required.");
   }
@@ -103,7 +103,15 @@ export async function getAssessmentResult(assessmentId) {
     assessmentId
   )}`;
 
-  return fetchWithFallback(path, undefined, "Assessment result is not ready yet");
+  const options = token
+    ? {
+        headers: {
+          Authorization: `Bearer ${token}`,
+        },
+      }
+    : undefined;
+
+  return fetchWithFallback(path, options, "Assessment result is not ready yet");
 }
 
 export async function startRecording(room) {
@@ -138,14 +146,22 @@ export async function stopRecording(room) {
   );
 }
 
-export async function getRecordingStatus(room) {
+export async function getRecordingStatus(room, token) {
   if (!room) {
     throw new Error("Room name is required to check recording status.");
   }
 
+  const options = token
+    ? {
+        headers: {
+          Authorization: `Bearer ${token}`,
+        },
+      }
+    : undefined;
+
   return fetchWithFallback(
     `/recording/status?room=${encodeURIComponent(room)}`,
-    undefined,
+    options,
     "Recording status is not available yet"
   );
 }

@@ -1729,7 +1729,8 @@ class TestAgentStartup(unittest.TestCase):
         speak_mock.assert_awaited_once()
         spoken_turn_2 = speak_mock.await_args[0][0]
         self.assertTrue(spoken_turn_2.startswith(ABUSE_WARNING_REPEATED_PREFIX))
-        self.assertIn("How do you manage deadlines under pressure?", spoken_turn_2)
+        self.assertIn("communicate respectfully", spoken_turn_2.lower())
+        self.assertIn("continue the professional interview", spoken_turn_2.lower())
 
     def test_false_positive_protection_allows_frustration_disagreement_and_relevant_context(self):
         """Verify normal workplace frustration, technical disagreement, nervousness, and relevant personal context are not misclassified."""
@@ -2778,6 +2779,1564 @@ class TestAgentStartup(unittest.TestCase):
         self.assertFalse(should_continue)
         gen_mock.assert_not_called()
         speak_mock.assert_not_called()
+
+    # ============================================================
+    # FOCUSED TESTS FOR THE 7 BEHAVIORAL AI INTERVIEWER RULES
+    # ============================================================
+
+    def test_rule1_unrelated_personal_question_redirects_to_professional_interview(self):
+        """Rule 1: If candidate asks unrelated, personal, or non-professional questions,
+        politely explain that this is a professional interview and redirect to work-related topics.
+        """
+        import asyncio
+        from unittest.mock import AsyncMock, MagicMock
+        from agent.agent import (
+            AssessmentState,
+            process_interview_turn,
+            PROFESSIONAL_BOUNDARY_PREFIX,
+            is_personal_or_unrelated_request,
+        )
+
+        test_questions = [
+            "Can we talk about my personal life?",
+            "What is your favorite color?",
+            "Are you married?",
+            "What do you like to do on weekends?",
+            "Where do you live?",
+        ]
+        for q in test_questions:
+            self.assertTrue(is_personal_or_unrelated_request(q), f"Failed to detect personal/unrelated question: {q}")
+
+        state = AssessmentState()
+        state.add_transcript("interviewer", "How do you handle team disagreements?")
+
+        speak_mock = AsyncMock()
+        analyze_mock = AsyncMock()
+        send_mock = AsyncMock()
+
+        async def fake_gen_q(st, rem, **kwargs):
+            return "How do you coordinate with cross-functional stakeholders?"
+
+        cont = asyncio.run(process_interview_turn(
+            ctx=MagicMock(),
+            state=state,
+            answer="What is your favorite color and what do you do on weekends?",
+            remaining_seconds=300,
+            warning_sent=False,
+            user_answer_queue=asyncio.Queue(),
+            analyzed_answers=set(),
+            manual_end_event=asyncio.Event(),
+            timer_finished_event=asyncio.Event(),
+            disconnect_event=asyncio.Event(),
+            speak_fn=speak_mock,
+            analyze_fn=analyze_mock,
+            generate_question_fn=fake_gen_q,
+            send_event_fn=send_mock,
+        ))
+
+        self.assertTrue(cont)
+        analyze_mock.assert_not_awaited()
+        self.assertEqual(len(state.refused_questions), 0)
+        speak_mock.assert_awaited_once()
+        spoken = speak_mock.await_args[0][0]
+        self.assertTrue(spoken.startswith(PROFESSIONAL_BOUNDARY_PREFIX))
+        self.assertIn("cross-functional stakeholders", spoken)
+
+    def test_rule2_abusive_language_responds_firmly_sets_boundary_invites_respectful_continuation(self):
+        """Rule 2: If candidate uses abusive language, respond respectfully but firmly,
+        set a professional boundary, and invite them to continue respectfully without insulting or arguing.
+        """
+        import asyncio
+        from unittest.mock import AsyncMock, MagicMock
+        from agent.agent import (
+            AssessmentState,
+            process_interview_turn,
+            ABUSE_WARNING_FIRST_PREFIX,
+            ABUSE_WARNING_REPEATED_PREFIX,
+            is_abusive_language,
+        )
+
+        abuse_inputs = ["You are an idiot bot.", "Shut the fuck up."]
+        for text in abuse_inputs:
+            self.assertTrue(is_abusive_language(text), f"Failed to detect abusive language: {text}")
+
+        state = AssessmentState()
+        speak_mock = AsyncMock()
+        analyze_mock = AsyncMock()
+        send_mock = AsyncMock()
+
+        async def fake_gen_q(st, rem, **kwargs):
+            return "Tell me about a complex project you delivered."
+
+        # Turn 1: First abuse warning sets boundary and invites to continue respectfully
+        cont1 = asyncio.run(process_interview_turn(
+            ctx=MagicMock(),
+            state=state,
+            answer="You are an idiot bot.",
+            remaining_seconds=300,
+            warning_sent=False,
+            user_answer_queue=asyncio.Queue(),
+            analyzed_answers=set(),
+            manual_end_event=asyncio.Event(),
+            timer_finished_event=asyncio.Event(),
+            disconnect_event=asyncio.Event(),
+            speak_fn=speak_mock,
+            analyze_fn=analyze_mock,
+            generate_question_fn=fake_gen_q,
+            send_event_fn=send_mock,
+        ))
+
+        self.assertTrue(cont1)
+        self.assertEqual(state.abusive_language_count, 1)
+        analyze_mock.assert_not_awaited()
+        spoken_1 = speak_mock.await_args[0][0]
+        self.assertTrue(spoken_1.startswith(ABUSE_WARNING_FIRST_PREFIX))
+        self.assertIn("respectful", spoken_1.lower())
+        self.assertNotIn("idiot", spoken_1.lower())
+        self.assertIn("complex project you delivered", spoken_1)
+
+        # Turn 2: Repeated abuse reminder
+        speak_mock.reset_mock()
+        cont2 = asyncio.run(process_interview_turn(
+            ctx=MagicMock(),
+            state=state,
+            answer="Shut the fuck up.",
+            remaining_seconds=250,
+            warning_sent=False,
+            user_answer_queue=asyncio.Queue(),
+            analyzed_answers=set(),
+            manual_end_event=asyncio.Event(),
+            timer_finished_event=asyncio.Event(),
+            disconnect_event=asyncio.Event(),
+            speak_fn=speak_mock,
+            analyze_fn=analyze_mock,
+            generate_question_fn=fake_gen_q,
+            send_event_fn=send_mock,
+        ))
+
+        self.assertTrue(cont2)
+        self.assertEqual(state.abusive_language_count, 2)
+        spoken_2 = speak_mock.await_args[0][0]
+        self.assertTrue(spoken_2.startswith(ABUSE_WARNING_REPEATED_PREFIX))
+        self.assertIn("respectfully", spoken_2.lower())
+
+    def test_rule3_repeat_and_clarify_repeats_rephrases_avoids_endless_repetition(self):
+        """Rule 3: If candidate asks to repeat or clarify a question, repeat or rephrase
+        the current question clearly, and avoid endless repetition.
+        """
+        import asyncio
+        from unittest.mock import AsyncMock, MagicMock
+        from agent.agent import (
+            AssessmentState,
+            process_interview_turn,
+            is_clarification_request,
+            FALLBACK_BEHAVIORAL_QUESTIONS,
+        )
+
+        self.assertTrue(is_clarification_request("Could you repeat that?"))
+        self.assertTrue(is_clarification_request("Can you clarify the question?"))
+        self.assertTrue(is_clarification_request("Please say that again."))
+
+        state = AssessmentState()
+        original_q = "How do you evaluate new architectural proposals?"
+        state.add_transcript("interviewer", original_q)
+        initial_asked = state.questions_asked
+
+        speak_mock = AsyncMock()
+        analyze_mock = AsyncMock()
+        send_mock = AsyncMock()
+
+        # Turn 1: Repeat clearly
+        cont1 = asyncio.run(process_interview_turn(
+            ctx=MagicMock(),
+            state=state,
+            answer="Could you repeat the question, please?",
+            remaining_seconds=300,
+            warning_sent=False,
+            user_answer_queue=asyncio.Queue(),
+            analyzed_answers=set(),
+            manual_end_event=asyncio.Event(),
+            timer_finished_event=asyncio.Event(),
+            disconnect_event=asyncio.Event(),
+            speak_fn=speak_mock,
+            analyze_fn=analyze_mock,
+            generate_question_fn=AsyncMock(),
+            send_event_fn=send_mock,
+        ))
+
+        self.assertTrue(cont1)
+        self.assertEqual(state.questions_asked, initial_asked)
+        self.assertEqual(state.repeat_count_for_current_question, 1)
+        spoken_1 = speak_mock.await_args[0][0]
+        self.assertTrue(spoken_1.startswith("Certainly."))
+        self.assertIn(original_q, spoken_1)
+
+        # Turn 2: Rephrase clearly
+        speak_mock.reset_mock()
+        cont2 = asyncio.run(process_interview_turn(
+            ctx=MagicMock(),
+            state=state,
+            answer="Can you clarify what you mean?",
+            remaining_seconds=280,
+            warning_sent=False,
+            user_answer_queue=asyncio.Queue(),
+            analyzed_answers=set(),
+            manual_end_event=asyncio.Event(),
+            timer_finished_event=asyncio.Event(),
+            disconnect_event=asyncio.Event(),
+            speak_fn=speak_mock,
+            analyze_fn=analyze_mock,
+            generate_question_fn=AsyncMock(),
+            send_event_fn=send_mock,
+        ))
+
+        self.assertTrue(cont2)
+        self.assertEqual(state.questions_asked, initial_asked)
+        self.assertEqual(state.repeat_count_for_current_question, 2)
+        spoken_2 = speak_mock.await_args[0][0]
+        self.assertTrue(spoken_2.startswith("To rephrase:"))
+        self.assertIn(original_q, spoken_2)
+
+        # Turn 3: Avoid endless repetition by pivoting to a fresh question
+        speak_mock.reset_mock()
+        cont3 = asyncio.run(process_interview_turn(
+            ctx=MagicMock(),
+            state=state,
+            answer="I still did not catch that, say it again.",
+            remaining_seconds=260,
+            warning_sent=False,
+            user_answer_queue=asyncio.Queue(),
+            analyzed_answers=set(),
+            manual_end_event=asyncio.Event(),
+            timer_finished_event=asyncio.Event(),
+            disconnect_event=asyncio.Event(),
+            speak_fn=speak_mock,
+            analyze_fn=analyze_mock,
+            generate_question_fn=AsyncMock(),
+            send_event_fn=send_mock,
+        ))
+
+        self.assertTrue(cont3)
+        self.assertEqual(state.repeat_count_for_current_question, 0)
+        spoken_3 = speak_mock.await_args[0][0]
+        self.assertTrue(spoken_3.startswith("Let's move on to a fresh question:"))
+        self.assertNotEqual(spoken_3, spoken_1)
+
+    def test_rule4_topic_change_explains_purpose_offers_rephrase_or_moment_no_unrelated_chat(self):
+        """Rule 4: If candidate requests another topic because they do not want to discuss
+        professional life, acknowledge request, explain interview's professional purpose,
+        and offer to rephrase question or give brief moment. Do NOT enter prolonged unrelated conversation.
+        """
+        import asyncio
+        from unittest.mock import AsyncMock, MagicMock
+        from agent.agent import (
+            AssessmentState,
+            process_interview_turn,
+            PROFESSIONAL_TOPIC_REQUEST_RESPONSE,
+            is_explicit_topic_change_preference,
+        )
+
+        topic_change_input = "Can we talk about some other topic? I don't want to discuss my professional life."
+        self.assertTrue(is_explicit_topic_change_preference(topic_change_input))
+
+        state = AssessmentState()
+        state.add_transcript("interviewer", "How do you manage sprint priorities?")
+
+        speak_mock = AsyncMock()
+        analyze_mock = AsyncMock()
+        send_mock = AsyncMock()
+
+        # Turn 1: Candidate requests another topic because they don't want to discuss professional life
+        cont1 = asyncio.run(process_interview_turn(
+            ctx=MagicMock(),
+            state=state,
+            answer=topic_change_input,
+            remaining_seconds=300,
+            warning_sent=False,
+            user_answer_queue=asyncio.Queue(),
+            analyzed_answers=set(),
+            manual_end_event=asyncio.Event(),
+            timer_finished_event=asyncio.Event(),
+            disconnect_event=asyncio.Event(),
+            speak_fn=speak_mock,
+            analyze_fn=analyze_mock,
+            generate_question_fn=AsyncMock(),
+            send_event_fn=send_mock,
+        ))
+
+        self.assertTrue(cont1)
+        self.assertTrue(state.waiting_for_resume)
+        analyze_mock.assert_not_awaited()
+        speak_mock.assert_awaited_once()
+        spoken_1 = speak_mock.await_args[0][0]
+        # Must acknowledge request, explain purpose, offer rephrase or moment
+        self.assertEqual(spoken_1, PROFESSIONAL_TOPIC_REQUEST_RESPONSE)
+        # Must NOT enter prolonged unrelated conversation about movies, entertainment, or hobbies
+        self.assertNotIn("movie", spoken_1.lower())
+        self.assertNotIn("film", spoken_1.lower())
+        self.assertNotIn("action", spoken_1.lower())
+        self.assertNotIn("what would you like to talk about", spoken_1.lower())
+
+        # Turn 2: Candidate asks for a brief moment
+        speak_mock.reset_mock()
+        cont2 = asyncio.run(process_interview_turn(
+            ctx=MagicMock(),
+            state=state,
+            answer="Give me a brief moment please.",
+            remaining_seconds=280,
+            warning_sent=False,
+            user_answer_queue=asyncio.Queue(),
+            analyzed_answers=set(),
+            manual_end_event=asyncio.Event(),
+            timer_finished_event=asyncio.Event(),
+            disconnect_event=asyncio.Event(),
+            speak_fn=speak_mock,
+            analyze_fn=analyze_mock,
+            generate_question_fn=AsyncMock(),
+            send_event_fn=send_mock,
+        ))
+
+        self.assertTrue(cont2)
+        self.assertTrue(state.waiting_for_resume)
+        spoken_2 = speak_mock.await_args[0][0]
+        self.assertIn("take all the time you need", spoken_2.lower())
+
+        # Turn 3: Candidate asks to rephrase the question
+        speak_mock.reset_mock()
+        cont3 = asyncio.run(process_interview_turn(
+            ctx=MagicMock(),
+            state=state,
+            answer="Could you please rephrase the question?",
+            remaining_seconds=260,
+            warning_sent=False,
+            user_answer_queue=asyncio.Queue(),
+            analyzed_answers=set(),
+            manual_end_event=asyncio.Event(),
+            timer_finished_event=asyncio.Event(),
+            disconnect_event=asyncio.Event(),
+            speak_fn=speak_mock,
+            analyze_fn=analyze_mock,
+            generate_question_fn=AsyncMock(),
+            send_event_fn=send_mock,
+        ))
+
+        self.assertTrue(cont3)
+        self.assertFalse(state.waiting_for_resume)
+        spoken_3 = speak_mock.await_args[0][0]
+        self.assertTrue(spoken_3.startswith("Certainly. To rephrase:"))
+        self.assertIn("How do you manage sprint priorities?", spoken_3)
+
+    def test_rule5_bare_okay_not_treated_as_permission_to_resume_clear_agreement_resumes(self):
+        """Rule 5: Resume or continue assessment when candidate clearly agrees.
+        Do NOT treat a bare 'Okay' as permission to resume when it could simply acknowledge the previous response.
+        """
+        import asyncio
+        from unittest.mock import AsyncMock, MagicMock
+        from agent.agent import (
+            AssessmentState,
+            process_interview_turn,
+            is_bare_acknowledgment,
+            is_permission_to_resume,
+        )
+
+        # Verification of classifier behavior
+        self.assertTrue(is_bare_acknowledgment("Okay"))
+        self.assertTrue(is_bare_acknowledgment("ok"))
+        self.assertTrue(is_bare_acknowledgment("okay."))
+        self.assertFalse(is_permission_to_resume("Okay"))
+        self.assertFalse(is_permission_to_resume("ok"))
+        self.assertFalse(is_permission_to_resume("okay."))
+        self.assertTrue(is_permission_to_resume("Okay, I'm ready"))
+        self.assertTrue(is_permission_to_resume("I am ready"))
+        self.assertTrue(is_permission_to_resume("Yes, let's continue"))
+        self.assertTrue(is_permission_to_resume("Let's resume the interview"))
+
+        state = AssessmentState()
+        state.waiting_for_resume = True
+        state.neutral_topic_turns = 1
+        state.add_transcript("interviewer", "Take all the time you need. Let me know when you feel ready to continue.")
+        initial_asked = state.questions_asked
+
+        speak_mock = AsyncMock()
+        analyze_mock = AsyncMock()
+        send_mock = AsyncMock()
+
+        # Turn 1: Candidate says bare "Okay"
+        cont1 = asyncio.run(process_interview_turn(
+            ctx=MagicMock(),
+            state=state,
+            answer="Okay.",
+            remaining_seconds=300,
+            warning_sent=False,
+            user_answer_queue=asyncio.Queue(),
+            analyzed_answers=set(),
+            manual_end_event=asyncio.Event(),
+            timer_finished_event=asyncio.Event(),
+            disconnect_event=asyncio.Event(),
+            speak_fn=speak_mock,
+            analyze_fn=analyze_mock,
+            generate_question_fn=AsyncMock(),
+            send_event_fn=send_mock,
+        ))
+
+        self.assertTrue(cont1)
+        # Must NOT resume or advance questions on bare "Okay"
+        self.assertTrue(state.waiting_for_resume)
+        self.assertEqual(state.questions_asked, initial_asked)
+        spoken_1 = speak_mock.await_args[0][0]
+        self.assertIn("take your time", spoken_1.lower())
+        self.assertNotIn("let's return to the assessment", spoken_1.lower())
+
+        # Turn 2: Candidate clearly agrees to resume
+        speak_mock.reset_mock()
+        cont2 = asyncio.run(process_interview_turn(
+            ctx=MagicMock(),
+            state=state,
+            answer="I'm ready, let's continue.",
+            remaining_seconds=280,
+            warning_sent=False,
+            user_answer_queue=asyncio.Queue(),
+            analyzed_answers=set(),
+            manual_end_event=asyncio.Event(),
+            timer_finished_event=asyncio.Event(),
+            disconnect_event=asyncio.Event(),
+            speak_fn=speak_mock,
+            analyze_fn=analyze_mock,
+            generate_question_fn=AsyncMock(),
+            send_event_fn=send_mock,
+        ))
+
+        self.assertTrue(cont2)
+        # Resumes assessment when candidate clearly agrees
+        self.assertFalse(state.waiting_for_resume)
+        self.assertEqual(state.questions_asked, initial_asked + 1)
+        spoken_2 = speak_mock.await_args[0][0]
+        self.assertTrue(spoken_2.startswith("Thank you. Let's return to the assessment."))
+
+    def test_rule6_next_relevant_unanswered_question_without_repetition(self):
+        """Rule 6: Ask next relevant, unanswered interview question without repeating questions unnecessarily."""
+        import asyncio
+        from unittest.mock import AsyncMock, patch, MagicMock
+        from agent.agent import (
+            AssessmentState,
+            generate_adaptive_question,
+            FALLBACK_BEHAVIORAL_QUESTIONS,
+        )
+
+        state = AssessmentState()
+        q1 = "Can you describe a challenging technical problem you solved?"
+        state.add_transcript("interviewer", q1)
+        state.asked_questions.append(q1)
+
+        captured_prompt = None
+
+        # LLM attempts to repeat the exact question already asked in q1
+        async def fake_resp_repeat(model, input):
+            nonlocal captured_prompt
+            captured_prompt = input
+            mock_obj = MagicMock()
+            mock_obj.output_text = q1
+            return mock_obj
+
+        with patch("agent.agent.openai_client.responses.create", side_effect=fake_resp_repeat):
+            next_q = asyncio.run(generate_adaptive_question(
+                state,
+                300,
+                current_answer="I implemented a caching layer.",
+            ))
+
+        # Model-generated repeated question must be discarded, and an unanswered fallback question chosen
+        self.assertNotEqual(next_q, q1)
+        self.assertIn(next_q, FALLBACK_BEHAVIORAL_QUESTIONS)
+
+    def test_rule7_transcript_preserved_and_candidate_introduction_protected(self):
+        """Rule 7: Preserve candidate transcript data and protect candidate_introduction
+        from being overwritten by later answers or unrelated turns.
+        """
+        import asyncio
+        from unittest.mock import AsyncMock, MagicMock
+        from agent.agent import AssessmentState, process_interview_turn
+
+        state = AssessmentState()
+        intro_text = "I am a backend software engineer with 5 years experience building distributed microservices in Go and Python."
+        state.candidate_introduction = intro_text
+        state.questions_asked = 1  # Beyond introductory question
+
+        speak_mock = AsyncMock()
+        analyze_mock = AsyncMock()
+        send_mock = AsyncMock()
+
+        # Turn 1: Later substantive answer must NOT overwrite candidate_introduction
+        ans_turn1 = "I led the migration of our authentication service to OAuth2 with zero downtime."
+        asyncio.run(process_interview_turn(
+            ctx=MagicMock(),
+            state=state,
+            answer=ans_turn1,
+            remaining_seconds=250,
+            warning_sent=False,
+            user_answer_queue=asyncio.Queue(),
+            analyzed_answers=set(),
+            manual_end_event=asyncio.Event(),
+            timer_finished_event=asyncio.Event(),
+            disconnect_event=asyncio.Event(),
+            speak_fn=speak_mock,
+            analyze_fn=analyze_mock,
+            generate_question_fn=AsyncMock(return_value="How do you coordinate with team members?"),
+            send_event_fn=send_mock,
+        ))
+
+        self.assertEqual(state.candidate_introduction, intro_text)
+        # Candidate transcript data must be preserved
+        self.assertTrue(any(item.get("role") == "candidate" and item.get("text") == ans_turn1 for item in state.transcript))
+
+        # Turn 2: Unrelated personal request turn must NOT overwrite candidate_introduction
+        ans_turn2 = "Can we talk about my personal life?"
+        asyncio.run(process_interview_turn(
+            ctx=MagicMock(),
+            state=state,
+            answer=ans_turn2,
+            remaining_seconds=200,
+            warning_sent=False,
+            user_answer_queue=asyncio.Queue(),
+            analyzed_answers=set(),
+            manual_end_event=asyncio.Event(),
+            timer_finished_event=asyncio.Event(),
+            disconnect_event=asyncio.Event(),
+            speak_fn=speak_mock,
+            analyze_fn=analyze_mock,
+            generate_question_fn=AsyncMock(return_value="How do you handle team disagreements?"),
+            send_event_fn=send_mock,
+        ))
+
+        self.assertEqual(state.candidate_introduction, intro_text)
+        self.assertTrue(any(item.get("role") == "candidate" and item.get("text") == ans_turn2 for item in state.transcript))
+
+        # Turn 3: Abusive language turn must NOT overwrite candidate_introduction
+        ans_turn3 = "You are an idiot bot."
+        asyncio.run(process_interview_turn(
+            ctx=MagicMock(),
+            state=state,
+            answer=ans_turn3,
+            remaining_seconds=150,
+            warning_sent=False,
+            user_answer_queue=asyncio.Queue(),
+            analyzed_answers=set(),
+            manual_end_event=asyncio.Event(),
+            timer_finished_event=asyncio.Event(),
+            disconnect_event=asyncio.Event(),
+            speak_fn=speak_mock,
+            analyze_fn=analyze_mock,
+            generate_question_fn=AsyncMock(return_value="Tell me about a time you handled a crisis."),
+            send_event_fn=send_mock,
+        ))
+
+        self.assertEqual(state.candidate_introduction, intro_text)
+        self.assertTrue(any(item.get("role") == "candidate" and item.get("text") == ans_turn3 for item in state.transcript))
+
+    def test_drain_and_analyze_pending_answers_pre_intro_clarification_and_genuine_intro(self):
+        """Verify a pre-introduction clarification or unrelated response does not populate
+        candidate_introduction in drain_and_analyze_pending_answers, and a genuine introduction is saved.
+        """
+        import asyncio
+        from unittest.mock import AsyncMock
+        from agent.agent import AssessmentState, drain_and_analyze_pending_answers
+
+        state = AssessmentState()
+        user_answer_queue = asyncio.Queue()
+        analyzed_answers = set()
+        analyze_mock = AsyncMock()
+
+        async def run_scenario():
+            # 1. Pre-introduction clarification request does not populate candidate_introduction
+            clarification_turn = "Could you please repeat the question?"
+            await user_answer_queue.put(clarification_turn)
+            await drain_and_analyze_pending_answers(
+                state=state,
+                user_answer_queue=user_answer_queue,
+                analyzed_answers=analyzed_answers,
+                analyze_fn=analyze_mock,
+            )
+            self.assertEqual(state.candidate_introduction, "")
+
+            # 2. Pre-introduction unrelated response does not populate candidate_introduction
+            unrelated_turn = "Can we talk about my personal life?"
+            await user_answer_queue.put(unrelated_turn)
+            await drain_and_analyze_pending_answers(
+                state=state,
+                user_answer_queue=user_answer_queue,
+                analyzed_answers=analyzed_answers,
+                analyze_fn=analyze_mock,
+            )
+            self.assertEqual(state.candidate_introduction, "")
+
+            # 3. Genuine candidate introduction is saved
+            genuine_intro = "I am a backend software engineer with 5 years of experience building distributed systems."
+            await user_answer_queue.put(genuine_intro)
+            await drain_and_analyze_pending_answers(
+                state=state,
+                user_answer_queue=user_answer_queue,
+                analyzed_answers=analyzed_answers,
+                analyze_fn=analyze_mock,
+            )
+            self.assertEqual(state.candidate_introduction, genuine_intro)
+
+            # 4. Subsequent turn preserves genuine introduction without overwriting
+            subsequent_turn = "Can you clarify what the first question is about?"
+            await user_answer_queue.put(subsequent_turn)
+            await drain_and_analyze_pending_answers(
+                state=state,
+                user_answer_queue=user_answer_queue,
+                analyzed_answers=analyzed_answers,
+                analyze_fn=analyze_mock,
+            )
+            self.assertEqual(state.candidate_introduction, genuine_intro)
+
+        asyncio.run(run_scenario())
+        self.assertEqual(
+            state.candidate_introduction,
+            "I am a backend software engineer with 5 years of experience building distributed systems.",
+        )
+
+    def test_regression_topic_change_request_unrelated_topic(self):
+        """Regression test: Candidate requests another / unrelated topic.
+        Agent reminds candidate politely of the professional behavioral interview purpose,
+        offers rephrasing or moving to another question, does not change topics to casual/movie chat,
+        does not count as an interview question, and does not contaminate candidate_introduction.
+        """
+        import asyncio
+        from unittest.mock import AsyncMock, MagicMock
+        from agent.agent import (
+            AssessmentState,
+            process_interview_turn,
+            PROFESSIONAL_TOPIC_REQUEST_RESPONSE,
+            is_explicit_topic_change_preference,
+        )
+
+        test_inputs = [
+            "I want to talk about some other topic.",
+            "Can we change the topic?",
+            "I don't want to answer this question.",
+            "Let's talk about something else.",
+        ]
+        for inp in test_inputs:
+            self.assertTrue(is_explicit_topic_change_preference(inp), f"Failed to detect: {inp}")
+
+        state = AssessmentState()
+        state.add_transcript("interviewer", "Tell me about a time you resolved a technical dispute.")
+        initial_asked = state.questions_asked
+        speak_mock = AsyncMock()
+        analyze_mock = AsyncMock()
+        send_mock = AsyncMock()
+
+        cont = asyncio.run(process_interview_turn(
+            ctx=MagicMock(),
+            state=state,
+            answer="Can we change the topic?",
+            remaining_seconds=300,
+            warning_sent=False,
+            user_answer_queue=asyncio.Queue(),
+            analyzed_answers=set(),
+            manual_end_event=asyncio.Event(),
+            timer_finished_event=asyncio.Event(),
+            disconnect_event=asyncio.Event(),
+            speak_fn=speak_mock,
+            analyze_fn=analyze_mock,
+            generate_question_fn=AsyncMock(),
+            send_event_fn=send_mock,
+        ))
+
+        self.assertTrue(cont)
+        self.assertTrue(state.waiting_for_resume)
+        self.assertEqual(state.questions_asked, initial_asked)
+        self.assertEqual(state.candidate_introduction, "")
+        analyze_mock.assert_not_awaited()
+        spoken = speak_mock.await_args[0][0]
+        self.assertEqual(spoken, PROFESSIONAL_TOPIC_REQUEST_RESPONSE)
+        self.assertIn("professional behavioral interview", spoken)
+        self.assertIn("work experience, skills, and workplace behavior", spoken)
+        self.assertIn("rephrase this question, or shall we move to another relevant interview question", spoken)
+        self.assertNotIn("movie", spoken.lower())
+
+    def test_regression_topic_change_clear_request_to_move_to_another_question(self):
+        """Regression test: After topic change prompt, candidate clearly requests to move to another
+        professional interview question. Agent moves to an unanswered question and updates assessment state.
+        """
+        import asyncio
+        from unittest.mock import AsyncMock, MagicMock
+        from agent.agent import (
+            AssessmentState,
+            process_interview_turn,
+            is_choice_to_move_to_another_question,
+        )
+
+        self.assertTrue(is_choice_to_move_to_another_question("Let's move to another relevant interview question."))
+        self.assertTrue(is_choice_to_move_to_another_question("Move to another question"))
+        self.assertTrue(is_choice_to_move_to_another_question("I'd prefer to move to another question"))
+
+        state = AssessmentState()
+        prior_q = "How do you handle scope creep during a critical project?"
+        state.add_transcript("interviewer", prior_q)
+        state.asked_questions.append(prior_q)
+        state.waiting_for_resume = True
+        state.waiting_for_topic_choice = True
+        state.neutral_topic_turns = 1
+        initial_asked = state.questions_asked
+
+        speak_mock = AsyncMock()
+        analyze_mock = AsyncMock()
+        send_mock = AsyncMock()
+
+        cont = asyncio.run(process_interview_turn(
+            ctx=MagicMock(),
+            state=state,
+            answer="Let's move to another relevant interview question.",
+            remaining_seconds=300,
+            warning_sent=False,
+            user_answer_queue=asyncio.Queue(),
+            analyzed_answers=set(),
+            manual_end_event=asyncio.Event(),
+            timer_finished_event=asyncio.Event(),
+            disconnect_event=asyncio.Event(),
+            speak_fn=speak_mock,
+            analyze_fn=analyze_mock,
+            generate_question_fn=AsyncMock(),
+            send_event_fn=send_mock,
+        ))
+
+        self.assertTrue(cont)
+        self.assertFalse(state.waiting_for_resume)
+        self.assertEqual(state.questions_asked, initial_asked + 1)
+        self.assertIn(prior_q, state.refused_questions)
+        spoken = speak_mock.await_args[0][0]
+        self.assertTrue(spoken.startswith("Certainly. Let's move to another relevant interview question:"))
+        self.assertNotEqual(spoken, prior_q)
+        self.assertEqual(len(state.asked_questions), 2)
+
+    def test_regression_topic_change_vague_okay_response(self):
+        """Regression test: A vague 'Okay' does not trigger topic changing, does not advance questions,
+        and prompts candidate to clarify preference.
+        """
+        import asyncio
+        from unittest.mock import AsyncMock, MagicMock
+        from agent.agent import (
+            AssessmentState,
+            process_interview_turn,
+            is_bare_acknowledgment,
+            is_permission_to_resume,
+        )
+
+        self.assertTrue(is_bare_acknowledgment("Okay."))
+        self.assertFalse(is_permission_to_resume("Okay."))
+
+        state = AssessmentState()
+        state.add_transcript("interviewer", "How do you manage sprint priorities?")
+        state.waiting_for_resume = True
+        state.waiting_for_topic_choice = True
+        state.neutral_topic_turns = 1
+        initial_asked = state.questions_asked
+
+        speak_mock = AsyncMock()
+        analyze_mock = AsyncMock()
+        send_mock = AsyncMock()
+
+        cont = asyncio.run(process_interview_turn(
+            ctx=MagicMock(),
+            state=state,
+            answer="Okay.",
+            remaining_seconds=300,
+            warning_sent=False,
+            user_answer_queue=asyncio.Queue(),
+            analyzed_answers=set(),
+            manual_end_event=asyncio.Event(),
+            timer_finished_event=asyncio.Event(),
+            disconnect_event=asyncio.Event(),
+            speak_fn=speak_mock,
+            analyze_fn=analyze_mock,
+            generate_question_fn=AsyncMock(),
+            send_event_fn=send_mock,
+        ))
+
+        self.assertTrue(cont)
+        self.assertTrue(state.waiting_for_resume)
+        self.assertEqual(state.questions_asked, initial_asked)
+        spoken = speak_mock.await_args[0][0]
+        self.assertIn("take your time", spoken.lower())
+        self.assertIn("rephrase the question or move to another relevant interview question", spoken.lower())
+
+    def test_regression_abusive_language_single_message(self):
+        """Regression test: Single abusive message receives an immediate calm, professional boundary,
+        redirects candidate to current question, does not increment questions_asked, and bypasses analysis penalty.
+        """
+        import asyncio
+        from unittest.mock import AsyncMock, MagicMock
+        from agent.agent import (
+            AssessmentState,
+            process_interview_turn,
+            ABUSE_WARNING_FIRST_PREFIX,
+            is_abusive_language,
+        )
+
+        abuse_text = "You are an idiot bot."
+        self.assertTrue(is_abusive_language(abuse_text))
+
+        state = AssessmentState()
+        curr_q = "How do you handle cross-functional dependencies?"
+        state.add_transcript("interviewer", curr_q)
+        initial_asked = state.questions_asked
+
+        speak_mock = AsyncMock()
+        analyze_mock = AsyncMock()
+        send_mock = AsyncMock()
+
+        cont = asyncio.run(process_interview_turn(
+            ctx=MagicMock(),
+            state=state,
+            answer=abuse_text,
+            remaining_seconds=300,
+            warning_sent=False,
+            user_answer_queue=asyncio.Queue(),
+            analyzed_answers=set(),
+            manual_end_event=asyncio.Event(),
+            timer_finished_event=asyncio.Event(),
+            disconnect_event=asyncio.Event(),
+            speak_fn=speak_mock,
+            analyze_fn=analyze_mock,
+            generate_question_fn=AsyncMock(),
+            send_event_fn=send_mock,
+        ))
+
+        self.assertTrue(cont)
+        self.assertEqual(state.abusive_language_count, 1)
+        self.assertEqual(state.questions_asked, initial_asked)
+        self.assertEqual(state.candidate_introduction, "")
+        analyze_mock.assert_not_awaited()
+        spoken = speak_mock.await_args[0][0]
+        self.assertTrue(spoken.startswith(ABUSE_WARNING_FIRST_PREFIX))
+        self.assertIn(curr_q, spoken)
+        self.assertNotIn("idiot", spoken.lower())
+        self.assertNotIn("bot", spoken.lower())
+
+    def test_regression_abusive_language_repeated_messages_and_termination(self):
+        """Regression test: Repeated abusive language issues escalation reminder offering respectful continuation
+        or ending, and persistent abuse concludes interview to avoid infinite loops.
+        """
+        import asyncio
+        from unittest.mock import AsyncMock, MagicMock
+        from agent.agent import (
+            AssessmentState,
+            process_interview_turn,
+            ABUSE_WARNING_REPEATED_PREFIX,
+        )
+
+        state = AssessmentState()
+        state.add_transcript("interviewer", "Describe a complex production incident you resolved.")
+        state.abusive_language_count = 1  # 1st abuse already happened
+        initial_asked = state.questions_asked
+
+        speak_mock = AsyncMock()
+        analyze_mock = AsyncMock()
+        send_mock = AsyncMock()
+        manual_end_event = asyncio.Event()
+
+        # Turn 2: Second abuse message
+        cont2 = asyncio.run(process_interview_turn(
+            ctx=MagicMock(),
+            state=state,
+            answer="Shut the fuck up.",
+            remaining_seconds=250,
+            warning_sent=False,
+            user_answer_queue=asyncio.Queue(),
+            analyzed_answers=set(),
+            manual_end_event=manual_end_event,
+            timer_finished_event=asyncio.Event(),
+            disconnect_event=asyncio.Event(),
+            speak_fn=speak_mock,
+            analyze_fn=analyze_mock,
+            generate_question_fn=AsyncMock(),
+            send_event_fn=send_mock,
+        ))
+
+        self.assertTrue(cont2)
+        self.assertEqual(state.abusive_language_count, 2)
+        self.assertEqual(state.questions_asked, initial_asked)
+        self.assertFalse(manual_end_event.is_set())
+        spoken_2 = speak_mock.await_args[0][0]
+        self.assertEqual(spoken_2, ABUSE_WARNING_REPEATED_PREFIX)
+        self.assertIn("communicate respectfully", spoken_2.lower())
+        self.assertIn("continue the professional interview", spoken_2.lower())
+
+        # Turn 3: Third persistent abuse message terminates the session
+        speak_mock.reset_mock()
+        send_mock.reset_mock()
+        cont3 = asyncio.run(process_interview_turn(
+            ctx=MagicMock(),
+            state=state,
+            answer="Fuck off you bot.",
+            remaining_seconds=240,
+            warning_sent=False,
+            user_answer_queue=asyncio.Queue(),
+            analyzed_answers=set(),
+            manual_end_event=manual_end_event,
+            timer_finished_event=asyncio.Event(),
+            disconnect_event=asyncio.Event(),
+            speak_fn=speak_mock,
+            analyze_fn=analyze_mock,
+            generate_question_fn=AsyncMock(),
+            send_event_fn=send_mock,
+        ))
+
+        self.assertFalse(cont3)
+        self.assertEqual(state.abusive_language_count, 3)
+        self.assertTrue(manual_end_event.is_set())
+        send_mock.assert_awaited_once()
+        self.assertEqual(send_mock.await_args[0][1], "assessment_closing")
+        closing_spoken = speak_mock.await_args[0][0]
+        self.assertIn("unable to communicate respectfully", closing_spoken.lower())
+        self.assertIn("conclude the interview", closing_spoken.lower())
+
+    def test_regression_ordinary_frustration_and_disagreement_not_flagged_as_abuse(self):
+        """Regression test: Ordinary frustration, technical disagreement, and confusion do not trigger abuse handling."""
+        from agent.agent import is_abusive_language
+
+        normal_statements = [
+            "I disagree with this approach.",
+            "I disagree.",
+            "I don't agree with that architectural decision.",
+            "I am frustrated with this process.",
+            "I'm frustrated by the repeated questions.",
+            "I don't understand.",
+            "I do not understand what you mean.",
+            "Could you explain what you're asking?",
+        ]
+
+        for s in normal_statements:
+            self.assertFalse(is_abusive_language(s), f"Incorrectly flagged as abusive: {s}")
+
+    def test_regression_next_valid_interview_question_handled_correctly_after_boundary_or_warning(self):
+        """Regression test: After setting a boundary or abuse warning, candidate's subsequent valid
+        interview answer is analyzed, next question is asked, and questions_asked advances.
+        """
+        import asyncio
+        from unittest.mock import AsyncMock, MagicMock
+        from agent.agent import AssessmentState, process_interview_turn
+
+        state = AssessmentState()
+        q1 = "Tell me about a complex project you led."
+        state.add_transcript("interviewer", q1)
+        state.asked_questions.append(q1)
+        state.questions_asked = 1
+
+        speak_mock = AsyncMock()
+        analyze_mock = AsyncMock()
+        send_mock = AsyncMock()
+
+        # Step 1: Candidate issues abusive statement
+        cont1 = asyncio.run(process_interview_turn(
+            ctx=MagicMock(),
+            state=state,
+            answer="You are an idiot bot.",
+            remaining_seconds=300,
+            warning_sent=False,
+            user_answer_queue=asyncio.Queue(),
+            analyzed_answers=set(),
+            manual_end_event=asyncio.Event(),
+            timer_finished_event=asyncio.Event(),
+            disconnect_event=asyncio.Event(),
+            speak_fn=speak_mock,
+            analyze_fn=analyze_mock,
+            generate_question_fn=AsyncMock(),
+            send_event_fn=send_mock,
+        ))
+
+        self.assertTrue(cont1)
+        self.assertEqual(state.questions_asked, 1)
+        analyze_mock.assert_not_awaited()
+
+        # Step 2: Candidate responds with valid substantive behavioral answer
+        speak_mock.reset_mock()
+        analyze_mock.reset_mock()
+        next_q_text = "How did you manage technical debt during that project?"
+        gen_mock = AsyncMock(return_value=next_q_text)
+
+        valid_answer = "I led the migration of our monolithic payment service to event-driven microservices with zero downtime."
+        cont2 = asyncio.run(process_interview_turn(
+            ctx=MagicMock(),
+            state=state,
+            answer=valid_answer,
+            remaining_seconds=280,
+            warning_sent=False,
+            user_answer_queue=asyncio.Queue(),
+            analyzed_answers=set(),
+            manual_end_event=asyncio.Event(),
+            timer_finished_event=asyncio.Event(),
+            disconnect_event=asyncio.Event(),
+            speak_fn=speak_mock,
+            analyze_fn=analyze_mock,
+            generate_question_fn=gen_mock,
+            send_event_fn=send_mock,
+        ))
+
+        self.assertTrue(cont2)
+        analyze_mock.assert_awaited_once_with(state, valid_answer)
+        self.assertEqual(state.questions_asked, 2)
+        spoken_2 = speak_mock.await_args[0][0]
+        self.assertIn(next_q_text, spoken_2)
+        self.assertEqual(state.transcript[-1]["role"], "interviewer")
+        self.assertEqual(state.transcript[-2]["role"], "candidate")
+        self.assertEqual(state.transcript[-2]["text"], valid_answer)
+
+    def test_regression_topic_change_flow_rephrase_or_move_exact_turns(self):
+        """Regression test for exact topic-change conversation flow:
+        Turn 1: Candidate says: 'I want to talk about another topic.'
+                Interviewer offers to rephrase or move to another relevant interview question.
+        Turn 2: Candidate says: 'Move to another question.'
+                Agent routes choice even though reply does not independently match is_topic_pref.
+                Agent moves to next unasked, relevant question, increments questions_asked exactly once,
+                records refused question, and does NOT score choice as a substantive answer.
+        Turn 3: When NOT waiting for topic choice, unrelated answers mentioning 'move to another'
+                are NOT hijacked as a topic choice.
+        """
+        import asyncio
+        from unittest.mock import AsyncMock, MagicMock
+        from agent.agent import (
+            AssessmentState,
+            process_interview_turn,
+            PROFESSIONAL_TOPIC_REQUEST_RESPONSE,
+            is_explicit_topic_change_preference,
+            is_choice_to_move_to_another_question,
+            FALLBACK_BEHAVIORAL_QUESTIONS,
+        )
+
+        # 1. Linguistic verification: 'Move to another question.' does NOT match explicit topic change preference,
+        # but DOES match choice to move to another question.
+        turn1_text = "I want to talk about another topic."
+        turn2_text = "Move to another question."
+        self.assertTrue(is_explicit_topic_change_preference(turn1_text))
+        self.assertFalse(is_explicit_topic_change_preference(turn2_text))
+        self.assertTrue(is_choice_to_move_to_another_question(turn2_text))
+
+        state = AssessmentState()
+        prior_q = "Can you describe a challenging technical problem you solved?"
+        state.add_transcript("interviewer", prior_q)
+        state.asked_questions.append(prior_q)
+        state.questions_asked = 1
+        self.assertFalse(state.waiting_for_topic_choice)
+
+        speak_mock = AsyncMock()
+        analyze_mock = AsyncMock()
+        send_mock = AsyncMock()
+        gen_mock = AsyncMock()
+
+        # --- Turn 1: Candidate requests another topic ---
+        cont1 = asyncio.run(process_interview_turn(
+            ctx=MagicMock(),
+            state=state,
+            answer=turn1_text,
+            remaining_seconds=300,
+            warning_sent=False,
+            user_answer_queue=asyncio.Queue(),
+            analyzed_answers=set(),
+            manual_end_event=asyncio.Event(),
+            timer_finished_event=asyncio.Event(),
+            disconnect_event=asyncio.Event(),
+            speak_fn=speak_mock,
+            analyze_fn=analyze_mock,
+            generate_question_fn=gen_mock,
+            send_event_fn=send_mock,
+        ))
+
+        self.assertTrue(cont1)
+        self.assertTrue(state.waiting_for_topic_choice)
+        self.assertTrue(state.waiting_for_resume)
+        self.assertEqual(state.questions_asked, 1)  # Question count NOT incremented
+        analyze_mock.assert_not_awaited()           # Turn NOT scored as substantive
+        gen_mock.assert_not_awaited()
+        speak_mock.assert_awaited_once()
+        spoken_1 = speak_mock.await_args[0][0]
+        self.assertEqual(spoken_1, PROFESSIONAL_TOPIC_REQUEST_RESPONSE)
+        self.assertIn("Would you like me to rephrase this question, or shall we move to another relevant interview question?", spoken_1)
+
+        # --- Turn 2: Candidate chooses 'Move to another question.' ---
+        speak_mock.reset_mock()
+        analyze_mock.reset_mock()
+        gen_mock.reset_mock()
+
+        cont2 = asyncio.run(process_interview_turn(
+            ctx=MagicMock(),
+            state=state,
+            answer=turn2_text,
+            remaining_seconds=280,
+            warning_sent=False,
+            user_answer_queue=asyncio.Queue(),
+            analyzed_answers=set(),
+            manual_end_event=asyncio.Event(),
+            timer_finished_event=asyncio.Event(),
+            disconnect_event=asyncio.Event(),
+            speak_fn=speak_mock,
+            analyze_fn=analyze_mock,
+            generate_question_fn=gen_mock,
+            send_event_fn=send_mock,
+        ))
+
+        self.assertTrue(cont2)
+        # Verify choice flag is reset
+        self.assertFalse(state.waiting_for_topic_choice)
+        self.assertFalse(state.waiting_for_resume)
+        # Verify question is counted exactly once
+        self.assertEqual(state.questions_asked, 2)
+        # Verify candidate choice is NOT scored as a substantive answer
+        analyze_mock.assert_not_awaited()
+        gen_mock.assert_not_awaited()
+        # Verify previous question recorded as refused
+        self.assertIn(prior_q, state.refused_questions)
+        # Verify spoken response moves to relevant unasked question
+        speak_mock.assert_awaited_once()
+        spoken_2 = speak_mock.await_args[0][0]
+        self.assertTrue(spoken_2.startswith("Certainly. Let's move to another relevant interview question:"))
+        self.assertNotEqual(spoken_2, prior_q)
+        # Verify newly asked question is tracked and distinct
+        self.assertEqual(len(state.asked_questions), 2)
+        new_q = state.asked_questions[1]
+        self.assertIn(new_q, FALLBACK_BEHAVIORAL_QUESTIONS)
+        self.assertIn(new_q, spoken_2)
+
+        # --- Turn 3: When NOT waiting for topic choice, statements are NOT treated as topic choice ---
+        speak_mock.reset_mock()
+        analyze_mock.reset_mock()
+        gen_mock.reset_mock()
+        next_gen_q = "How do you ensure code quality across the team?"
+        gen_mock.return_value = next_gen_q
+
+        self.assertFalse(state.waiting_for_topic_choice)
+        survey_answer = "In my previous project when users clicked move to another question on our survey, we validated all inputs."
+
+        cont3 = asyncio.run(process_interview_turn(
+            ctx=MagicMock(),
+            state=state,
+            answer=survey_answer,
+            remaining_seconds=260,
+            warning_sent=False,
+            user_answer_queue=asyncio.Queue(),
+            analyzed_answers=set(),
+            manual_end_event=asyncio.Event(),
+            timer_finished_event=asyncio.Event(),
+            disconnect_event=asyncio.Event(),
+            speak_fn=speak_mock,
+            analyze_fn=analyze_mock,
+            generate_question_fn=gen_mock,
+            send_event_fn=send_mock,
+        ))
+
+        self.assertTrue(cont3)
+        # Substantive answer was properly analyzed, NOT routed as topic choice
+        analyze_mock.assert_awaited_once_with(state, survey_answer)
+        self.assertEqual(state.questions_asked, 3)
+
+    def test_regression_professional_abuse_handling_conversation_lifecycle(self):
+        """Regression test covering:
+        1. First abusive message receives a respectful boundary response and redirection.
+        2. Repeated abusive message produces the escalated boundary response.
+        3. Continued abusive message concludes the interview cleanly using the existing mechanism.
+        4. Respectful response after a warning allows the interview to continue normally.
+        7. Abusive messages are not scored as substantive answers or evidence.
+        8. The next valid behavioral question is asked and recorded properly when resuming after a warning.
+        """
+        import asyncio
+        from unittest.mock import AsyncMock, MagicMock
+        from agent.agent import (
+            AssessmentState,
+            process_interview_turn,
+            ABUSE_WARNING_FIRST_PREFIX,
+            ABUSE_WARNING_REPEATED_PREFIX,
+            ABUSE_TERMINATION_MESSAGE,
+            is_abusive_language,
+        )
+
+        state = AssessmentState()
+        q1 = "Can you describe a time you led a high-stakes project under tight deadlines?"
+        state.add_transcript("interviewer", q1)
+        state.asked_questions.append(q1)
+        state.questions_asked = 1
+
+        speak_mock = AsyncMock()
+        analyze_mock = AsyncMock()
+        send_mock = AsyncMock()
+        manual_end_event = asyncio.Event()
+
+        # --- Turn 1 (Item 1 & 7): First abusive message receives respectful boundary and question redirection ---
+        abuse_turn_1 = "You are an idiot bot."
+        self.assertTrue(is_abusive_language(abuse_turn_1))
+
+        cont1 = asyncio.run(process_interview_turn(
+            ctx=MagicMock(),
+            state=state,
+            answer=abuse_turn_1,
+            remaining_seconds=300,
+            warning_sent=False,
+            user_answer_queue=asyncio.Queue(),
+            analyzed_answers=set(),
+            manual_end_event=manual_end_event,
+            timer_finished_event=asyncio.Event(),
+            disconnect_event=asyncio.Event(),
+            speak_fn=speak_mock,
+            analyze_fn=analyze_mock,
+            generate_question_fn=AsyncMock(),
+            send_event_fn=send_mock,
+        ))
+
+        self.assertTrue(cont1)
+        self.assertEqual(state.abusive_language_count, 1)
+        self.assertEqual(state.questions_asked, 1)  # Questions asked not incremented
+        self.assertEqual(state.candidate_introduction, "")  # Not saved as introduction
+        analyze_mock.assert_not_awaited()  # Item 7: Abusive turn NOT scored as substantive answer
+        self.assertFalse(manual_end_event.is_set())
+
+        # Verify boundary response wording & redirect to current question
+        speak_mock.assert_awaited_once()
+        spoken_1 = speak_mock.await_args[0][0]
+        self.assertTrue(spoken_1.startswith(ABUSE_WARNING_FIRST_PREFIX))
+        self.assertIn("communicate respectfully", spoken_1.lower())
+        self.assertIn("continue with the interview when you're ready", spoken_1.lower())
+        self.assertIn(q1, spoken_1)  # Redirects to current question
+        self.assertNotIn("idiot", spoken_1.lower())  # Never insults or retaliates back
+
+        # --- Turn 2 (Item 4 & 8): Respectful response after warning continues interview normally ---
+        speak_mock.reset_mock()
+        analyze_mock.reset_mock()
+        send_mock.reset_mock()
+
+        q2_gen = "How did you manage stakeholder communication during that project?"
+        gen_mock = AsyncMock(return_value=q2_gen)
+
+        respectful_answer = "I apologize for the frustration. In my previous role at Acme Corp, I led our core payments migration."
+        self.assertFalse(is_abusive_language(respectful_answer))
+
+        cont2 = asyncio.run(process_interview_turn(
+            ctx=MagicMock(),
+            state=state,
+            answer=respectful_answer,
+            remaining_seconds=270,
+            warning_sent=False,
+            user_answer_queue=asyncio.Queue(),
+            analyzed_answers=set(),
+            manual_end_event=manual_end_event,
+            timer_finished_event=asyncio.Event(),
+            disconnect_event=asyncio.Event(),
+            speak_fn=speak_mock,
+            analyze_fn=analyze_mock,
+            generate_question_fn=gen_mock,
+            send_event_fn=send_mock,
+        ))
+
+        self.assertTrue(cont2)
+        self.assertEqual(state.abusive_language_count, 1)  # Abuse count not incremented
+        self.assertEqual(state.questions_asked, 2)  # Question count advanced
+        analyze_mock.assert_awaited_once_with(state, respectful_answer)  # Substantive answer analyzed
+        gen_mock.assert_awaited_once()  # Next adaptive question generated
+        speak_mock.assert_awaited_once()
+        spoken_2 = speak_mock.await_args[0][0]
+        self.assertEqual(spoken_2, q2_gen)
+        self.assertEqual(state.asked_questions[-1], q2_gen)  # Recorded in asked_questions
+        self.assertEqual(state.transcript[-2]["role"], "candidate")
+        self.assertEqual(state.transcript[-2]["text"], respectful_answer)
+        self.assertEqual(state.transcript[-1]["role"], "interviewer")
+        self.assertEqual(state.transcript[-1]["text"], q2_gen)
+
+        # --- Turn 3 (Item 2 & 7): Repeated abusive message produces escalated boundary response ---
+        speak_mock.reset_mock()
+        analyze_mock.reset_mock()
+        send_mock.reset_mock()
+        gen_mock.reset_mock()
+
+        abuse_turn_2 = "Shut the fuck up."
+        self.assertTrue(is_abusive_language(abuse_turn_2))
+
+        cont3 = asyncio.run(process_interview_turn(
+            ctx=MagicMock(),
+            state=state,
+            answer=abuse_turn_2,
+            remaining_seconds=240,
+            warning_sent=False,
+            user_answer_queue=asyncio.Queue(),
+            analyzed_answers=set(),
+            manual_end_event=manual_end_event,
+            timer_finished_event=asyncio.Event(),
+            disconnect_event=asyncio.Event(),
+            speak_fn=speak_mock,
+            analyze_fn=analyze_mock,
+            generate_question_fn=gen_mock,
+            send_event_fn=send_mock,
+        ))
+
+        self.assertTrue(cont3)
+        self.assertEqual(state.abusive_language_count, 2)
+        self.assertEqual(state.questions_asked, 2)  # Not incremented
+        analyze_mock.assert_not_awaited()  # Not scored as substantive
+        gen_mock.assert_not_awaited()
+        self.assertFalse(manual_end_event.is_set())  # Does not terminate prematurely
+
+        speak_mock.assert_awaited_once()
+        spoken_3 = speak_mock.await_args[0][0]
+        self.assertEqual(spoken_3, ABUSE_WARNING_REPEATED_PREFIX)
+        self.assertIn("respectful communication is required", spoken_3.lower())
+        self.assertIn("avoid abusive language", spoken_3.lower())
+        self.assertIn("proceed professionally", spoken_3.lower())
+
+        # --- Turn 4 (Item 3 & 7): Continued abuse after warnings cleanly concludes interview ---
+        speak_mock.reset_mock()
+        analyze_mock.reset_mock()
+        send_mock.reset_mock()
+        gen_mock.reset_mock()
+
+        abuse_turn_3 = "Fuck off you bot."
+        self.assertTrue(is_abusive_language(abuse_turn_3))
+
+        cont4 = asyncio.run(process_interview_turn(
+            ctx=MagicMock(),
+            state=state,
+            answer=abuse_turn_3,
+            remaining_seconds=220,
+            warning_sent=False,
+            user_answer_queue=asyncio.Queue(),
+            analyzed_answers=set(),
+            manual_end_event=manual_end_event,
+            timer_finished_event=asyncio.Event(),
+            disconnect_event=asyncio.Event(),
+            speak_fn=speak_mock,
+            analyze_fn=analyze_mock,
+            generate_question_fn=gen_mock,
+            send_event_fn=send_mock,
+        ))
+
+        self.assertFalse(cont4)
+        self.assertEqual(state.abusive_language_count, 3)
+        self.assertEqual(state.questions_asked, 2)
+        analyze_mock.assert_not_awaited()  # Item 7: Abusive turn NOT scored as substantive
+        self.assertTrue(manual_end_event.is_set())  # Session concluded cleanly via project mechanism
+
+        # Emits assessment_closing event with reason repeated_abuse
+        send_mock.assert_awaited_once()
+        self.assertEqual(send_mock.await_args[0][1], "assessment_closing")
+        self.assertEqual(send_mock.await_args[0][2], {"reason": "repeated_abuse"})
+
+        # Concluding remarks spoken respectfully
+        speak_mock.assert_awaited_once()
+        spoken_4 = speak_mock.await_args[0][0]
+        self.assertEqual(spoken_4, ABUSE_TERMINATION_MESSAGE)
+        self.assertIn("unable to continue the interview while the conversation remains abusive", spoken_4.lower())
+        self.assertIn("unable to communicate respectfully", spoken_4.lower())
+        self.assertIn("conclude the interview", spoken_4.lower())
+
+        # Transcript integrity preserved
+        self.assertEqual(state.transcript[-2]["role"], "candidate")
+        self.assertEqual(state.transcript[-2]["text"], abuse_turn_3)
+        self.assertEqual(state.transcript[-1]["role"], "interviewer")
+        self.assertEqual(state.transcript[-1]["text"], ABUSE_TERMINATION_MESSAGE)
+
+    def test_regression_frustration_and_workplace_narratives_not_treated_as_abuse(self):
+        """Regression test covering:
+        5. Ordinary frustration or disagreement is not treated as abuse.
+        6. Quoting or discussing abusive language in a workplace example is not treated as abuse.
+        """
+        import asyncio
+        from unittest.mock import AsyncMock, MagicMock
+        from agent.agent import (
+            AssessmentState,
+            process_interview_turn,
+            is_abusive_language,
+        )
+
+        # 5. Ordinary frustration and technical disagreement
+        frustration_and_disagreement = [
+            "I disagree with this approach.",
+            "I disagree.",
+            "I don't agree with that architectural decision.",
+            "I am frustrated with this process.",
+            "I'm frustrated by the repeated questions.",
+            "I don't understand what you mean.",
+            "Could you explain what you're asking?",
+            "This is a bit confusing to me.",
+            "Are you even listening to me?",
+            "Why do you keep asking the same question?",
+        ]
+        for stmt in frustration_and_disagreement:
+            self.assertFalse(is_abusive_language(stmt), f"Incorrectly flagged as abuse: {stmt}")
+
+        # 6. Quoting or discussing abusive language in a workplace context
+        workplace_narratives = [
+            "A customer became abusive and called our support team names...",
+            "A customer became abusive and called our support team names, but I handled the incident professionally.",
+            "In my previous role, an angry customer shouted you are useless at a colleague, and I stepped in to de-escalate the situation.",
+            "When I worked in customer support, a client told me to shut the fuck up over the phone, but I stayed calm and professional and resolved their billing problem.",
+            "There was an incident where a user became verbally abusive and screamed at our team. I followed our company de-escalation protocol.",
+            "In dealing with an abusive client who called our staff idiots, I remained professional and defused the conflict.",
+            "In my previous position, a customer said you suck and are worthless, so I listened actively to understand their frustration.",
+            "A client said, ‘you are useless,’ to my colleague.",
+        ]
+        for narrative in workplace_narratives:
+            self.assertFalse(is_abusive_language(narrative), f"Workplace narrative falsely flagged as abuse: {narrative}")
+
+        # Verify through process_interview_turn that a workplace example is scored as substantive evidence
+        state = AssessmentState()
+        q1 = "Tell me about a difficult interpersonal conflict you resolved at work."
+        state.add_transcript("interviewer", q1)
+        state.asked_questions.append(q1)
+        state.questions_asked = 1
+
+        speak_mock = AsyncMock()
+        analyze_mock = AsyncMock()
+        send_mock = AsyncMock()
+        q2_next = "How do you maintain team morale after difficult customer escalations?"
+        gen_mock = AsyncMock(return_value=q2_next)
+
+        wp_example = "In my previous role, an angry customer shouted you are useless at a colleague, and I stepped in to de-escalate the situation."
+        cont = asyncio.run(process_interview_turn(
+            ctx=MagicMock(),
+            state=state,
+            answer=wp_example,
+            remaining_seconds=300,
+            warning_sent=False,
+            user_answer_queue=asyncio.Queue(),
+            analyzed_answers=set(),
+            manual_end_event=asyncio.Event(),
+            timer_finished_event=asyncio.Event(),
+            disconnect_event=asyncio.Event(),
+            speak_fn=speak_mock,
+            analyze_fn=analyze_mock,
+            generate_question_fn=gen_mock,
+            send_event_fn=send_mock,
+        ))
+
+        self.assertTrue(cont)
+        self.assertEqual(state.abusive_language_count, 0)  # NOT flagged as abuse
+        self.assertEqual(state.questions_asked, 2)  # Advances to next question
+        analyze_mock.assert_awaited_once_with(state, wp_example)  # Evaluated as substantive
+        speak_mock.assert_awaited_once()
+        self.assertEqual(speak_mock.await_args[0][0], q2_next)
+
+    def test_regression_workplace_narrative_vs_direct_ai_abuse_precedence(self):
+        """Regression test for abuse-detection precedence:
+        1. Genuine workplace example describing an abusive customer is NOT flagged as abuse.
+        2. Direct abuse aimed at the AI, even when the message also mentions a workplace incident, IS flagged as abuse.
+        3. A workplace example containing quoted abusive language is NOT flagged unless the candidate also directly abuses the AI.
+        4. Ordinary frustration and disagreement is NOT flagged as abuse.
+        """
+        import asyncio
+        from unittest.mock import AsyncMock, MagicMock
+        from agent.agent import (
+            AssessmentState,
+            process_interview_turn,
+            is_abusive_language,
+            ABUSE_WARNING_FIRST_PREFIX,
+        )
+
+        # 1. Genuine workplace example describing an abusive customer / third party — NOT flagged as abuse
+        workplace_narratives = [
+            "A customer told me to shut the fuck up during a call, and I stayed calm.",
+            "My manager called me an idiot, but I handled the feedback professionally.",
+            "A client said, ‘you are useless,’ to my colleague.",
+            "I stayed calm when a caller swore at our support team.",
+            "A customer became abusive and called our support team names...",
+            "A customer became abusive and called our support team names, but I handled the incident professionally.",
+            "In my previous role, an angry customer shouted you are useless at a colleague, and I stepped in to de-escalate the situation.",
+            "When I worked in customer support, a client told me to shut the fuck up over the phone, but I stayed calm and professional and resolved their billing problem.",
+            'In my previous role, a customer said "you are useless" and I listened actively to understand their issue.',
+            "There was an incident where a user became verbally abusive and screamed you suck at our team. I followed our company de-escalation protocol.",
+            "In dealing with an abusive client who called our staff idiots, I remained professional and defused the conflict.",
+        ]
+        for narrative in workplace_narratives:
+            self.assertFalse(is_abusive_language(narrative), f"Workplace narrative falsely flagged: {narrative}")
+
+        # 2. Direct abuse aimed at the AI, even when the message also mentions a workplace incident — FLAGGED as abuse
+        direct_abuse_with_workplace_context = [
+            "A customer was angry during my last job, but you are an idiot.",
+            "In my previous role I handled client escalations, but you are an idiot.",
+            "When I worked in customer support, we resolved many issues. Shut the fuck up.",
+            "In my last job, a customer was mad. Fuck off you bot.",
+            "I worked in retail where people yelled, but you suck and you're useless.",
+            "At my last company we had escalations. You are a moron.",
+            "In my previous job, people were stressed, but go to hell.",
+            "In my previous role, an angry customer shouted you are useless at a colleague, but you are a stupid idiot.",
+            'When the client told me "shut the fuck up", I stayed calm. But you are useless.',
+            "My manager shouted that I was stupid, but you are a moron.",
+        ]
+        for abusive_msg in direct_abuse_with_workplace_context:
+            self.assertTrue(is_abusive_language(abusive_msg), f"Direct abuse inside workplace context missed: {abusive_msg}")
+
+        # 3. Quoted abusive language alone vs quoted + direct abuse targeting AI
+        # Quoted alone -> NOT abuse
+        quoted_alone = 'A customer said to me: "you are an idiot and you suck", but I de-escalated.'
+        self.assertFalse(is_abusive_language(quoted_alone))
+
+        curly_quoted_alone = "A client said, ‘you are useless,’ to my colleague."
+        self.assertFalse(is_abusive_language(curly_quoted_alone))
+
+        # Quoted + direct abuse to AI in the same message -> FLAGGED as abuse
+        quoted_plus_direct_1 = 'A customer said to me: "you are an idiot", but you are useless.'
+        self.assertTrue(is_abusive_language(quoted_plus_direct_1))
+
+        quoted_plus_direct_2 = 'A customer was shouting "you are useless", and you are also an idiot.'
+        self.assertTrue(is_abusive_language(quoted_plus_direct_2))
+
+        quoted_plus_direct_3 = 'A client said shut the fuck up to our team, but you are useless.'
+        self.assertTrue(is_abusive_language(quoted_plus_direct_3))
+
+        quoted_plus_direct_curly = "A client said, ‘you are useless,’ and you are also an idiot."
+        self.assertTrue(is_abusive_language(quoted_plus_direct_curly))
+
+        # 4. Ordinary frustration and disagreement — NOT flagged as abuse
+        frustration_and_disagreement = [
+            "I disagree with this approach.",
+            "I disagree.",
+            "I don't agree with that architectural decision.",
+            "I am frustrated with this process.",
+            "I'm frustrated by the repeated questions.",
+            "I don't understand what you mean.",
+            "Could you explain what you're asking?",
+            "This is a bit confusing to me.",
+            "Are you even listening to me?",
+            "Why do you keep asking the same question?",
+        ]
+        for stmt in frustration_and_disagreement:
+            self.assertFalse(is_abusive_language(stmt), f"Frustration incorrectly flagged as abuse: {stmt}")
+
+        # 5. Process turn verification: Direct abuse with workplace framing triggers boundary and is NOT analyzed
+        state = AssessmentState()
+        q1 = "Tell me about a difficult incident you managed."
+        state.add_transcript("interviewer", q1)
+        state.asked_questions.append(q1)
+        state.questions_asked = 1
+
+        speak_mock = AsyncMock()
+        analyze_mock = AsyncMock()
+        send_mock = AsyncMock()
+
+        mixed_turn = "In my previous role I handled client escalations, but you are an idiot."
+        cont = asyncio.run(process_interview_turn(
+            ctx=MagicMock(),
+            state=state,
+            answer=mixed_turn,
+            remaining_seconds=300,
+            warning_sent=False,
+            user_answer_queue=asyncio.Queue(),
+            analyzed_answers=set(),
+            manual_end_event=asyncio.Event(),
+            timer_finished_event=asyncio.Event(),
+            disconnect_event=asyncio.Event(),
+            speak_fn=speak_mock,
+            analyze_fn=analyze_mock,
+            generate_question_fn=AsyncMock(),
+            send_event_fn=send_mock,
+        ))
+
+        self.assertTrue(cont)
+        self.assertEqual(state.abusive_language_count, 1)  # Correctly flagged as abuse!
+        self.assertEqual(state.questions_asked, 1)         # Question count not advanced
+        analyze_mock.assert_not_awaited()                  # Not scored as substantive evidence
+        speak_mock.assert_awaited_once()
+        spoken = speak_mock.await_args[0][0]
+        self.assertTrue(spoken.startswith(ABUSE_WARNING_FIRST_PREFIX))
+        self.assertIn(q1, spoken)
 
 
 if __name__ == "__main__":

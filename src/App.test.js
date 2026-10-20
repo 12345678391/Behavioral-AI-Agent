@@ -1284,6 +1284,57 @@ describe('Behavioral AI Agent App', () => {
     expect(badge).toHaveTextContent('Assessment Active (Running)');
     expect(screen.queryByTestId('paused-banner')).not.toBeInTheDocument();
   });
+
+  test('hash reopening: reopens completed assessment and recording from URL hash, sanitizing address bar', async () => {
+    const mockReport = {
+      assessment_id: 'archived-room-123',
+      completed: true,
+      recording: {
+        status: 'completed',
+        videoUrl: 'https://r2.example.com/recordings/archived-room-123.mp4',
+      },
+      final_analysis: {
+        overall_score: 91,
+        scores: { communication: 92, problem_solving: 90 },
+        strengths: ['Clear and concise communication'],
+        areas_for_improvement: ['Provide more concrete metrics'],
+        behavioral_summary: 'Outstanding candidate performance in interview.',
+      },
+    };
+
+    api.getAssessmentResult.mockResolvedValueOnce(mockReport);
+    api.getRecordingStatus.mockResolvedValueOnce({
+      success: true,
+      status: 'completed',
+      videoUrl: 'https://r2.example.com/recordings/archived-room-123.mp4',
+    });
+
+    const replaceStateSpy = jest.spyOn(window.history, 'replaceState');
+
+    // Set URL hash
+    window.location.hash = '#room=archived-room-123&archiveToken=token-secret-abc';
+
+    try {
+      await act(async () => {
+        render(<App />);
+      });
+
+      // 1. Verify address bar sanitization (hash purged)
+      expect(replaceStateSpy).toHaveBeenCalledWith(null, '', expect.not.stringContaining('archiveToken'));
+
+      // 2. Verify API called with capability token
+      expect(api.getAssessmentResult).toHaveBeenCalledWith('archived-room-123', 'token-secret-abc');
+      expect(api.getRecordingStatus).toHaveBeenCalledWith('archived-room-123', 'token-secret-abc');
+
+      // 3. Verify report rendered
+      expect(screen.getByText(/Assessment Report/i)).toBeInTheDocument();
+      expect(screen.getByText('91')).toBeInTheDocument();
+      expect(screen.getByText(/Outstanding candidate performance in interview/i)).toBeInTheDocument();
+    } finally {
+      window.location.hash = '';
+      replaceStateSpy.mockRestore();
+    }
+  });
 });
 
 
