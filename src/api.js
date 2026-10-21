@@ -1,11 +1,26 @@
+const KNOWN_BACKUP_HOST = "behavioral-ai-api-backup.onrender.com";
+const DEFAULT_FEATURE_BACKEND = "https://behavioral-backend-gc62.onrender.com";
+
 const rawBaseUrl = process.env.REACT_APP_API_BASE_URL;
 
-const API_BASE_URL = (
-  rawBaseUrl ||
-  (process.env.NODE_ENV === "production"
-    ? ""
-    : "http://localhost:3001")
-).replace(/\/+$/, "");
+export function resolveApiBaseUrl(raw = rawBaseUrl, nodeEnv = process.env.NODE_ENV) {
+  if (raw && typeof raw === "string") {
+    const trimmed = raw.trim().replace(/\/+$/, "");
+    if (trimmed.includes(KNOWN_BACKUP_HOST)) {
+      console.warn(
+        `[API] REACT_APP_API_BASE_URL points to known backup host (${KNOWN_BACKUP_HOST}) which lacks recording functionality. Directing to feature backend (${DEFAULT_FEATURE_BACKEND}).`
+      );
+      return DEFAULT_FEATURE_BACKEND;
+    }
+    return trimmed;
+  }
+  if (nodeEnv === "production") {
+    return DEFAULT_FEATURE_BACKEND;
+  }
+  return "http://localhost:3001";
+}
+
+const API_BASE_URL = resolveApiBaseUrl();
 
 async function parseResponse(response, fallbackMessage) {
   if (!response.ok) {
@@ -130,18 +145,23 @@ export async function startRecording(room) {
   );
 }
 
-export async function stopRecording(room) {
+export async function stopRecording(room, token) {
   if (!room) {
     throw new Error("Room name is required to stop recording.");
   }
 
+  const options = {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+    },
+    body: JSON.stringify({ room }),
+  };
+
   return fetchWithFallback(
     "/recording/stop",
-    {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ room }),
-    },
+    options,
     "Failed to stop recording"
   );
 }
@@ -165,3 +185,5 @@ export async function getRecordingStatus(room, token) {
     "Recording status is not available yet"
   );
 }
+
+export { API_BASE_URL };

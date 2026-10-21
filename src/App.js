@@ -191,7 +191,8 @@ function App() {
     if (recordingStoppedRoomRef.current === roomName) return;
     recordingStoppedRoomRef.current = roomName;
     try {
-      const res = await stopRecording(roomName);
+      const token = archiveTokenRef.current || undefined;
+      const res = await stopRecording(roomName, token);
       if (!isMountedRef.current) return;
       if (res && res.status) {
         setRecordingStatus(res.status);
@@ -199,7 +200,9 @@ function App() {
         if (res.error) setRecordingError(res.error);
       }
     } catch (err) {
-      // Non-fatal stop recording notice
+      if (!isMountedRef.current) return;
+      console.warn("[App] Recording stop notice:", err?.message || err);
+      setRecordingError(err?.message || "Could not stop recording cleanly.");
     }
   }, []);
 
@@ -1773,15 +1776,45 @@ function App() {
 
           <div className="flex items-center gap-3">
             {connected && (
-              <span
-                className={`rounded-full px-3 py-1.5 text-xs font-medium ${
-                  audioBlocked
-                    ? "border border-amber-500/30 bg-amber-500/10 text-amber-300"
-                    : "bg-indigo-500/10 text-indigo-300"
-                }`}
-              >
-                {audioBlocked ? "🔇 Audio Blocked" : "🔊 Audio Active"}
-              </span>
+              <>
+                <span
+                  className={`rounded-full px-3 py-1.5 text-xs font-medium ${
+                    audioBlocked
+                      ? "border border-amber-500/30 bg-amber-500/10 text-amber-300"
+                      : "bg-indigo-500/10 text-indigo-300"
+                  }`}
+                >
+                  {audioBlocked ? "🔇 Audio Blocked" : "🔊 Audio Active"}
+                </span>
+                <span
+                  data-testid="live-recording-status-badge"
+                  className={`rounded-full px-3 py-1.5 text-xs font-medium ${
+                    recordingStatus === "active"
+                      ? "border border-red-500/30 bg-red-500/10 text-red-400 flex items-center gap-1.5"
+                      : recordingStatus === "starting"
+                      ? "border border-amber-500/30 bg-amber-500/10 text-amber-300 flex items-center gap-1.5"
+                      : recordingStatus === "failed"
+                      ? "border border-rose-500/30 bg-rose-500/10 text-rose-300"
+                      : "border border-slate-700 bg-slate-800 text-slate-400"
+                  }`}
+                >
+                  {recordingStatus === "active" ? (
+                    <>
+                      <span className="inline-block h-2 w-2 rounded-full bg-red-500 animate-pulse" />
+                      REC
+                    </>
+                  ) : recordingStatus === "starting" ? (
+                    <>
+                      <span className="inline-block h-2 w-2 rounded-full bg-amber-400 animate-pulse" />
+                      Rec Starting...
+                    </>
+                  ) : recordingStatus === "failed" ? (
+                    "⚠️ Rec Unavailable"
+                  ) : (
+                    "Rec Idle"
+                  )}
+                </span>
+              </>
             )}
             <div
               data-testid="interview-status-badge"
@@ -1973,6 +2006,15 @@ function App() {
                   </div>
                 )}
 
+                {connected && recordingStatus === "failed" && recordingError && (
+                  <div
+                    data-testid="recording-live-warning"
+                    className="mt-4 rounded-xl border border-rose-500/30 bg-rose-500/10 px-4 py-3 text-xs text-rose-300"
+                  >
+                    <span>⚠️ Video recording could not be started: {recordingError} (Assessment and scoring continue normally).</span>
+                  </div>
+                )}
+
                 {/* CURRENT QUESTION */}
 
                 <div className="mt-8 rounded-2xl border border-indigo-500/20 bg-indigo-500/5 p-7">
@@ -1981,7 +2023,10 @@ function App() {
                     AI Interviewer
                   </p>
 
-                  <p className="mt-4 text-xl leading-relaxed text-slate-100">
+                  <p className="mt-4 text-xl leading-relaxed text-slate-100 flex items-center gap-2">
+                    {!assessmentStarted && (
+                      <span className="inline-block h-4 w-4 animate-spin rounded-full border-2 border-indigo-400 border-t-transparent" />
+                    )}
                     {currentQuestion}
                   </p>
 

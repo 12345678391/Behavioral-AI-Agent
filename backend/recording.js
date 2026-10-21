@@ -36,19 +36,20 @@ function resetRecordingSessionsForTest() {
 function getStorageConfig() {
   // 1. AWS S3 / S3-compatible (Cloudflare R2, MinIO, Wasabi, AWS S3)
   const s3Key = sanitizeEnvValue(
-    process.env.S3_KEY_ID || process.env.AWS_ACCESS_KEY_ID
+    process.env.S3_KEY_ID || process.env.AWS_ACCESS_KEY_ID || process.env.R2_ACCESS_KEY_ID
   );
   const s3Secret = sanitizeEnvValue(
-    process.env.S3_KEY_SECRET || process.env.AWS_SECRET_ACCESS_KEY
+    process.env.S3_KEY_SECRET || process.env.AWS_SECRET_ACCESS_KEY || process.env.R2_SECRET_ACCESS_KEY
   );
   const s3Bucket = sanitizeEnvValue(
-    process.env.S3_BUCKET || process.env.AWS_BUCKET
+    process.env.S3_BUCKET || process.env.AWS_BUCKET || process.env.R2_BUCKET
   );
   const s3Region = sanitizeEnvValue(
-    process.env.S3_REGION || process.env.AWS_REGION || "us-east-1"
+    process.env.S3_REGION || process.env.AWS_REGION || process.env.R2_REGION || "auto"
   );
-  const s3Endpoint = sanitizeEnvValue(process.env.S3_ENDPOINT);
-  const forcePathStyle = process.env.S3_FORCE_PATH_STYLE === "true";
+  const s3Endpoint = sanitizeEnvValue(process.env.S3_ENDPOINT || process.env.R2_ENDPOINT);
+  const isR2 = Boolean(s3Endpoint && s3Endpoint.includes("r2.cloudflarestorage.com"));
+  const forcePathStyle = process.env.S3_FORCE_PATH_STYLE !== undefined ? process.env.S3_FORCE_PATH_STYLE === "true" : isR2;
 
   if (s3Key && s3Secret && s3Bucket) {
     return {
@@ -112,6 +113,7 @@ function computePlaybackUrl(storageConfig, filepath, fileResults, result) {
   const publicBaseUrl = sanitizeEnvValue(
     process.env.RECORDING_BASE_URL ||
     process.env.S3_PUBLIC_BASE_URL ||
+    process.env.R2_PUBLIC_URL ||
     process.env.STORAGE_PUBLIC_URL
   );
 
@@ -192,13 +194,13 @@ function generatePresignedPlaybackUrl(
     process.env.S3_KEY_SECRET || process.env.AWS_SECRET_ACCESS_KEY
   );
   const bucket = sanitizeEnvValue(
-    storageConfig.bucket || process.env.S3_BUCKET || process.env.AWS_BUCKET
+    storageConfig.bucket || process.env.S3_BUCKET || process.env.AWS_BUCKET || process.env.R2_BUCKET
   );
   const region = sanitizeEnvValue(
-    storageConfig.region || process.env.S3_REGION || process.env.AWS_REGION || "auto"
+    storageConfig.region || process.env.S3_REGION || process.env.AWS_REGION || process.env.R2_REGION || "auto"
   );
   const rawEndpoint = sanitizeEnvValue(
-    storageConfig.endpoint || process.env.S3_ENDPOINT
+    storageConfig.endpoint || process.env.S3_ENDPOINT || process.env.R2_ENDPOINT
   );
 
   if (!accessKeyId || !secretAccessKey || !bucket) {
