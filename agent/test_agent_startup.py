@@ -3995,8 +3995,8 @@ class TestAgentStartup(unittest.TestCase):
         speak_mock.assert_awaited_once()
         spoken_1 = speak_mock.await_args[0][0]
         self.assertTrue(spoken_1.startswith(ABUSE_WARNING_FIRST_PREFIX))
-        self.assertIn("communicate respectfully", spoken_1.lower())
-        self.assertIn("continue with the interview when you're ready", spoken_1.lower())
+        self.assertIn("respectful and professional", spoken_1.lower())
+        self.assertIn("conduct a professional interview", spoken_1.lower())
         self.assertIn(q1, spoken_1)  # Redirects to current question
         self.assertNotIn("idiot", spoken_1.lower())  # Never insults or retaliates back
 
@@ -4337,6 +4337,318 @@ class TestAgentStartup(unittest.TestCase):
         spoken = speak_mock.await_args[0][0]
         self.assertTrue(spoken.startswith(ABUSE_WARNING_FIRST_PREFIX))
         self.assertIn(q1, spoken)
+
+
+    def test_enforce_professional_interview_boundaries_all_criteria(self):
+        """Comprehensive verification of the 5 required completion criteria:
+        1. Candidate: 'Can we talk about movies?' -> Politely decline with exact boundary explanation and redirect.
+        2. Candidate: 'Ask me about cartoons and games.' -> Maintain professional boundaries and redirect.
+        3. Candidate uses abusive language -> Calm warning, no insults back, redirect to current question.
+        4. Candidate: 'Can you ask another question?' / 'Ask another question' -> Acknowledge, pivot without repetition.
+        5. Candidate gives normal workplace answer -> Continue interview naturally.
+        """
+        import asyncio
+        from unittest.mock import AsyncMock, MagicMock
+        from agent.agent import (
+            AssessmentState,
+            process_interview_turn,
+            PROFESSIONAL_BOUNDARY_PREFIX,
+            ABUSE_WARNING_FIRST_PREFIX,
+            REPEATED_REFUSAL_PREFIX,
+            PROFESSIONAL_REFUSAL_PREFIX,
+            is_personal_or_unrelated_request,
+            is_abusive_language,
+            is_candidate_refusal,
+            FALLBACK_BEHAVIORAL_QUESTIONS,
+        )
+
+        state = AssessmentState()
+        q1 = "Tell me about a time you led a challenging project under tight deadlines."
+        state.add_transcript("interviewer", q1)
+        state.asked_questions.append(q1)
+        state.questions_asked = 1
+
+        speak_mock = AsyncMock()
+        analyze_mock = AsyncMock()
+        send_mock = AsyncMock()
+
+        # =====================================================================
+        # Scenario 1: Candidate asks "Can we talk about movies?"
+        # Expected: Politely decline the topic and return to a professional interview question.
+        # =====================================================================
+        unrelated_movies = "Can we talk about movies?"
+        self.assertTrue(is_personal_or_unrelated_request(unrelated_movies))
+
+        async def gen_q_redirect(st, rem, **kwargs):
+            return "How do you prioritize deliverables when unexpected obstacles arise?"
+
+        cont1 = asyncio.run(process_interview_turn(
+            ctx=MagicMock(),
+            state=state,
+            answer=unrelated_movies,
+            remaining_seconds=300,
+            warning_sent=False,
+            user_answer_queue=asyncio.Queue(),
+            analyzed_answers=set(),
+            manual_end_event=asyncio.Event(),
+            timer_finished_event=asyncio.Event(),
+            disconnect_event=asyncio.Event(),
+            speak_fn=speak_mock,
+            analyze_fn=analyze_mock,
+            generate_question_fn=gen_q_redirect,
+            send_event_fn=send_mock,
+        ))
+
+        self.assertTrue(cont1)
+        analyze_mock.assert_not_awaited()  # No behavioral scoring for off-topic requests
+        spoken_1 = speak_mock.await_args[0][0]
+        # Politely decline with exact boundary explanation:
+        self.assertTrue(spoken_1.startswith(PROFESSIONAL_BOUNDARY_PREFIX))
+        self.assertEqual(
+            PROFESSIONAL_BOUNDARY_PREFIX,
+            "This is a professional interview, so I need to keep our conversation focused on your skills, experiences, and workplace behavior."
+        )
+        # Redirect to a professional question
+        self.assertIn("How do you prioritize deliverables when unexpected obstacles arise?", spoken_1)
+        # Never engage in movie chat
+        self.assertNotIn("favorite movie", spoken_1.lower())
+
+        # =====================================================================
+        # Scenario 2: Candidate asks "Ask me about cartoons and games."
+        # Expected: Maintain professional boundaries and redirect.
+        # =====================================================================
+        speak_mock.reset_mock()
+        analyze_mock.reset_mock()
+        unrelated_cartoons = "Ask me about cartoons and games."
+        self.assertTrue(is_personal_or_unrelated_request(unrelated_cartoons))
+
+        cont2 = asyncio.run(process_interview_turn(
+            ctx=MagicMock(),
+            state=state,
+            answer=unrelated_cartoons,
+            remaining_seconds=280,
+            warning_sent=False,
+            user_answer_queue=asyncio.Queue(),
+            analyzed_answers=set(),
+            manual_end_event=asyncio.Event(),
+            timer_finished_event=asyncio.Event(),
+            disconnect_event=asyncio.Event(),
+            speak_fn=speak_mock,
+            analyze_fn=analyze_mock,
+            generate_question_fn=gen_q_redirect,
+            send_event_fn=send_mock,
+        ))
+
+        self.assertTrue(cont2)
+        analyze_mock.assert_not_awaited()
+        spoken_2 = speak_mock.await_args[0][0]
+        self.assertTrue(spoken_2.startswith(PROFESSIONAL_BOUNDARY_PREFIX))
+        self.assertNotIn("cartoon", spoken_2.lower())
+        self.assertNotIn("game", spoken_2.lower())
+
+        # =====================================================================
+        # Scenario 3: Candidate uses abusive language
+        # Expected: Calm boundary-setting response, never insult back, redirect to current question.
+        # =====================================================================
+        speak_mock.reset_mock()
+        analyze_mock.reset_mock()
+        abuse_text = "You are a stupid idiot bot."
+        self.assertTrue(is_abusive_language(abuse_text))
+
+        current_q = "How do you prioritize deliverables when unexpected obstacles arise?"
+        state.add_transcript("interviewer", current_q)
+
+        cont3 = asyncio.run(process_interview_turn(
+            ctx=MagicMock(),
+            state=state,
+            answer=abuse_text,
+            remaining_seconds=260,
+            warning_sent=False,
+            user_answer_queue=asyncio.Queue(),
+            analyzed_answers=set(),
+            manual_end_event=asyncio.Event(),
+            timer_finished_event=asyncio.Event(),
+            disconnect_event=asyncio.Event(),
+            speak_fn=speak_mock,
+            analyze_fn=analyze_mock,
+            generate_question_fn=AsyncMock(),
+            send_event_fn=send_mock,
+        ))
+
+        self.assertTrue(cont3)
+        self.assertEqual(state.abusive_language_count, 1)
+        analyze_mock.assert_not_awaited()
+        spoken_3 = speak_mock.await_args[0][0]
+        # Calm boundary-setting response:
+        self.assertTrue(spoken_3.startswith(ABUSE_WARNING_FIRST_PREFIX))
+        self.assertEqual(
+            ABUSE_WARNING_FIRST_PREFIX,
+            "Let's keep our conversation respectful and professional. I'm here to conduct a professional interview."
+        )
+        # Redirect to current question:
+        self.assertIn(current_q, spoken_3)
+        # Never insults or retaliates back:
+        self.assertNotIn("idiot", spoken_3.lower())
+        self.assertNotIn("stupid", spoken_3.lower())
+
+        # =====================================================================
+        # Scenario 4: Candidate says "Can you ask another question?" and "Ask another question"
+        # Expected: Acknowledge request, ask different relevant behavioral question without repetition.
+        # =====================================================================
+        speak_mock.reset_mock()
+        analyze_mock.reset_mock()
+        refusal_1 = "Can you ask another question?"
+        self.assertTrue(is_candidate_refusal(refusal_1))
+
+        q_diff = "Could you tell me about how you resolve technical disagreements with colleagues?"
+        async def gen_q_diff(st, rem, is_refusal=False, refused_question="", **kwargs):
+            self.assertTrue(is_refusal)
+            return q_diff
+
+        cont4 = asyncio.run(process_interview_turn(
+            ctx=MagicMock(),
+            state=state,
+            answer=refusal_1,
+            remaining_seconds=240,
+            warning_sent=False,
+            user_answer_queue=asyncio.Queue(),
+            analyzed_answers=set(),
+            manual_end_event=asyncio.Event(),
+            timer_finished_event=asyncio.Event(),
+            disconnect_event=asyncio.Event(),
+            speak_fn=speak_mock,
+            analyze_fn=analyze_mock,
+            generate_question_fn=gen_q_diff,
+            send_event_fn=send_mock,
+        ))
+
+        self.assertTrue(cont4)
+        analyze_mock.assert_not_awaited()
+        spoken_4 = speak_mock.await_args[0][0]
+        self.assertTrue(spoken_4.startswith(PROFESSIONAL_REFUSAL_PREFIX))
+        self.assertIn(q_diff, spoken_4)
+        self.assertIn(current_q, state.refused_questions)
+
+        # Repeated refusal: "Ask another question"
+        speak_mock.reset_mock()
+        analyze_mock.reset_mock()
+        refusal_2 = "Ask another question"
+        self.assertTrue(is_candidate_refusal(refusal_2))
+
+        q_diff_2 = "How do you approach learning and adopting new engineering tools under tight deadlines?"
+        async def gen_q_diff_2(st, rem, is_refusal=False, refused_question="", **kwargs):
+            self.assertTrue(is_refusal)
+            return q_diff_2
+
+        cont5 = asyncio.run(process_interview_turn(
+            ctx=MagicMock(),
+            state=state,
+            answer=refusal_2,
+            remaining_seconds=220,
+            warning_sent=False,
+            user_answer_queue=asyncio.Queue(),
+            analyzed_answers=set(),
+            manual_end_event=asyncio.Event(),
+            timer_finished_event=asyncio.Event(),
+            disconnect_event=asyncio.Event(),
+            speak_fn=speak_mock,
+            analyze_fn=analyze_mock,
+            generate_question_fn=gen_q_diff_2,
+            send_event_fn=send_mock,
+        ))
+
+        self.assertTrue(cont5)
+        analyze_mock.assert_not_awaited()
+        spoken_5 = speak_mock.await_args[0][0]
+        # Politely explain that relevant examples help assess workplace skills:
+        self.assertTrue(spoken_5.startswith(REPEATED_REFUSAL_PREFIX))
+        self.assertIn("Relevant examples help assess your workplace skills", spoken_5)
+        self.assertIn(q_diff_2, spoken_5)
+
+        # =====================================================================
+        # Scenario 5: Candidate gives a normal workplace-related answer
+        # Expected: Continue the interview naturally.
+        # =====================================================================
+        speak_mock.reset_mock()
+        analyze_mock.reset_mock()
+        normal_answer = "When we adopted Kubernetes, I created a proof-of-concept cluster, ran benchmarking tests, and held training workshops for our junior engineers."
+        self.assertFalse(is_personal_or_unrelated_request(normal_answer))
+        self.assertFalse(is_abusive_language(normal_answer))
+        self.assertFalse(is_candidate_refusal(normal_answer))
+
+        q_adaptive = "How did you measure the performance improvements after moving to Kubernetes?"
+        async def gen_q_adaptive(st, rem, **kwargs):
+            return q_adaptive
+
+        cont6 = asyncio.run(process_interview_turn(
+            ctx=MagicMock(),
+            state=state,
+            answer=normal_answer,
+            remaining_seconds=200,
+            warning_sent=False,
+            user_answer_queue=asyncio.Queue(),
+            analyzed_answers=set(),
+            manual_end_event=asyncio.Event(),
+            timer_finished_event=asyncio.Event(),
+            disconnect_event=asyncio.Event(),
+            speak_fn=speak_mock,
+            analyze_fn=analyze_mock,
+            generate_question_fn=gen_q_adaptive,
+            send_event_fn=send_mock,
+        ))
+
+        self.assertTrue(cont6)
+        # Normal answer is analyzed and scored:
+        analyze_mock.assert_awaited_once_with(state, normal_answer)
+        spoken_6 = speak_mock.await_args[0][0]
+        self.assertEqual(spoken_6, q_adaptive)
+
+
+    def test_circuit_breaker_bypasses_llm_on_unrelated_requests(self):
+        """Verify generate_adaptive_question circuit-breaker returns a safe workplace fallback
+        without invoking OpenAI when candidate answer is an unrelated request or entertainment topic.
+        """
+        import asyncio
+        from unittest.mock import AsyncMock, patch
+        from agent.agent import AssessmentState, generate_adaptive_question, FALLBACK_BEHAVIORAL_QUESTIONS
+
+        state = AssessmentState()
+
+        with patch("agent.agent.openai_client.responses.create", new_callable=AsyncMock) as mock_resp,              patch("agent.agent.openai_client.chat.completions.create", new_callable=AsyncMock) as mock_chat:
+
+            # 1. Candidate asked about movies
+            q1 = asyncio.run(generate_adaptive_question(
+                state=state,
+                remaining_seconds=300,
+                current_answer="Can we talk about movies?",
+            ))
+            mock_resp.assert_not_awaited()
+            mock_chat.assert_not_awaited()
+            self.assertIn(q1, FALLBACK_BEHAVIORAL_QUESTIONS)
+            self.assertNotIn("movie", q1.lower())
+
+            # 2. Candidate asked about cartoons and games
+            q2 = asyncio.run(generate_adaptive_question(
+                state=state,
+                remaining_seconds=280,
+                current_answer="Ask me about cartoons and games.",
+            ))
+            mock_resp.assert_not_awaited()
+            mock_chat.assert_not_awaited()
+            self.assertIn(q2, FALLBACK_BEHAVIORAL_QUESTIONS)
+            self.assertNotIn("cartoon", q2.lower())
+            self.assertNotIn("game", q2.lower())
+
+            # 3. is_boundary flag passed explicitly
+            q3 = asyncio.run(generate_adaptive_question(
+                state=state,
+                remaining_seconds=260,
+                current_answer="",
+                is_boundary=True,
+            ))
+            mock_resp.assert_not_awaited()
+            mock_chat.assert_not_awaited()
+            self.assertIn(q3, FALLBACK_BEHAVIORAL_QUESTIONS)
 
 
 if __name__ == "__main__":

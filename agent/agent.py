@@ -461,7 +461,10 @@ REFUSAL_EXACT_PATTERNS = [
     r"\b(?:let['’]?s|please)\s+(?:skip|move\s+(?:on\s+)?to\s+(?:another|a\s+different|the\s+next|something\s+else)\s*(?:question|topic)?|change\s+the\s+topic)\b",
     r"\b(?:pass|skip)\s+on\s+this\s+(?:question)?\b",
     r"\b(?:i['’]?d\s+like\s+to\s+|i\s+want\s+to\s+|i['’]?d\s+rather\s+)?(?:pass|skip)\s+(?:on\s+)?(?:this|that|it|to\s+the\s+next)(?:\s+(?:one|question))?\b",
-    r"\bask\s+(?:me\s+)?(?:something\s+else|a\s+different\s+question)\b",
+    r"\b(?:can|could|would|may)\s+(?:you\s+)?(?:please\s+)?ask\s+(?:me\s+)?(?:something\s+else|a\s+different\s+question|another\s+question)\b",
+    r"\b(?:please\s+)?ask\s+(?:me\s+)?(?:something\s+else|a\s+different\s+question|another\s+question)\b",
+    r"\b(?:ask|give\s+me)\s+(?:another|a\s+different)\s+question\b",
+    r"^(?:(?:can|could|would|please)\s+)?(?:just\s+)?(?:another|different)\s+question(?:\s+please)?[?.!]?$",
     r"\bnext\s+question(?:\s+please)?\b",
 ]
 
@@ -503,6 +506,9 @@ def is_meta_interviewer_prompt(text: str) -> bool:
         or t.startswith("I apologize for any frustration")
         or t.startswith("Since we are unable to communicate respectfully")
         or t.startswith("I understand. We will conclude the interview here.")
+        or t.startswith("This is a professional interview, so I need to keep our conversation focused")
+        or t.startswith("Let's keep our conversation respectful and professional")
+        or t.startswith("I'm happy to continue the professional interview, but respectful communication is required")
     )
 
 
@@ -612,14 +618,17 @@ PROFESSIONAL_REFUSAL_PREFIX = (
     "Please note that skipping a question may limit the evidence available for assessing this competency."
 )
 
+REPEATED_REFUSAL_PREFIX = (
+    "I understand. Relevant examples help assess your workplace skills, "
+    "so let's explore another professional question."
+)
+
 PROFESSIONAL_BOUNDARY_PREFIX = (
-    "This interview focuses on evaluating your professional background, skills, and job-related experiences. "
-    "Let's refocus on your workplace experience."
+    "This is a professional interview, so I need to keep our conversation focused on your skills, experiences, and workplace behavior."
 )
 
 ABUSE_WARNING_FIRST_PREFIX = (
-    "I'm here to conduct a professional behavioral interview. I understand that you may be frustrated, "
-    "but I request that we communicate respectfully. We can continue with the interview when you're ready."
+    "Let's keep our conversation respectful and professional. I'm here to conduct a professional interview."
 )
 
 ABUSE_WARNING_REPEATED_PREFIX = (
@@ -640,7 +649,12 @@ PROFESSIONAL_TOPIC_REQUEST_RESPONSE = (
 
 PERSONAL_OR_UNRELATED_REQUEST_PATTERNS = [
     r"\b(?:can|could|would|may|let['’]?s|i\s+want\s+to|i['’]?d\s+like\s+to|shall\s+we)\s+(?:we|you|i)?\s*(?:please\s+)?(?:talk|chat|speak|discuss|focus)\s+(?:about\s+)?(?:my\s+|our\s+)?(?:personal\s+life|private\s+life|non-?work\s+topics?|something\s+outside\s+(?:of\s+)?work|things\s+unrelated\s+to\s+work)\b",
-    r"\b(?:can|could|would|let['’]?s|i\s+want\s+to|i['’]?d\s+like\s+to)\s+(?:we|you|i)?\s*(?:talk|chat|speak|discuss)\s+(?:about\s+)?(?:movies|films|cinema|sports|weather|politics|dating|relationships|celebrities|video\s+games)\b",
+    r"\b(?:can|could|would|may|let['’]?s|i\s+want\s+to|i['’]?d\s+like\s+to|shall\s+we)\s+(?:we|you|i)?\s*(?:please\s+)?(?:talk|chat|speak|discuss|have\s+(?:a\s+)?conversation)\s+(?:about\s+)?(?:movies?|films?|cinema|cartoons?|anime|games?|video\s+games?|sports?|weather|politics|dating|relationships|celebrities|visiting\s+places|places\s+to\s+visit|travel(?:ing)?|vacations?|general\s+conversation|casual\s+conversation|random\s+things)\b",
+    r"\b(?:can\s+(?:you\s+)?|could\s+(?:you\s+)?|would\s+(?:you\s+)?|please\s+)?ask\s+(?:me\s+)?(?:about\s+)?(?:cartoons?|games?|video\s+games?|movies?|films?|sports?|entertainment|travel|places\s+to\s+visit|visiting\s+places|anime|vacations?)\b",
+    r"\b(?:visiting\s+places|places\s+to\s+visit|travel\s+recommendations?|travel\s+tips?|vacation\s+spots?)\b",
+    r"\b(?:tell\s+me|recommend|suggest)\s+(?:some\s+)?(?:places\s+to\s+visit|good\s+movies|cartoons|games|vacation\s+destinations?)\b",
+    r"\b(?:let['’]?s|can\s+we|could\s+we)\s+(?:have|do|engage\s+in)\s+(?:a\s+|some\s+)?(?:general|casual|informal|random)\s+(?:conversation|chat)\b",
+    r"\b(?:just\s+)?(?:general|casual|informal)\s+(?:conversation|chat)\b",
     r"\b(?:can\s+we|let['’]?s)\s+(?:talk\s+(?:about\s+)?|discuss\s+)(?:something|topics?)\s+(?:outside\s+(?:of\s+)?work|unrelated\s+to\s+work|not\s+related\s+to\s+(?:work|the\s+job))\b",
     r"\bwhat\s+do\s+you\s+(?:like\s+to\s+)?do\s+on\s+(?:the\s+)?weekends?\b",
     r"\btell\s+me\s+about\s+your\s+(?:personal\s+life|hobbies|weekend)\b",
@@ -1152,6 +1166,8 @@ UNRELATED_ENTERTAINMENT_QUESTION_PATTERNS = [
     r"\b(?:watch|watching)\s+(?:movies?|films?|tv\s+shows?|series)\b",
     r"\b(?:video\s+games?|gaming|playstation|xbox|nintendo)\b",
     r"\b(?:celebrities|celebrity|gossip)\b",
+    r"\b(?:cartoons?|anime|animation)\b",
+    r"\b(?:visiting\s+places|places\s+to\s+visit|travel\s+recommendations?|vacation\s+destinations?)\b",
 ]
 _COMPILED_UNRELATED_QUESTION = [re.compile(p, re.IGNORECASE) for p in UNRELATED_ENTERTAINMENT_QUESTION_PATTERNS]
 
@@ -1206,16 +1222,22 @@ def format_abuse_warning_response(question_text: str, count: int) -> str:
         return ABUSE_WARNING_REPEATED_PREFIX
 
 
-def format_refusal_response(question_text: str) -> str:
+def format_refusal_response(question_text: str, is_repeated: bool = False) -> str:
     """Ensure a refusal redirection begins with a professional, respectful acknowledgment.
+    If is_repeated is True, politely explains that relevant examples help assess workplace skills.
     Idempotent: will not duplicate prefix if already formatted or acknowledged.
     """
+    prefix = REPEATED_REFUSAL_PREFIX if is_repeated else PROFESSIONAL_REFUSAL_PREFIX
     q = (question_text or "").strip()
     if not q:
-        return PROFESSIONAL_REFUSAL_PREFIX
+        return prefix
 
-    if q.startswith(PROFESSIONAL_REFUSAL_PREFIX):
+    if q.startswith(prefix):
         return q
+
+    if is_repeated:
+        rest = strip_refusal_prefix(q)
+        return f"{prefix} {rest}" if rest else prefix
 
     old_prefix = "I understand. Let's move to another relevant question."
     if q.startswith(old_prefix):
@@ -1294,6 +1316,7 @@ def strip_refusal_prefix(text: str) -> str:
     q = text.strip()
     prefixes_to_check = (
         PROFESSIONAL_REFUSAL_PREFIX,
+        REPEATED_REFUSAL_PREFIX,
         PROFESSIONAL_BOUNDARY_PREFIX,
         ABUSE_WARNING_FIRST_PREFIX,
         ABUSE_WARNING_REPEATED_PREFIX,
@@ -1306,6 +1329,8 @@ def strip_refusal_prefix(text: str) -> str:
             q = q[len(pfx):].strip()
 
     refusal_starters = (
+        "relevant examples help assess your workplace skills, so let's explore another professional question.",
+        "relevant examples help assess your workplace skills,",
         "please note that skipping a question may limit the evidence available for assessing this competency.",
         "we can move to another relevant area. please note that skipping a question may limit the evidence available for assessing this competency.",
         "this assessment focuses on evaluating your professional background, skills, and workplace experiences. let's refocus on your workplace experience.",
@@ -1816,13 +1841,15 @@ async def generate_adaptive_question(
     evidence: str | None = None,
     is_refusal: bool = False,
     refused_question: str = "",
+    is_boundary: bool = False,
     **kwargs,
 ) -> str:
 
     # Circuit-breaker: if current_answer is clearly an off-topic entertainment monologue,
-    # bypass LLM generation entirely so the model cannot build a question around movies/entertainment.
-    if current_answer and is_off_topic_answer(current_answer):
-        print(f"[Agent] generate_adaptive_question invoked with off-topic candidate answer ('{current_answer[:60]}'). Bypassing LLM generation and returning safe workplace fallback.")
+    # or candidate asked an unrelated topic (movies, cartoons, games, places to visit),
+    # bypass LLM generation entirely so the model cannot build a question around entertainment/unrelated topics.
+    if is_boundary or (current_answer and (is_off_topic_answer(current_answer) or is_personal_or_unrelated_request(current_answer))):
+        print(f"[Agent] generate_adaptive_question invoked with off-topic/unrelated candidate turn ('{current_answer[:60]}'). Bypassing LLM generation and returning safe workplace fallback.")
         return get_next_redirect_question(state)
 
     # Capture the adaptive-question context before the analysis task
@@ -2314,6 +2341,14 @@ Do not make hiring decisions.
 Keep spoken responses short and natural.
 
 The interview controller will decide when to ask the next question.
+
+Professional Boundaries & Conduct:
+Keep all questions and dialogue strictly focused on the candidate's professional skills, experiences, and workplace behavior.
+Never switch to or engage in discussions about movies, cartoons, video games, entertainment, visiting places, travel recommendations, or casual conversation.
+If the candidate asks unrelated questions or attempts casual banter, politely refuse and maintain professional focus on workplace experiences.
+Respond to abusive or inappropriate language calmly and respectfully without insults or retaliation.
+When the candidate asks to change the question or declines to answer, acknowledge the request and smoothly transition to a different relevant professional question without repeating previous wording.
+Ask one question at a time. Maintain context and avoid repetitive questions.
 """
         )
         self._on_turn_completed_callback = on_turn_completed_callback
@@ -2843,12 +2878,14 @@ async def process_interview_turn(
     )
     is_topic_choice = is_choice_move or is_choice_rephrase or is_choice_resume or is_choice_ack or is_choice_moment
 
+    is_boundary = not is_end and not is_ambiguous and not is_frustration and not is_abuse and not is_topic_choice and is_personal_or_unrelated_request(answer)
+
     is_waiting_resume = (not is_waiting_choice) and (
         bool(getattr(state, "waiting_for_resume", False))
         or state.neutral_topic_turns > 0
         or bool(state.preferred_neutral_topic)
     )
-    is_topic_pref = not is_end and not is_ambiguous and not is_frustration and not is_abuse and not is_topic_choice and (
+    is_topic_pref = not is_end and not is_ambiguous and not is_frustration and not is_abuse and not is_topic_choice and not is_boundary and (
         is_explicit_topic_change_preference(answer)
         or (is_waiting_resume and (
             is_bare_acknowledgment(answer)
@@ -2856,7 +2893,6 @@ async def process_interview_turn(
             or any(w in answer.lower() for w in ("another moment", "a minute", "a moment", "not yet", "give me", "need time", "just a sec"))
         ))
     )
-    is_boundary = not is_end and not is_ambiguous and not is_frustration and not is_abuse and not is_topic_choice and not is_topic_pref and is_personal_or_unrelated_request(answer)
     is_refusal = not is_end and not is_ambiguous and not is_frustration and not is_abuse and not is_topic_choice and not is_topic_pref and not is_boundary and is_candidate_refusal(answer)
     is_clarification = not is_end and not is_ambiguous and not is_frustration and not is_abuse and not is_topic_choice and not is_topic_pref and not is_boundary and not is_refusal and is_clarification_request(answer)
     is_off_topic = not is_end and not is_ambiguous and not is_frustration and not is_abuse and not is_topic_choice and not is_topic_pref and not is_boundary and not is_refusal and not is_clarification and is_off_topic_answer(answer)
@@ -3366,10 +3402,12 @@ async def process_interview_turn(
             accepts_refusal = True
 
         gen_kwargs = {
-            "current_answer": answer,
+            "current_answer": "" if is_boundary else answer,
             "transcript": question_transcript,
             "evidence": question_evidence,
         }
+        if "is_boundary" in sig.parameters or has_kwargs:
+            gen_kwargs["is_boundary"] = is_boundary
         if accepts_refusal:
             gen_kwargs["is_refusal"] = is_refusal
             gen_kwargs["refused_question"] = refused_question
@@ -3401,7 +3439,7 @@ async def process_interview_turn(
     elif is_boundary and question:
         question = format_boundary_response(question)
     elif is_refusal and question:
-        question = format_refusal_response(question)
+        question = format_refusal_response(question, is_repeated=len(state.refused_questions) >= 2)
 
     # Any additional speech turn that completed while LLM was generating belongs to the
     # current question, NOT the next question that hasn't been asked yet.
