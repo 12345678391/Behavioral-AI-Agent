@@ -38,6 +38,21 @@ describe("api.js module unit tests", () => {
       expect(resolved).toBe("http://localhost:3001");
     });
 
+    test("redirects localhost:3001 in production to feature backend", () => {
+      const resolved = resolveApiBaseUrl("http://localhost:3001", "production");
+      expect(resolved).toBe("https://behavioral-backend-gc62.onrender.com");
+    });
+
+    test("redirects 127.0.0.1 in production to feature backend", () => {
+      const resolved = resolveApiBaseUrl("http://127.0.0.1:3001", "production");
+      expect(resolved).toBe("https://behavioral-backend-gc62.onrender.com");
+    });
+
+    test("preserves localhost:3001 in development environment", () => {
+      const resolved = resolveApiBaseUrl("http://localhost:3001", "development");
+      expect(resolved).toBe("http://localhost:3001");
+    });
+
     test("preserves valid custom backend url without trailing slashes", () => {
       const customUrl = "https://custom-backend.example.com///";
       const resolved = resolveApiBaseUrl(customUrl, "production");

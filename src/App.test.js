@@ -1335,6 +1335,138 @@ describe('Behavioral AI Agent App', () => {
       replaceStateSpy.mockRestore();
     }
   });
+
+  test('recording stop flow: falls back to livekitToken when archiveToken is not returned by backend', async () => {
+    let capturedOnData = null;
+    const mockRoom = {
+      name: 'room-token-fallback-test',
+      disconnect: jest.fn(),
+      localParticipant: { publishData: jest.fn().mockResolvedValue(true) },
+    };
+
+    api.getToken.mockResolvedValueOnce({
+      token: 'jwt-livekit-token-456',
+      serverUrl: 'wss://test.livekit.cloud',
+      room: 'room-token-fallback-test',
+      // archiveToken omitted intentionally to test fallback
+    });
+
+    api.startRecording.mockResolvedValueOnce({
+      success: true,
+      status: 'active',
+      egressId: 'egress-fallback-123',
+    });
+
+    api.stopRecording.mockResolvedValueOnce({
+      success: true,
+      status: 'finalizing',
+    });
+
+    livekitRoom.joinRoom.mockImplementation((token, url, onData, onConnected) => {
+      capturedOnData = onData;
+      if (onConnected) onConnected();
+      return Promise.resolve(mockRoom);
+    });
+
+    render(<App />);
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: /Start Assessment/i }));
+    });
+
+    // Deliver final assessment result
+    await act(async () => {
+      capturedOnData({
+        type: 'final_result',
+        data: {
+          assessment_id: 'room-token-fallback-test',
+          completed: true,
+          recording: {
+            status: 'completed',
+            videoUrl: 'https://storage.example.com/interviews/room-token-fallback-test.mp4',
+          },
+          final_analysis: {
+            overall_score: 90,
+            scores: { communication: 90 },
+            strengths: ['Great communication skills.'],
+            areas_for_improvement: ['None'],
+            behavioral_summary: 'Great performance.',
+          },
+        },
+      });
+    });
+
+    // Verify stopRecording was called with the LiveKit token as fallback instead of undefined
+    expect(api.stopRecording).toHaveBeenCalledWith('room-token-fallback-test', 'jwt-livekit-token-456');
+  });
+
+  test('recording stop flow: does not initiate polling loop when recording is unavailable at start', async () => {
+    let capturedOnData = null;
+    const mockRoom = {
+      name: 'room-quota-unavailable-test',
+      disconnect: jest.fn(),
+      localParticipant: { publishData: jest.fn().mockResolvedValue(true) },
+    };
+
+    api.getToken.mockResolvedValueOnce({
+      token: 'jwt-quota-test',
+      serverUrl: 'wss://test.livekit.cloud',
+      room: 'room-quota-unavailable-test',
+      archiveToken: 'archive-quota-test',
+    });
+
+    // Simulate startRecording failing due to LiveKit Cloud free-tier quota exceeded
+    api.startRecording.mockResolvedValueOnce({
+      success: false,
+      status: 'unavailable',
+      error: 'LiveKit Cloud recording is unavailable: free-tier project egress limit exceeded.',
+    });
+
+    api.stopRecording.mockResolvedValueOnce({
+      success: true,
+      status: 'unavailable',
+      error: 'No recording session found for this room.',
+    });
+
+    livekitRoom.joinRoom.mockImplementation((token, url, onData, onConnected) => {
+      capturedOnData = onData;
+      if (onConnected) onConnected();
+      return Promise.resolve(mockRoom);
+    });
+
+    render(<App />);
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: /Start Assessment/i }));
+    });
+
+    // Recording status should be unavailable and status polling should not be called
+    api.getRecordingStatus.mockClear();
+
+    await act(async () => {
+      capturedOnData({
+        type: 'final_result',
+        data: {
+          assessment_id: 'room-quota-unavailable-test',
+          completed: true,
+          final_analysis: {
+            overall_score: 85,
+            scores: { communication: 85 },
+            strengths: ['Good answers'],
+            areas_for_improvement: ['None'],
+            behavioral_summary: 'Solid interview.',
+          },
+        },
+      });
+    });
+
+    // Verify stopRecording called safely
+    expect(api.stopRecording).toHaveBeenCalledWith('room-quota-unavailable-test', 'archive-quota-test');
+    // Verify polling was not triggered repeatedly
+    expect(api.getRecordingStatus).not.toHaveBeenCalled();
+    // Verify dashboard rendered and results saved
+    expect(screen.getByTestId('recording-unavailable-container')).toBeInTheDocument();
+  });
 });
 
 

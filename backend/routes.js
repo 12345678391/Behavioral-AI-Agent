@@ -191,7 +191,26 @@ function extractBearerToken(req) {
   return null;
 }
 
-function verifyRoomAuthorization(roomName, providedToken) {
+async function verifyLiveKitToken(roomName, rawToken) {
+  const apiKey = (process.env.LIVEKIT_API_KEY || "").trim().replace(/^[\"']|[\"']$/g, "");
+  const apiSecret = (process.env.LIVEKIT_API_SECRET || "").trim().replace(/^[\"']|[\"']$/g, "");
+  if (!apiKey || !apiSecret || !rawToken) return false;
+  try {
+    const { TokenVerifier } = require("livekit-server-sdk");
+    const verifier = new TokenVerifier(apiKey, apiSecret);
+    const claims = await verifier.verify(rawToken);
+    if (!claims) return false;
+    const tokenRoom = claims.video?.room || claims.room;
+    if (tokenRoom && tokenRoom === roomName) {
+      return true;
+    }
+  } catch (_) {
+    // Not a valid LiveKit token or expired
+  }
+  return false;
+}
+
+async function verifyRoomAuthorization(roomName, providedToken) {
   if (!roomName) {
     return {
       authorized: false,
@@ -204,6 +223,56 @@ function verifyRoomAuthorization(roomName, providedToken) {
   const safeId = roomName.replace(/[^a-zA-Z0-9_-]/g, "_");
   const authRecord = getRoomAuthRecord(safeId);
 
+  // Check if session has been revoked by administrator
+  if (authRecord && authRecord.revoked) {
+    return {
+      authorized: false,
+      authenticated: false,
+      status: 403,
+      error: "Access to this interview session has been revoked.",
+    };
+  }
+
+  // Capability token or session token is required
+  if (!providedToken) {
+    return {
+      authorized: false,
+      authenticated: false,
+      status: 401,
+      error: "Authorization required: session capability token is missing.",
+    };
+  }
+
+  const trimmedToken = String(providedToken).trim();
+
+  // 1. Verify SHA-256 hash in constant time if capability token is configured
+  if (authRecord && authRecord.archiveTokenHash) {
+    const providedHash = crypto
+      .createHash("sha256")
+      .update(trimmedToken)
+      .digest("hex");
+
+    const expectedBuf = Buffer.from(authRecord.archiveTokenHash, "utf8");
+    const providedBuf = Buffer.from(providedHash, "utf8");
+
+    if (
+      expectedBuf.length === providedBuf.length &&
+      crypto.timingSafeEqual(expectedBuf, providedBuf)
+    ) {
+      return { authorized: true, authenticated: true };
+    }
+  }
+
+  // 2. Cryptographic LiveKit JWT verification for this room
+  const isLiveKitValid = await verifyLiveKitToken(roomName, trimmedToken);
+  if (isLiveKitValid) {
+    // If authorization record was missing, register capability record automatically
+    if (!authRecord || !authRecord.archiveTokenHash) {
+      registerRoomCapabilityToken(roomName, trimmedToken);
+    }
+    return { authorized: true, authenticated: true };
+  }
+
   // FAIL CLOSED: If no authorization record exists for this room, reject immediately!
   if (!authRecord || !authRecord.archiveTokenHash) {
     return {
@@ -214,48 +283,12 @@ function verifyRoomAuthorization(roomName, providedToken) {
     };
   }
 
-  // Check if session has been revoked by administrator
-  if (authRecord.revoked) {
-    return {
-      authorized: false,
-      authenticated: false,
-      status: 403,
-      error: "Access to this interview session has been revoked.",
-    };
-  }
-
-  // Capability token is required
-  if (!providedToken) {
-    return {
-      authorized: false,
-      authenticated: false,
-      status: 401,
-      error: "Authorization required: session capability token is missing.",
-    };
-  }
-
-  // Verify SHA-256 hash in constant time
-  const providedHash = crypto
-    .createHash("sha256")
-    .update(String(providedToken).trim())
-    .digest("hex");
-
-  const expectedBuf = Buffer.from(authRecord.archiveTokenHash, "utf8");
-  const providedBuf = Buffer.from(providedHash, "utf8");
-
-  if (
-    expectedBuf.length !== providedBuf.length ||
-    !crypto.timingSafeEqual(expectedBuf, providedBuf)
-  ) {
-    return {
-      authorized: false,
-      authenticated: false,
-      status: 403,
-      error: "Invalid or unauthorized session capability token.",
-    };
-  }
-
-  return { authorized: true, authenticated: true };
+  return {
+    authorized: false,
+    authenticated: false,
+    status: 403,
+    error: "Invalid or unauthorized session capability token.",
+  };
 }
 
 function verifyAdminSignature(roomId, providedSignature) {
@@ -418,7 +451,7 @@ router.get("/token", async (req, res) => {
       if (existingAuth && existingAuth.archiveTokenHash) {
         // Reconnect / refresh for existing room requires valid capability token
         const providedToken = extractBearerToken(req);
-        const auth = verifyRoomAuthorization(safeId, providedToken);
+        const auth = await verifyRoomAuthorization(safeId, providedToken);
         if (!auth.authorized) {
           return res.status(auth.status).json({
             error: `Unauthorized room reconnect: ${auth.error}`,
@@ -594,7 +627,7 @@ function syncRecordingToAssessment(roomName, recData) {
 // ============================================================
 // ASSESSMENT RESULT RETRIEVAL
 // ============================================================
-router.get("/assessment-result", (req, res) => {
+router.get("/assessment-result", async (req, res) => {
   try {
     const assessmentId = req.query.assessmentId;
 
@@ -632,7 +665,7 @@ router.get("/assessment-result", (req, res) => {
     if (!isAdminAuth) {
       // Authenticate candidate against capability token
       const providedToken = extractBearerToken(req);
-      auth = verifyRoomAuthorization(safeId, providedToken);
+      auth = await verifyRoomAuthorization(safeId, providedToken);
       if (!auth.authorized) {
         return res.status(auth.status).json({
           error: auth.error,
@@ -786,7 +819,7 @@ router.post("/recording/stop", express.json(), async (req, res) => {
     // 2. Validate room capability token for ordinary client requests
     if (!isAdminAuth) {
       const providedToken = extractBearerToken(req);
-      const auth = verifyRoomAuthorization(room, providedToken);
+      const auth = await verifyRoomAuthorization(room, providedToken);
       if (!auth.authorized) {
         return res.status(auth.status).json({
           success: false,
@@ -842,7 +875,7 @@ router.get("/recording/status", async (req, res) => {
     }
 
     const providedToken = extractBearerToken(req);
-    const auth = verifyRoomAuthorization(room, providedToken);
+    const auth = await verifyRoomAuthorization(room, providedToken);
     if (!auth.authorized) {
       return res.status(auth.status).json({
         success: false,

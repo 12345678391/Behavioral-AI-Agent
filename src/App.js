@@ -107,10 +107,13 @@ function App() {
   const [recordingStatus, setRecordingStatus] = useState("idle"); // 'idle' | 'starting' | 'active' | 'finalizing' | 'completed' | 'failed' | 'unavailable'
   const [recordingVideoUrl, setRecordingVideoUrl] = useState(null);
   const [recordingError, setRecordingError] = useState("");
+
+  const recordingStatusRef = useRef("idle");
   const recordingPollingRef = useRef(null);
   const recordingStartedRoomRef = useRef(null);
   const recordingStoppedRoomRef = useRef(null);
   const archiveTokenRef = useRef("");
+  const livekitTokenRef = useRef("");
 
   const clearRecordingPolling = useCallback(() => {
     if (recordingPollingRef.current) {
@@ -122,10 +125,11 @@ function App() {
   const checkRecordingStatus = useCallback(async (roomName) => {
     if (!roomName) return;
     try {
-      const token = archiveTokenRef.current || undefined;
+      const token = archiveTokenRef.current || livekitTokenRef.current || undefined;
       const res = await getRecordingStatus(roomName, token);
       if (!isMountedRef.current) return;
       if (res && res.status) {
+        recordingStatusRef.current = res.status;
         setRecordingStatus(res.status);
         if (res.videoUrl) {
           setRecordingVideoUrl(res.videoUrl);
@@ -142,7 +146,10 @@ function App() {
         }
       }
     } catch (err) {
-      // Non-fatal status polling notice
+      // Non-fatal status polling notice: halt polling on auth rejection
+      if (err?.status === 401 || err?.status === 403) {
+        clearRecordingPolling();
+      }
     }
   }, [clearRecordingPolling]);
 
@@ -171,16 +178,19 @@ function App() {
     if (recordingStartedRoomRef.current === roomName) return;
     recordingStartedRoomRef.current = roomName;
     try {
+      recordingStatusRef.current = "starting";
       setRecordingStatus("starting");
       const res = await startRecording(roomName);
       if (!isMountedRef.current) return;
       if (res && res.status) {
+        recordingStatusRef.current = res.status;
         setRecordingStatus(res.status);
         if (res.error) setRecordingError(res.error);
       }
     } catch (err) {
       if (!isMountedRef.current) return;
       console.warn("[App] Recording start notice:", err?.message || err);
+      recordingStatusRef.current = "failed";
       setRecordingStatus("failed");
       setRecordingError(err?.message || "Could not start recording.");
     }
@@ -191,20 +201,31 @@ function App() {
     if (recordingStoppedRoomRef.current === roomName) return;
     recordingStoppedRoomRef.current = roomName;
     try {
-      const token = archiveTokenRef.current || undefined;
+      const token = archiveTokenRef.current || livekitTokenRef.current || undefined;
       const res = await stopRecording(roomName, token);
       if (!isMountedRef.current) return;
       if (res && res.status) {
-        setRecordingStatus(res.status);
+        if (recordingStatusRef.current !== "completed" || res.status === "completed") {
+          recordingStatusRef.current = res.status;
+          setRecordingStatus(res.status);
+        }
         if (res.videoUrl) setRecordingVideoUrl(res.videoUrl);
         if (res.error) setRecordingError(res.error);
+        if (
+          res.status === "completed" ||
+          res.status === "failed" ||
+          res.status === "unavailable"
+        ) {
+          clearRecordingPolling();
+        }
       }
     } catch (err) {
       if (!isMountedRef.current) return;
       console.warn("[App] Recording stop notice:", err?.message || err);
+      clearRecordingPolling();
       setRecordingError(err?.message || "Could not stop recording cleanly.");
     }
-  }, []);
+  }, [clearRecordingPolling]);
 
   // Synchronously prime the Web Audio pipeline during a user gesture
   function unlockBrowserAudio() {
@@ -653,6 +674,7 @@ function App() {
 
         if (finalData.recording) {
           if (finalData.recording.status) {
+            recordingStatusRef.current = finalData.recording.status;
             setRecordingStatus(finalData.recording.status);
           }
           if (finalData.recording.videoUrl) {
@@ -680,7 +702,14 @@ function App() {
 
       if (currentRoomNameRef.current) {
         safeStopRecording(currentRoomNameRef.current);
-        pollRecordingUntilFinalized(currentRoomNameRef.current);
+        const curStatus = recordingStatusRef.current;
+        if (
+          curStatus !== "completed" &&
+          curStatus !== "failed" &&
+          curStatus !== "unavailable"
+        ) {
+          pollRecordingUntilFinalized(currentRoomNameRef.current);
+        }
       }
 
       const activeRoom = roomRef.current || room;
@@ -721,7 +750,7 @@ function App() {
         }
 
         try {
-          const token = archiveTokenRef.current || undefined;
+          const token = archiveTokenRef.current || livekitTokenRef.current || undefined;
           const res = await getAssessmentResult(roomName, token);
           const fallbackData = res?.data || res;
           if (isValidAssessmentReport(fallbackData)) {
@@ -813,6 +842,9 @@ function App() {
       clearRecordingPolling();
       recordingStartedRoomRef.current = null;
       recordingStoppedRoomRef.current = null;
+      livekitTokenRef.current = "";
+      archiveTokenRef.current = "";
+      recordingStatusRef.current = "idle";
       setRecordingStatus("idle");
       setRecordingVideoUrl(null);
       setRecordingError("");
@@ -836,6 +868,9 @@ function App() {
         );
 
       currentRoomNameRef.current = data?.room || "";
+      if (data?.token) {
+        livekitTokenRef.current = data.token;
+      }
       if (data?.archiveToken) {
         archiveTokenRef.current = data.archiveToken;
       }
@@ -864,7 +899,14 @@ function App() {
 
             if (currentRoomNameRef.current) {
               safeStopRecording(currentRoomNameRef.current);
-              pollRecordingUntilFinalized(currentRoomNameRef.current);
+              const curStatus = recordingStatusRef.current;
+              if (
+                curStatus !== "completed" &&
+                curStatus !== "failed" &&
+                curStatus !== "unavailable"
+              ) {
+                pollRecordingUntilFinalized(currentRoomNameRef.current);
+              }
             }
 
             roomRef.current = null;
@@ -1793,7 +1835,7 @@ function App() {
                       ? "border border-red-500/30 bg-red-500/10 text-red-400 flex items-center gap-1.5"
                       : recordingStatus === "starting"
                       ? "border border-amber-500/30 bg-amber-500/10 text-amber-300 flex items-center gap-1.5"
-                      : recordingStatus === "failed"
+                      : recordingStatus === "failed" || recordingStatus === "unavailable"
                       ? "border border-rose-500/30 bg-rose-500/10 text-rose-300"
                       : "border border-slate-700 bg-slate-800 text-slate-400"
                   }`}
@@ -1808,7 +1850,7 @@ function App() {
                       <span className="inline-block h-2 w-2 rounded-full bg-amber-400 animate-pulse" />
                       Rec Starting...
                     </>
-                  ) : recordingStatus === "failed" ? (
+                  ) : recordingStatus === "failed" || recordingStatus === "unavailable" ? (
                     "⚠️ Rec Unavailable"
                   ) : (
                     "Rec Idle"
@@ -2006,7 +2048,7 @@ function App() {
                   </div>
                 )}
 
-                {connected && recordingStatus === "failed" && recordingError && (
+                {connected && (recordingStatus === "failed" || recordingStatus === "unavailable") && recordingError && (
                   <div
                     data-testid="recording-live-warning"
                     className="mt-4 rounded-xl border border-rose-500/30 bg-rose-500/10 px-4 py-3 text-xs text-rose-300"

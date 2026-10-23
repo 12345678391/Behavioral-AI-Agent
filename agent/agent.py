@@ -425,6 +425,20 @@ def save_assessment(
 
     path = RESULTS_DIR / f"{safe_id}.json"
 
+    # Preserve existing session metadata (e.g. capability token hash, recording status)
+    existing_data = {}
+    if path.exists():
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                existing_data = json.load(f)
+        except Exception:
+            existing_data = {}
+
+    merged_data = {**existing_data, **state.to_dict()}
+    for key in ("archiveTokenHash", "revoked", "recording"):
+        if key in existing_data and key not in state.to_dict():
+            merged_data[key] = existing_data[key]
+
     with open(
         path,
         "w",
@@ -432,7 +446,7 @@ def save_assessment(
     ) as file:
 
         json.dump(
-            state.to_dict(),
+            merged_data,
             file,
             indent=2,
             ensure_ascii=False,

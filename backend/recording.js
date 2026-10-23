@@ -428,13 +428,23 @@ async function startRecording(roomName) {
 
     console.error(`[Recording] LiveKit Egress start error for room ${roomName}:`, sanitizedError);
 
+    const isQuotaOrLimitError =
+      /limit exceeded|quota exceeded|free-tier|resource limit|project limit|egress limit|429|exceeded.*limit/i.test(
+        sanitizedError
+      );
+
+    const status = isQuotaOrLimitError ? "unavailable" : "failed";
+    const errorMessage = isQuotaOrLimitError
+      ? "LiveKit Cloud recording is unavailable: free-tier project egress limit exceeded. The assessment and behavioral scoring continue normally."
+      : `LiveKit Egress service unavailable: ${sanitizedError}`;
+
     const session = {
       roomName,
-      status: "failed",
+      status,
       egressId: null,
       filepath: null,
       videoUrl: null,
-      error: `LiveKit Egress service unavailable: ${sanitizedError}`,
+      error: errorMessage,
       startedAt: timestamp,
       endedAt: null,
       storageType: storageConfig.type,
@@ -444,7 +454,7 @@ async function startRecording(roomName) {
 
     return {
       success: false,
-      status: "failed",
+      status,
       error: session.error,
     };
   }
@@ -462,14 +472,23 @@ async function stopRecording(roomName) {
   const session = recordingSessions.get(roomName);
   if (!session) {
     return {
+      success: true,
+      roomName,
       status: "unavailable",
       videoUrl: null,
       error: "No recording session found for this room.",
     };
   }
 
-  if (session.status === "completed" || session.status === "failed") {
-    return session;
+  if (
+    session.status === "completed" ||
+    session.status === "failed" ||
+    session.status === "unavailable"
+  ) {
+    return {
+      success: true,
+      ...session,
+    };
   }
 
   session.status = "finalizing";
@@ -514,7 +533,10 @@ async function stopRecording(roomName) {
     }
   }
 
-  return session;
+  return {
+    success: true,
+    ...session,
+  };
 }
 
 async function getRecordingStatus(roomName) {
@@ -537,8 +559,12 @@ async function getRecordingStatus(roomName) {
     };
   }
 
-  // If already completed or failed, return latest status
-  if (session.status === "completed" || session.status === "failed") {
+  // If already completed, failed, or unavailable, return latest status
+  if (
+    session.status === "completed" ||
+    session.status === "failed" ||
+    session.status === "unavailable"
+  ) {
     return {
       success: true,
       room: roomName,

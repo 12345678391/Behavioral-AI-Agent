@@ -1131,6 +1131,115 @@ const server = app.listen(0, async () => {
         failures++;
       }
 
+      // Test 43: Stop recording authorized via LiveKit JWT AccessToken
+      const lkAuthRoom = `lk-auth-room-${Date.now()}`;
+      const { AccessToken } = require("livekit-server-sdk");
+      const lkTokenObj = new AccessToken(process.env.LIVEKIT_API_KEY, process.env.LIVEKIT_API_SECRET, { identity: "candidate-jwt-test" });
+      lkTokenObj.addGrant({ roomJoin: true, room: lkAuthRoom });
+      const validLkJwt = await lkTokenObj.toJwt();
+
+      // Mock active recording session for lkAuthRoom
+      recording.setRecordingSession(lkAuthRoom, {
+        roomName: lkAuthRoom,
+        status: "active",
+        egressId: "egress-jwt-1",
+        filepath: `recordings/${lkAuthRoom}.mp4`,
+        videoUrl: null,
+        error: null,
+        startedAt: Date.now(),
+        endedAt: null,
+      });
+
+      const lkStopRes = await fetch(`http://localhost:${port}/api/recording/stop`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${validLkJwt}`,
+        },
+        body: JSON.stringify({ room: lkAuthRoom }),
+      });
+      const lkStopData = await lkStopRes.json();
+
+      if (lkStopRes.status === 200 && lkStopData.success === true && (lkStopData.status === "completed" || lkStopData.status === "finalizing")) {
+        console.log("PASS: Recording stop authorized via LiveKit JWT AccessToken succeeds without capability token");
+      } else {
+        console.error("FAIL: Recording stop with LiveKit JWT failed", { status: lkStopRes.status, data: lkStopData });
+        failures++;
+      }
+
+      // Test 44: Safe handling of missing recording session returns 200 with unavailable status
+      const missingSessionRoom = `missing-session-${Date.now()}`;
+      const missingTokenObj = new AccessToken(process.env.LIVEKIT_API_KEY, process.env.LIVEKIT_API_SECRET, { identity: "cand-missing" });
+      missingTokenObj.addGrant({ roomJoin: true, room: missingSessionRoom });
+      const missingLkJwt = await missingTokenObj.toJwt();
+
+      const missingStopRes = await fetch(`http://localhost:${port}/api/recording/stop`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${missingLkJwt}`,
+        },
+        body: JSON.stringify({ room: missingSessionRoom }),
+      });
+      const missingStopData = await missingStopRes.json();
+
+      if (missingStopRes.status === 200 && missingStopData.success === true && missingStopData.status === "unavailable") {
+        console.log("PASS: Recording stop on missing session safely returns 200 with unavailable status");
+      } else {
+        console.error("FAIL: Missing recording session stop test failed", { status: missingStopRes.status, data: missingStopData });
+        failures++;
+      }
+
+      // Test 45: Already-stopped or unavailable recording safely handled without duplicate egress stop
+      recording.setRecordingSession(missingSessionRoom, {
+        roomName: missingSessionRoom,
+        status: "unavailable",
+        egressId: null,
+        filepath: null,
+        videoUrl: null,
+        error: "LiveKit Cloud recording is unavailable: free-tier project egress limit exceeded.",
+      });
+
+      const alreadyStoppedRes = await fetch(`http://localhost:${port}/api/recording/stop`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${missingLkJwt}`,
+        },
+        body: JSON.stringify({ room: missingSessionRoom }),
+      });
+      const alreadyStoppedData = await alreadyStoppedRes.json();
+
+      if (alreadyStoppedRes.status === 200 && alreadyStoppedData.success === true && alreadyStoppedData.status === "unavailable") {
+        console.log("PASS: Already-stopped unavailable recording session handled safely on repeat stop request");
+      } else {
+        console.error("FAIL: Already-stopped recording repeat stop test failed", { status: alreadyStoppedRes.status, data: alreadyStoppedData });
+        failures++;
+      }
+
+      // Test 46: Graceful handling of LiveKit Cloud Egress free-tier quota error
+      const quotaRoom = `quota-exceeded-room-${Date.now()}`;
+      recording.setEgressClientForTest({
+        startRoomCompositeEgress: async () => {
+          throw new Error("LiveKit Egress service failed: project free-tier egress limit exceeded (429)");
+        },
+      });
+
+      const quotaStartRes = await recording.startRecording(quotaRoom);
+      const quotaSession = recording.getRecordingSession(quotaRoom);
+
+      if (
+        quotaStartRes.success === false &&
+        quotaStartRes.status === "unavailable" &&
+        quotaStartRes.error.includes("free-tier") &&
+        quotaSession?.status === "unavailable"
+      ) {
+        console.log("PASS: LiveKit Cloud free-tier quota error handled gracefully with status unavailable and informative notice");
+      } else {
+        console.error("FAIL: Free-tier quota error test failed", { quotaStartRes, quotaSession });
+        failures++;
+      }
+
     } finally {
       // Restore original environment
       for (const [key, val] of Object.entries(originalSecureEnv)) {

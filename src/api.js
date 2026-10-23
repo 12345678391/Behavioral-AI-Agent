@@ -12,6 +12,17 @@ export function resolveApiBaseUrl(raw = rawBaseUrl, nodeEnv = process.env.NODE_E
       );
       return DEFAULT_FEATURE_BACKEND;
     }
+    // Safeguard: In production, redirect localhost / 127.0.0.1 misconfigurations to deployed backend
+    if (
+      nodeEnv === "production" &&
+      (/^https?:\/\/localhost(:\d+)?$/i.test(trimmed) ||
+        /^https?:\/\/127\.0\.0\.1(:\d+)?$/i.test(trimmed))
+    ) {
+      console.warn(
+        `[API] REACT_APP_API_BASE_URL points to localhost (${trimmed}) in production. Directing to feature backend (${DEFAULT_FEATURE_BACKEND}).`
+      );
+      return DEFAULT_FEATURE_BACKEND;
+    }
     return trimmed;
   }
   if (nodeEnv === "production") {
