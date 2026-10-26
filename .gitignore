@@ -1,0 +1,27 @@
+# Environment variables
+.env
+.env.*
+!.env.example
+
+# Node.js
+node_modules/
+
+# Python
+.venv/
+.venv-*/
+__pycache__/
+*.pyc
+
+# Logs
+logs/
+*.log
+
+# Build outputs
+build/
+dist/
+
+# Project generated files
+agent/latest_assessment.json
+agent/assessment_result.json
+agent/assessments/
+*.json.bak

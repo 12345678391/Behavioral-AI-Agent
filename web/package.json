@@ -1,0 +1,14 @@
+{
+  "name": "behavioral-ai-api-server",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "start": "node server.cjs"
+  },
+  "dependencies": {
+    "cors": "^2.8.6",
+    "dotenv": "^18.0.2",
+    "express": "^5.2.1",
+    "livekit-server-sdk": "^2.19.1"
+  }
+}
