@@ -15,6 +15,7 @@ from livekit.agents import (
     JobContext,
     JobExecutorType,
     JobProcess,
+    RoomOutputOptions,
     WorkerOptions,
     cli,
 )
@@ -1057,9 +1058,9 @@ The interview controller will decide when to ask the next question.
 
 def prewarm(proc: JobProcess):
     """Prewarm the Silero VAD model during worker startup to prevent runtime event-loop blocks."""
-    print("[Agent Worker] Prewarming Silero VAD (sample_rate=16000 Hz)...")
+    print("[Agent Worker] Prewarming Silero VAD (sample_rate=8000 Hz)...")
     try:
-        proc.userdata["vad"] = silero.VAD.load(sample_rate=16000)
+        proc.userdata["vad"] = silero.VAD.load(sample_rate=8000)
         print("[Agent Worker] Silero VAD prewarmed successfully.")
     except Exception as error:
         print("[Agent Worker] Silero VAD prewarm warning:", repr(error))
@@ -1213,16 +1214,16 @@ async def entrypoint(
     vad = ctx.proc.userdata.get("vad") if hasattr(ctx, "proc") and hasattr(ctx.proc, "userdata") else None
     if vad is None:
         print(
-            "[Agent] [Stage 3/5] Loading Silero VAD in background worker thread (sample_rate=16000 Hz)..."
+            "[Agent] [Stage 3/5] Loading Silero VAD in background worker thread (sample_rate=8000 Hz)..."
         )
-        vad = await asyncio.to_thread(silero.VAD.load, sample_rate=16000)
+        vad = await asyncio.to_thread(silero.VAD.load, sample_rate=8000)
     else:
         print(
-            "[Agent] [Stage 3/5] Using prewarmed Silero VAD (sample_rate=16000 Hz)."
+            "[Agent] [Stage 3/5] Using prewarmed Silero VAD (sample_rate=8000 Hz)."
         )
 
     print(
-        "[Agent] [Stage 3/5] Creating AgentSession with uninterrupted speech delivery and 16kHz VAD..."
+        "[Agent] [Stage 3/5] Creating AgentSession with uninterrupted speech delivery and 8kHz VAD..."
     )
 
     session = AgentSession(
@@ -1427,6 +1428,9 @@ async def entrypoint(
     await session.start(
         room=ctx.room,
         agent=BehavioralInterviewAgent(),
+        room_output_options=RoomOutputOptions(
+            sync_transcription=False,
+        ),
     )
 
     published_tracks = [
