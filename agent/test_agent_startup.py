@@ -145,8 +145,8 @@ class TestAgentStartup(unittest.TestCase):
 
             self.assertIn("invalid final analysis", str(ctx.exception))
 
-    def test_prewarm_initializes_silero_vad_16k(self):
-        """Verify prewarm loads Silero VAD with 16000 Hz sample rate into proc.userdata."""
+    def test_prewarm_initializes_silero_vad_8k(self):
+        """Verify prewarm loads Silero VAD with 8000 Hz sample rate into proc.userdata."""
         from unittest.mock import MagicMock, patch
         from agent.agent import prewarm
 
@@ -157,11 +157,17 @@ class TestAgentStartup(unittest.TestCase):
         with patch("livekit.plugins.silero.VAD.load", return_value=mock_vad) as mock_load:
             prewarm(mock_proc)
             mock_load.assert_called_once_with(
-                sample_rate=16000,
+                sample_rate=8000,
                 min_silence_duration=0.8,
                 activation_threshold=0.5,
             )
             self.assertEqual(mock_proc.userdata.get("vad"), mock_vad)
+
+    def test_room_output_options_sync_transcription_disabled(self):
+        """Verify RoomOutputOptions is available and supports sync_transcription=False."""
+        from livekit.agents import RoomOutputOptions
+        opts = RoomOutputOptions(sync_transcription=False)
+        self.assertFalse(opts.sync_transcription)
 
     def test_worker_options_includes_prewarm_fnc(self):
         """Verify WorkerOptions is configured with prewarm_fnc, THREAD executor, and timeout."""
@@ -2352,7 +2358,7 @@ class TestAgentStartup(unittest.TestCase):
         self.assertEqual(state.transcript[-1]["text"], "Tell me about a technical project you built.")
 
     def test_vad_prewarm_configuration(self):
-        """Verify prewarm sets sample_rate 16000 and min_silence_duration 0.8."""
+        """Verify prewarm sets sample_rate 8000 and min_silence_duration 0.8."""
         from unittest.mock import MagicMock, patch
         from agent.agent import prewarm
 
@@ -2362,7 +2368,7 @@ class TestAgentStartup(unittest.TestCase):
         with patch("livekit.plugins.silero.VAD.load") as mock_load:
             prewarm(mock_proc)
             mock_load.assert_called_once_with(
-                sample_rate=16000,
+                sample_rate=8000,
                 min_silence_duration=0.8,
                 activation_threshold=0.5,
             )

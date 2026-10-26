@@ -18,6 +18,7 @@ from livekit.agents import (
     JobContext,
     JobExecutorType,
     JobProcess,
+    RoomOutputOptions,
     WorkerOptions,
     cli,
     room_io,
@@ -3568,10 +3569,10 @@ async def process_interview_turn(
 
 def prewarm(proc: JobProcess):
     """Prewarm the Silero VAD model during worker startup to prevent runtime event-loop blocks."""
-    print("[Agent Worker] Prewarming Silero VAD (sample_rate=16000 Hz, min_silence=0.8s)...")
+    print("[Agent Worker] Prewarming Silero VAD (sample_rate=8000 Hz, min_silence=0.8s)...")
     try:
         proc.userdata["vad"] = silero.VAD.load(
-            sample_rate=16000,
+            sample_rate=8000,
             min_silence_duration=0.8,
             activation_threshold=0.5,
         )
@@ -3825,21 +3826,21 @@ async def entrypoint(
     vad = ctx.proc.userdata.get("vad") if hasattr(ctx, "proc") and hasattr(ctx.proc, "userdata") else None
     if vad is None:
         print(
-            "[Agent] [Stage 3/5] Loading Silero VAD in background worker thread (sample_rate=16000 Hz, min_silence=0.8s)..."
+            "[Agent] [Stage 3/5] Loading Silero VAD in background worker thread (sample_rate=8000 Hz, min_silence=0.8s)..."
         )
         vad = await asyncio.to_thread(
             silero.VAD.load,
-            sample_rate=16000,
+            sample_rate=8000,
             min_silence_duration=0.8,
             activation_threshold=0.5,
         )
     else:
         print(
-            "[Agent] [Stage 3/5] Using prewarmed Silero VAD (sample_rate=16000 Hz, min_silence=0.8s)."
+            "[Agent] [Stage 3/5] Using prewarmed Silero VAD (sample_rate=8000 Hz, min_silence=0.8s)."
         )
 
     print(
-        "[Agent] [Stage 3/5] Creating AgentSession with uninterrupted speech delivery and 16kHz VAD..."
+        "[Agent] [Stage 3/5] Creating AgentSession with uninterrupted speech delivery and 8kHz VAD..."
     )
 
     speech_lock = asyncio.Lock()
@@ -4071,6 +4072,9 @@ async def entrypoint(
         room_options=room_io.RoomOptions(
             participant_identity=participant.identity,
             video_input=False,
+        ),
+        room_output_options=RoomOutputOptions(
+            sync_transcription=False,
         ),
     )
 
