@@ -3568,17 +3568,11 @@ async def process_interview_turn(
 # ============================================================
 
 def prewarm(proc: JobProcess):
-    """Prewarm the Silero VAD model during worker startup to prevent runtime event-loop blocks."""
-    print("[Agent Worker] Prewarming Silero VAD (sample_rate=8000 Hz, min_silence=0.8s)...")
-    try:
-        proc.userdata["vad"] = silero.VAD.load(
-            sample_rate=8000,
-            min_silence_duration=0.8,
-            activation_threshold=0.5,
-        )
-        print("[Agent Worker] Silero VAD prewarmed successfully.")
-    except Exception as error:
-        print("[Agent Worker] Silero VAD prewarm warning:", repr(error))
+    """Keep worker startup lightweight; local Silero VAD is disabled."""
+    print(
+        "[Agent Worker] Worker prewarmed "
+        "(local VAD disabled; using STT turn detection)."
+    )
 
 
 # ============================================================
@@ -3822,22 +3816,12 @@ async def entrypoint(
     # --------------------------------------------------------
     # SESSION
     # --------------------------------------------------------
+    vad = None
 
-    vad = ctx.proc.userdata.get("vad") if hasattr(ctx, "proc") and hasattr(ctx.proc, "userdata") else None
-    if vad is None:
-        print(
-            "[Agent] [Stage 3/5] Loading Silero VAD in background worker thread (sample_rate=8000 Hz, min_silence=0.8s)..."
-        )
-        vad = await asyncio.to_thread(
-            silero.VAD.load,
-            sample_rate=8000,
-            min_silence_duration=0.8,
-            activation_threshold=0.5,
-        )
-    else:
-        print(
-            "[Agent] [Stage 3/5] Using prewarmed Silero VAD (sample_rate=8000 Hz, min_silence=0.8s)."
-        )
+    print(
+       "[Agent] [Stage 3/5] Local Silero VAD disabled; "
+        "using STT turn detection."
+    )
 
     print(
         "[Agent] [Stage 3/5] Creating AgentSession with uninterrupted speech delivery and 8kHz VAD..."
@@ -3925,10 +3909,7 @@ async def entrypoint(
         vad=vad,
 
         turn_handling={
-            "endpointing": {
-                "min_delay": 2.2,
-                "max_delay": 5.0,
-            },
+            "turn_detection": "stt",
             "interruption": {
                 "enabled": False,
             },
